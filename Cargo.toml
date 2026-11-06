@@ -1,0 +1,17 @@
+[package]
+name = "rexdiff"
+version = "0.1.0"
+edition = "2024"
+description = "Your git changes in a Rex pane, next to your terminal"
+repository = "https://github.com/victorvf/rexdiff"
+readme = "README.md"
+
+[dependencies]
+git2 = { version = "0.21.0", default-features = false }
+libc = "0.2.191"
+notify = "8.2.1"
+ratatui = "0.30.2"
+serde_json = "1.0.154"
+similar = "3.2.1"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+unicode-width = "0.2.3"
