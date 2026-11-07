@@ -31,7 +31,8 @@ In the panel:
 
 On the Branches screen:
   ↑↓ / j k        move between local branches
-  space / Enter   check out the branch
+  space           check out the branch
+  Enter           commit history of the branch (Esc goes back)
   p               pull the branch (current: git pull; others: fast-forward only)
   P (Shift+P)     push the branch (to its upstream, or `origin` with -u)
   m               update the branch from its upstream, then merge it into the current one

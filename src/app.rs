@@ -17,7 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::git::{self, BranchInfo, FileDiff, Job, Msg, RowKind, Snapshot, Staged};
+use crate::git::{self, BranchInfo, CommitInfo, FileDiff, Job, Msg, RowKind, Snapshot, Staged};
 use crate::theme::{self, Palette};
 use crate::tree::{self, Item, TreeRow};
 use crate::wrap::{wrap_row, WrapCache};
@@ -53,6 +53,8 @@ const SIDE_MIN_WIDTH: u16 = 160;
 enum View {
     Changes,
     Branches,
+    /// The commit history of one branch, opened from the Branches screen.
+    History,
 }
 
 struct App {
@@ -65,6 +67,11 @@ struct App {
     branch_cursor: usize,
     /// First visible branch row (updated while drawing).
     branch_off: Cell<usize>,
+
+    hist_branch: String,
+    history: Option<Result<Vec<CommitInfo>, String>>,
+    hist_cursor: usize,
+    hist_off: Cell<usize>,
     pal: Palette,
     detected: Option<theme::Detected>,
 
@@ -119,6 +126,10 @@ pub fn run(cwd: PathBuf) -> std::io::Result<()> {
         branches: None,
         branch_cursor: 0,
         branch_off: Cell::new(0),
+        hist_branch: String::new(),
+        history: None,
+        hist_cursor: 0,
+        hist_off: Cell::new(0),
         pal: Palette::from(detected),
         detected,
         snapshot: None,
@@ -242,8 +253,14 @@ impl App {
             let now = Instant::now();
             if refresh_due.is_some_and(|t| now >= t) || now - last_refresh >= FALLBACK_REFRESH {
                 let _ = self.jobs.send(Job::Refresh);
-                if self.view == View::Branches {
-                    let _ = self.jobs.send(Job::Branches);
+                match self.view {
+                    View::Branches => {
+                        let _ = self.jobs.send(Job::Branches);
+                    }
+                    View::History => {
+                        let _ = self.jobs.send(Job::History { branch: self.hist_branch.clone() });
+                    }
+                    View::Changes => {}
                 }
                 refresh_due = None;
                 last_refresh = now;
@@ -314,6 +331,13 @@ impl App {
                         keep.and_then(|n| l.iter().position(|b| b.name == n))
                     };
                     self.branch_cursor = pos.unwrap_or(self.branch_cursor).min(l.len().saturating_sub(1));
+                }
+            }
+            Msg::History { branch, commits } => {
+                if branch == self.hist_branch {
+                    self.history = Some(commits);
+                    let len = self.history_len();
+                    self.hist_cursor = self.hist_cursor.min(len.saturating_sub(1));
                 }
             }
             Msg::Progress(p) => self.busy = Some(p),
@@ -484,8 +508,10 @@ impl App {
             KeyCode::Char('2') => return self.show_view(View::Branches),
             _ => {}
         }
-        if self.view == View::Branches {
-            return self.on_branches_key(k);
+        match self.view {
+            View::Branches => return self.on_branches_key(k),
+            View::History => return self.on_history_key(k),
+            View::Changes => {}
         }
         let page = self.areas.diff.height.max(2) as isize - 1;
         match k.code {
@@ -557,13 +583,48 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.branch_cursor = move_by(self.branch_cursor, 1),
             KeyCode::Home | KeyCode::Char('g') => self.branch_cursor = 0,
             KeyCode::End | KeyCode::Char('G') => self.branch_cursor = len.saturating_sub(1),
-            KeyCode::Char(' ') | KeyCode::Enter => self.checkout_selected(),
+            KeyCode::Char(' ') => self.checkout_selected(),
+            KeyCode::Enter => self.open_history(),
             KeyCode::Char('P') => self.push_selected(),
             KeyCode::Char('p') => self.pull_selected(),
             KeyCode::Char('m') => self.merge_selected(),
             KeyCode::Char('r') => {
                 let _ = self.jobs.send(Job::Branches);
             }
+            _ => {}
+        }
+    }
+
+    fn open_history(&mut self) {
+        let Some(b) = self.selected_branch() else { return };
+        self.hist_branch = b.name.clone();
+        self.history = None;
+        self.hist_cursor = 0;
+        self.hist_off.set(0);
+        self.view = View::History;
+        let _ = self.jobs.send(Job::History { branch: self.hist_branch.clone() });
+    }
+
+    fn history_len(&self) -> usize {
+        match &self.history {
+            Some(Ok(c)) => c.len(),
+            _ => 0,
+        }
+    }
+
+    /// History screen: move through the commits, Esc goes back to Branches.
+    fn on_history_key(&mut self, k: KeyEvent) {
+        let len = self.history_len();
+        let page = (self.areas.diff.height.max(2) as isize).max(10);
+        let move_by = |c: usize, d: isize| (c as isize + d).clamp(0, len.saturating_sub(1) as isize) as usize;
+        match k.code {
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => self.view = View::Branches,
+            KeyCode::Up | KeyCode::Char('k') => self.hist_cursor = move_by(self.hist_cursor, -1),
+            KeyCode::Down | KeyCode::Char('j') => self.hist_cursor = move_by(self.hist_cursor, 1),
+            KeyCode::PageDown | KeyCode::Char('f') => self.hist_cursor = move_by(self.hist_cursor, page),
+            KeyCode::PageUp | KeyCode::Char('b') => self.hist_cursor = move_by(self.hist_cursor, -page),
+            KeyCode::Home | KeyCode::Char('g') => self.hist_cursor = 0,
+            KeyCode::End | KeyCode::Char('G') => self.hist_cursor = len.saturating_sub(1),
             _ => {}
         }
     }
@@ -665,6 +726,22 @@ impl App {
                     return self.show_view(if i == 0 { View::Changes } else { View::Branches });
                 }
             }
+        }
+        if self.view == View::History {
+            let len = self.history_len();
+            match m.kind {
+                MouseEventKind::ScrollDown => self.hist_cursor = (self.hist_cursor + 1).min(len.saturating_sub(1)),
+                MouseEventKind::ScrollUp => self.hist_cursor = self.hist_cursor.saturating_sub(1),
+                // Row 2 is the title; commits start at row 3.
+                MouseEventKind::Down(MouseButton::Left) if m.row >= 3 => {
+                    let row = self.hist_off.get() + (m.row - 3) as usize;
+                    if row < len {
+                        self.hist_cursor = row;
+                    }
+                }
+                _ => {}
+            }
+            return;
         }
         if self.view == View::Branches {
             let len = match &self.branches {
@@ -830,10 +907,18 @@ impl App {
         self.tabs.set(self.draw_header(buf, area, snapshot));
         hline(buf, area.x, area.y + 1, area.width, p.rule);
 
-        if self.view == View::Branches {
-            self.draw_branches(buf, area);
-            self.draw_footer(buf, area);
-            return;
+        match self.view {
+            View::Branches => {
+                self.draw_branches(buf, area);
+                self.draw_footer(buf, area);
+                return;
+            }
+            View::History => {
+                self.draw_history(buf, area);
+                self.draw_footer(buf, area);
+                return;
+            }
+            View::Changes => {}
         }
 
         if files.is_empty() {
@@ -879,7 +964,7 @@ impl App {
         let changes_end = x;
         x += 2;
         let branches_x = x;
-        put(buf, &mut x, y, lim, "Branches", tab(self.view == View::Branches));
+        put(buf, &mut x, y, lim, "Branches", tab(matches!(self.view, View::Branches | View::History)));
         let branches_end = x;
         put(buf, &mut x, y, lim, &format!("   ⎇ {}", s.branch), Style::new().fg(p.muted));
         if self.view == View::Changes && n > 0 {
@@ -888,6 +973,84 @@ impl App {
             put(buf, &mut x, y, lim, &format!("   ✓ {done}/{n} staged"), st);
         }
         [(changes_x, changes_end), (branches_x, branches_end)]
+    }
+
+    /// The history screen: a title row, then one row per commit.
+    fn draw_history(&self, buf: &mut Buffer, area: Rect) {
+        let p = &self.pal;
+        let right = area.x + area.width - 1;
+
+        // Title: ‹ branch · N commits · K not pushed
+        let ty = area.y + 2;
+        let mut x = area.x + 1;
+        put(buf, &mut x, ty, right, "‹ ", Style::new().fg(p.faint));
+        put(buf, &mut x, ty, right, &self.hist_branch, Style::new().add_modifier(Modifier::BOLD));
+        if let Some(Ok(commits)) = &self.history {
+            let n = commits.len();
+            let more = if n >= 1000 { "+" } else { "" };
+            put(buf, &mut x, ty, right, &format!("  ·  {n}{more} commits"), Style::new().fg(p.muted));
+            let unpushed = commits.iter().filter(|c| c.unpushed).count();
+            if unpushed > 0 {
+                put(buf, &mut x, ty, right, &format!("  ·  ↑{unpushed} not pushed"), Style::new().fg(p.green));
+            }
+        }
+
+        let list_area = Rect::new(area.x, area.y + 3, area.width, area.height.saturating_sub(4));
+        let commits = match &self.history {
+            None => return center(buf, list_area, "Loading history…", p.faint),
+            Some(Err(e)) => return center(buf, list_area, e, p.muted),
+            Some(Ok(c)) if c.is_empty() => return center(buf, list_area, "No commits", p.faint),
+            Some(Ok(c)) => c,
+        };
+
+        let h = list_area.height as usize;
+        let mut off = self.hist_off.get();
+        if self.hist_cursor < off {
+            off = self.hist_cursor;
+        } else if h > 0 && self.hist_cursor >= off + h {
+            off = self.hist_cursor + 1 - h;
+        }
+        self.hist_off.set(off);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        // The author only when there's room for it next to the message.
+        let author_w = if area.width >= 110 { commits.iter().map(|c| c.author.width()).max().unwrap_or(0).min(20) } else { 0 };
+        for (i, c) in commits.iter().enumerate().skip(off).take(h) {
+            let y = list_area.y + (i - off) as u16;
+            let base = if i == self.hist_cursor { Style::new().bg(p.sel_bg) } else { Style::new() };
+            buf.set_style(Rect::new(area.x, y, area.width, 1), base);
+
+            // Author and time on the right.
+            let when = relative_time(now - c.time);
+            let when_w = 13; // "11 months ago"
+            let mut author = c.author.clone();
+            while author.width() > author_w {
+                author.pop();
+            }
+            let right_w = (if author_w > 0 { author_w + 2 } else { 0 } + when_w) as u16;
+            let rx = right.saturating_sub(right_w);
+            let lim = rx.saturating_sub(2);
+            let mut x = rx;
+            put(buf, &mut x, y, right, &author, base.fg(p.muted));
+            let mut x = right.saturating_sub(when.width() as u16);
+            put(buf, &mut x, y, right, &when, base.fg(p.faint));
+
+            let mut x = area.x + 1;
+            if c.unpushed {
+                put(buf, &mut x, y, lim, "↑ ", base.fg(p.green));
+            } else {
+                x += 2;
+            }
+            put(buf, &mut x, y, lim, &c.short, base.fg(p.yellow));
+            x += 1;
+            if !c.refs.is_empty() {
+                put(buf, &mut x, y, lim, &format!("({}) ", c.refs.join(", ")), base.fg(p.blue));
+            }
+            let subject_style = if c.merge { base.fg(p.muted) } else { base };
+            put(buf, &mut x, y, lim, &c.subject, subject_style);
+        }
     }
 
     /// The Branches screen: one row per local branch.
@@ -1224,12 +1387,14 @@ impl App {
                 ("2", "branches"),
                 ("q", "quit"),
             ],
+            View::History => &[("↑↓", "move"), ("esc", "back"), ("1", "changes"), ("q", "quit")],
             View::Branches => &[
                 ("↑↓", "move"),
                 ("space", "checkout"),
                 ("p", "pull"),
                 ("P", "push"),
                 ("m", "merge into current"),
+                ("⏎", "history"),
                 ("1", "changes"),
                 ("q", "quit"),
             ],
