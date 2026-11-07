@@ -310,3 +310,8 @@ If the panel ever crashes, the error is written to
 - History shows up to 1,000 commits per branch.
 - Commands can't answer prompts: an SSH key without an agent, or a hook that
   asks for input, makes them fail with a message instead.
+
+## License
+
+[MIT](LICENSE): use it, copy it, change it, and share it, as long as the
+copyright and license notice stay with the code.
