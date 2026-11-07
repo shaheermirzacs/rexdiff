@@ -7,14 +7,17 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use git2::{BranchType, Delta, DiffOptions, Patch, Repository, Status, StatusOptions, Tree};
+use git2::{BranchType, Delta, DiffOptions, Oid, Patch, Repository, Sort, Status, StatusOptions, Tree};
 
 use crate::highlight::{Highlighter, Span};
+
+/// The history screen shows at most this many commits.
+const MAX_HISTORY: usize = 1000;
 
 /// Larger diffs are truncated (nobody reads 50k lines in a pane).
 const MAX_ROWS: usize = 50_000;
@@ -91,6 +94,21 @@ pub enum Job {
     Pull { name: String },
     /// Update the branch from its upstream, then merge it into the current one.
     Merge { name: String },
+    /// The commit history of a local branch.
+    History { branch: String },
+}
+
+/// One commit, for the history screen.
+pub struct CommitInfo {
+    pub short: String,
+    pub subject: String,
+    pub author: String,
+    pub time: i64,
+    /// On the branch but not on its upstream yet.
+    pub unpushed: bool,
+    pub merge: bool,
+    /// Branches and tags pointing at it (`main`, `origin/main`, `tag: v1.0`).
+    pub refs: Vec<String>,
 }
 
 /// A local branch, for the Branches screen.
@@ -109,6 +127,7 @@ pub enum Msg {
     Diff(FileDiff),
     Error(String),
     Branches(Result<Vec<BranchInfo>, String>),
+    History { branch: String, commits: Result<Vec<CommitInfo>, String> },
     /// A long-running step is under way ("Pushing main to origin/main…").
     Progress(String),
     /// A commit, checkout, or push finished: a summary, or what went wrong.
@@ -127,10 +146,12 @@ pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
         let mut stage_jobs = Vec::new();
         let mut commit_job = None;
         let mut branches = false;
+        let mut history_job = None;
         let mut actions = Vec::new();
         for job in std::iter::once(first).chain(rx.try_iter()) {
             match job {
                 Job::Branches => branches = true,
+                Job::History { branch } => history_job = Some(branch),
                 Job::Checkout { .. } | Job::Push { .. } | Job::Pull { .. } | Job::Merge { .. } => {
                     actions.push(job)
                 }
@@ -177,6 +198,13 @@ pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
             let _ = tx.send(Msg::Done(done));
             refresh = true;
             branches = true;
+        }
+
+        if let Some(branch) = history_job {
+            let commits = history(r, &branch).map_err(|e| e.message().to_string());
+            if tx.send(Msg::History { branch, commits }).is_err() {
+                return;
+            }
         }
 
         if branches {
@@ -262,6 +290,73 @@ fn list_branches(repo: &Repository) -> Result<Vec<BranchInfo>, git2::Error> {
     }
     out.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
+}
+
+/// The newest commits of a local branch, marking the ones its upstream doesn't
+/// have and the refs that point at each.
+fn history(repo: &Repository, name: &str) -> Result<Vec<CommitInfo>, git2::Error> {
+    let branch = repo.find_branch(name, BranchType::Local)?;
+    let tip = branch.get().target().ok_or_else(|| git2::Error::from_str("this branch has no commits"))?;
+    let unpushed: HashSet<Oid> = match branch.upstream().ok().and_then(|u| u.get().target()) {
+        Some(up) => {
+            let mut walk = repo.revwalk()?;
+            walk.push(tip)?;
+            walk.hide(up)?;
+            walk.take(MAX_HISTORY).filter_map(Result::ok).collect()
+        }
+        None => HashSet::new(),
+    };
+    let labels = ref_labels(repo);
+
+    let mut walk = repo.revwalk()?;
+    walk.push(tip)?;
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
+    let mut out = Vec::new();
+    for oid in walk.take(MAX_HISTORY) {
+        let oid = oid?;
+        let c = repo.find_commit(oid)?;
+        let author = c.author();
+        out.push(CommitInfo {
+            short: c.as_object().short_id()?.as_str().unwrap_or_default().to_string(),
+            subject: sanitize(c.summary().ok().flatten().unwrap_or_default()),
+            author: author.name().ok().unwrap_or("?").to_string(),
+            time: c.time().seconds(),
+            unpushed: unpushed.contains(&oid),
+            merge: c.parent_count() > 1,
+            refs: labels.get(&oid).cloned().unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
+
+/// Branches (local and remote) and tags, by the commit they point at.
+fn ref_labels(repo: &Repository) -> HashMap<Oid, Vec<String>> {
+    let mut map: HashMap<Oid, Vec<String>> = HashMap::new();
+    let Ok(refs) = repo.references() else { return map };
+    for r in refs.flatten() {
+        let Some(short) = r.shorthand().ok().map(str::to_string) else { continue };
+        if short == "HEAD" || short.ends_with("/HEAD") {
+            continue;
+        }
+        let Ok(commit) = r.peel_to_commit() else { continue };
+        let label = if r.is_tag() { format!("tag: {short}") } else { short };
+        map.entry(commit.id()).or_default().push(label);
+    }
+    // `main` and `origin/main` on the same commit: just `main` (the Branches
+    // screen already says it's in sync).
+    for labels in map.values_mut() {
+        let locals: Vec<String> = labels.iter().filter(|l| !l.contains('/') || !is_remote_label(repo, l)).cloned().collect();
+        labels.retain(|l| {
+            !is_remote_label(repo, l)
+                || !locals.iter().any(|local| l.split_once('/').is_some_and(|(_, rest)| rest == local))
+        });
+    }
+    map
+}
+
+/// `origin/main` is a remote label; `feature/x` (a local branch) is not.
+fn is_remote_label(repo: &Repository, label: &str) -> bool {
+    label.split_once('/').is_some_and(|(remote, _)| repo.find_remote(remote).is_ok())
 }
 
 fn checkout(dir: &Path, name: &str) -> Result<String, String> {
