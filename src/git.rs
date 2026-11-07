@@ -84,6 +84,10 @@ pub enum Job {
     Stage { path: String, add: bool },
     /// `git commit -m message`.
     Commit { message: String },
+    /// Throw away changes: `restore` paths go back to `HEAD` (index and disk),
+    /// `new` paths (not in `HEAD`) are unstaged and deleted. `label` names
+    /// what was discarded, for the result message.
+    Discard { restore: Vec<String>, new: Vec<String>, label: String },
     /// List the local branches.
     Branches,
     /// `git switch <name>`.
@@ -147,11 +151,13 @@ pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
         let mut commit_job = None;
         let mut branches = false;
         let mut history_job = None;
+        let mut discard_job = None;
         let mut actions = Vec::new();
         for job in std::iter::once(first).chain(rx.try_iter()) {
             match job {
                 Job::Branches => branches = true,
                 Job::History { branch } => history_job = Some(branch),
+                Job::Discard { restore, new, label } => discard_job = Some((restore, new, label)),
                 Job::Checkout { .. } | Job::Push { .. } | Job::Pull { .. } | Job::Merge { .. } => {
                     actions.push(job)
                 }
@@ -174,6 +180,15 @@ pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
             if let Err(e) = stage(r, &path, add) {
                 let _ = tx.send(Msg::Error(format!("Could not {} {path}: {}", if add { "stage" } else { "unstage" }, e.message())));
             }
+            refresh = true;
+        }
+
+        if let Some((restore, new, label)) = discard_job {
+            let done = match r.workdir() {
+                Some(dir) => discard(dir, &restore, &new, &label),
+                None => Err("This repository has no working tree".into()),
+            };
+            let _ = tx.send(Msg::Done(done));
             refresh = true;
         }
 
@@ -453,6 +468,39 @@ fn merge_into_current(dir: &Path, name: &str, tx: &Sender<Msg>) -> Result<String
         return Ok(format!("{current} already has everything from {name}"));
     }
     Ok(format!("Merged {name} into {current}"))
+}
+
+/// Throws away changes. Files `HEAD` has go back to it, in the index and on
+/// disk; new files are taken out of the index and deleted, along with folders
+/// that end up empty.
+fn discard(dir: &Path, restore: &[String], new: &[String], label: &str) -> Result<String, String> {
+    if !restore.is_empty() {
+        let mut args = vec!["restore", "--source=HEAD", "--staged", "--worktree", "--"];
+        args.extend(restore.iter().map(String::as_str));
+        run_git(dir, &args)?;
+    }
+    if !new.is_empty() {
+        let mut args = vec!["rm", "--cached", "--quiet", "--ignore-unmatch", "--"];
+        args.extend(new.iter().map(String::as_str));
+        run_git(dir, &args)?;
+        for path in new {
+            let file = dir.join(path);
+            match std::fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("Could not delete {path}: {e}")),
+            }
+            // Remove the folders this left empty, up to the repository root.
+            let mut parent = file.parent();
+            while let Some(d) = parent {
+                if d == dir || std::fs::remove_dir(d).is_err() {
+                    break;
+                }
+                parent = d.parent();
+            }
+        }
+    }
+    Ok(format!("Discarded {label}"))
 }
 
 /// `git commit -m message` with what's staged.
