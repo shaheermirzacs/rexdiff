@@ -97,6 +97,8 @@ struct App {
     flash: Option<Flash>,
     /// The commit message being typed (`c`), while the box is open.
     commit_box: Option<String>,
+    /// A discard (`d`) waiting for `y`.
+    confirm: Option<Confirm>,
     /// A commit in progress, and what it's doing.
     busy: Option<String>,
     quit: bool,
@@ -149,6 +151,7 @@ pub fn run(cwd: PathBuf) -> std::io::Result<()> {
         dragging: false,
         flash: None,
         commit_box: None,
+        confirm: None,
         busy: None,
         quit: false,
     };
@@ -500,6 +503,14 @@ impl App {
             self.on_commit_key(k);
             return;
         }
+        // A pending discard: `y` goes ahead, any other key cancels.
+        if let Some(c) = self.confirm.take() {
+            if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.busy = Some(format!("Discarding {}…", c.label));
+                let _ = self.jobs.send(Job::Discard { restore: c.restore, new: c.new, label: c.label });
+            }
+            return;
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Char('q') => return self.quit = true,
@@ -516,6 +527,7 @@ impl App {
         let page = self.areas.diff.height.max(2) as isize - 1;
         match k.code {
             KeyCode::Char('c') if !ctrl => self.open_commit_box(),
+            KeyCode::Char('d') if !ctrl => self.ask_discard(),
             KeyCode::Char('d') if ctrl => self.scroll_diff(page / 2),
             KeyCode::Char('u') if ctrl => self.scroll_diff(-page / 2),
             KeyCode::Up | KeyCode::Char('k') => self.move_row(-1),
@@ -675,6 +687,36 @@ impl App {
         let name = b.name.clone();
         self.busy = Some(format!("Pushing {name}…"));
         let _ = self.jobs.send(Job::Push { name });
+    }
+
+    /// `d`: get ready to throw away the changes of the file or folder under
+    /// the cursor, and ask for confirmation in the footer.
+    fn ask_discard(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(row) = self.rows.get(self.cursor) else { return };
+        let files = self.files();
+        let (label, picked): (String, Vec<&git::FileEntry>) = match &row.item {
+            Item::File { idx, .. } => (files[*idx].path.clone(), vec![&files[*idx]]),
+            Item::Dir { path, .. } => {
+                let prefix = format!("{path}/");
+                (prefix.clone(), files.iter().filter(|f| f.path.starts_with(&prefix)).collect())
+            }
+        };
+        if picked.is_empty() {
+            return;
+        }
+        let label = if picked.len() > 1 { format!("{label} ({} files)", picked.len()) } else { label };
+        // New files aren't in HEAD: discarding them means deleting them.
+        let (new, restore): (Vec<_>, Vec<_>) = picked.into_iter().partition(|f| f.status == 'A');
+        let confirm = Confirm {
+            label,
+            restore: restore.iter().map(|f| f.path.clone()).collect(),
+            new: new.iter().map(|f| f.path.clone()).collect(),
+        };
+        self.flash = None;
+        self.confirm = Some(confirm);
     }
 
     fn open_commit_box(&mut self) {
@@ -1366,6 +1408,20 @@ impl App {
         if let Some(msg) = &self.commit_box {
             return Some(self.draw_commit_box(buf, area, y, msg));
         }
+        if let Some(c) = &self.confirm {
+            let red = Style::new().fg(p.red);
+            put(buf, &mut x, y, right, &format!("Discard changes to {}? ", c.label), red.add_modifier(Modifier::BOLD));
+            if !c.new.is_empty() {
+                let n = c.new.len();
+                let files = if n == 1 { "new file" } else { "new files" };
+                put(buf, &mut x, y, right, &format!("{n} {files} will be deleted for good. "), red);
+            }
+            put(buf, &mut x, y, right, "y", Style::new().fg(p.muted));
+            put(buf, &mut x, y, right, " discard   ", Style::new().fg(p.faint));
+            put(buf, &mut x, y, right, "any key", Style::new().fg(p.muted));
+            put(buf, &mut x, y, right, " cancel", Style::new().fg(p.faint));
+            return None;
+        }
         if let Some(busy) = &self.busy {
             put(buf, &mut x, y, right, "◌ ", Style::new().fg(p.blue));
             put(buf, &mut x, y, right, busy, Style::new().fg(p.muted));
@@ -1383,6 +1439,7 @@ impl App {
                 ("←→", "folders"),
                 ("space", "stage/fold"),
                 ("c", "commit"),
+                ("d", "discard"),
                 ("x", "whole file"),
                 ("2", "branches"),
                 ("q", "quit"),
@@ -1448,6 +1505,15 @@ impl App {
         put(buf, &mut tx, y, field_end, shown, Style::new().bg(p.pill_bg));
         (tx, y)
     }
+}
+
+/// What `d` is about to throw away, until `y` confirms it.
+struct Confirm {
+    label: String,
+    /// Files `HEAD` has: they go back to it.
+    restore: Vec<String>,
+    /// New files: they get deleted.
+    new: Vec<String>,
 }
 
 /// A message shown in the footer for a few seconds.
