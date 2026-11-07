@@ -45,6 +45,8 @@ left and the diff on the right.
   to unstage it. Each file shows `✓` (staged), `◐` (staged, then changed
   again), or `○` (not staged); reviewed files fade, folders get a `✓` when
   everything in them is staged, and the header counts your progress.
+- **Discard what you don't want.** `d` on a file or folder throws its changes
+  away, after you confirm with `y`.
 - **Commit from the panel.** Press `c`, type the message, and Enter commits
   what's staged. It runs the real `git`, so your hooks and commit signing work
   as usual.
@@ -138,6 +140,7 @@ does nothing.
 | `J` / `K` | Scroll the diff one line |
 | `g` / `G` | Top / bottom of the diff |
 | `c` | Commit what's staged (see below) |
+| `d` | Discard the changes of the file or folder under the cursor (see below) |
 | `x` | Toggle between changed hunks only and the whole file |
 | `+` / `-` | Make the tree bigger / smaller |
 | `1` / `2` | Changes / Branches screen (or click the tabs in the header). They work on every screen |
@@ -169,6 +172,19 @@ wrong. Nothing is pushed.
 `git` runs detached from the panel's terminal, so it can't stop to ask for
 anything: a hook that needs input makes the commit fail with a message instead
 of hanging.
+
+### Discard
+
+`d` on a file or folder asks, in red in the footer, before throwing its changes
+away. Press `y` to go ahead; any other key cancels.
+
+- A file the last commit has (modified, deleted, partly staged) goes back to
+  that version, both in the index and on disk
+  (`git restore --source=HEAD --staged --worktree`).
+- A new file is taken out of the index and **deleted**, along with any folder
+  that ends up empty. The prompt says how many new files will go, because
+  there's no getting them back.
+- On a folder, it does this to every changed file inside it.
 
 ### Branches
 
@@ -277,6 +293,7 @@ the way of your own `git` commands. The only writes are the ones you ask for:
 | --- | --- | --- |
 | Changes | `space` on a file | `git add` / `git restore --staged` |
 | Changes | `c`, then Enter | `git commit -m <message>` |
+| Changes | `d`, then `y` | `git restore --source=HEAD --staged --worktree` for files the last commit has; new files are unstaged and deleted |
 | Branches | `space` | `git switch <branch>` |
 | Branches | `p` | `git pull` on the current branch; `git fetch <remote> <branch>:<branch>` (fast-forward only) on any other |
 | Branches | `P` | `git push`, or `git push -u origin <branch>` the first time |
