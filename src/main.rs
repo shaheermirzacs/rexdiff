@@ -26,6 +26,16 @@ In the panel:
   Tab / Shift-Tab next / previous file, wrapping around
   f / b           scroll the diff one page   J K  one line   g / G  top / bottom
   x               toggle between changed hunks only and the whole file
+  c               commit what's staged: type the message, Enter commits, Esc cancels
+  1 / 2           Changes / Branches screen
+
+On the Branches screen:
+  ↑↓ / j k        move between local branches
+  space / Enter   check out the branch
+  p               pull the branch (current: git pull; others: fast-forward only)
+  P (Shift+P)     push the branch (to its upstream, or `origin` with -u)
+  m               update the branch from its upstream, then merge it into the current one
+  Esc / 1         back to Changes
   + -             tree height                r    reload the repository   q  quit
   The mouse works too: click, scroll, and drag the divider.
 ";
