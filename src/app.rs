@@ -1,5 +1,6 @@
 //! The panel: state, keyboard/mouse input, and drawing.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -7,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
@@ -16,7 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::git::{self, FileDiff, Job, Msg, RowKind, Snapshot, Staged};
+use crate::git::{self, BranchInfo, FileDiff, Job, Msg, RowKind, Snapshot, Staged};
 use crate::theme::{self, Palette};
 use crate::tree::{self, Item, TreeRow};
 use crate::wrap::{wrap_row, WrapCache};
@@ -47,8 +48,23 @@ const CHROME_ROWS: u16 = 7;
 /// left and the diff on the right.
 const SIDE_MIN_WIDTH: u16 = 160;
 
+/// The two screens: changed files with their diff, and the local branches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Changes,
+    Branches,
+}
+
 struct App {
     jobs: Sender<Job>,
+    view: View,
+    /// Column ranges of the "Changes" and "Branches" tabs in the header, for clicks.
+    tabs: Cell<[(u16, u16); 2]>,
+
+    branches: Option<Result<Vec<BranchInfo>, String>>,
+    branch_cursor: usize,
+    /// First visible branch row (updated while drawing).
+    branch_off: Cell<usize>,
     pal: Palette,
     detected: Option<theme::Detected>,
 
@@ -71,7 +87,11 @@ struct App {
     areas: Areas,
     dragging: bool,
     /// A short message in the footer (errors, mostly) and when it goes away.
-    flash: Option<(String, Instant)>,
+    flash: Option<Flash>,
+    /// The commit message being typed (`c`), while the box is open.
+    commit_box: Option<String>,
+    /// A commit in progress, and what it's doing.
+    busy: Option<String>,
     quit: bool,
 }
 
@@ -90,10 +110,15 @@ pub fn run(cwd: PathBuf) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
     log_panics();
     let detected = theme::query(Duration::from_millis(400));
-    execute!(std::io::stdout(), EnableMouseCapture)?;
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
 
     let mut app = App {
         jobs: job_tx,
+        view: View::Changes,
+        tabs: Cell::new([(0, 0); 2]),
+        branches: None,
+        branch_cursor: 0,
+        branch_off: Cell::new(0),
         pal: Palette::from(detected),
         detected,
         snapshot: None,
@@ -112,11 +137,13 @@ pub fn run(cwd: PathBuf) -> std::io::Result<()> {
         areas: Areas::default(),
         dragging: false,
         flash: None,
+        commit_box: None,
+        busy: None,
         quit: false,
     };
 
     let res = app.event_loop(&mut terminal, &msg_rx, &fs_rx);
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     res
 }
@@ -185,6 +212,11 @@ impl App {
                     match event::read()? {
                         Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
                         Event::Mouse(m) => self.on_mouse(m),
+                        Event::Paste(text) => {
+                            if let Some(msg) = self.commit_box.as_mut() {
+                                msg.push_str(&text.replace(['\n', '\r'], " "));
+                            }
+                        }
                         _ => {}
                     }
                     if !event::poll(Duration::ZERO)? {
@@ -199,7 +231,7 @@ impl App {
                 self.on_msg(msg);
                 dirty = true;
             }
-            if self.flash.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
+            if self.flash.as_ref().is_some_and(|f| Instant::now() >= f.until) {
                 self.flash = None;
                 dirty = true;
             }
@@ -210,6 +242,9 @@ impl App {
             let now = Instant::now();
             if refresh_due.is_some_and(|t| now >= t) || now - last_refresh >= FALLBACK_REFRESH {
                 let _ = self.jobs.send(Job::Refresh);
+                if self.view == View::Branches {
+                    let _ = self.jobs.send(Job::Branches);
+                }
                 refresh_due = None;
                 last_refresh = now;
             }
@@ -266,7 +301,29 @@ impl App {
                     self.request_diff();
                 }
             }
-            Msg::Error(e) => self.flash = Some((e, Instant::now() + Duration::from_secs(6))),
+            Msg::Error(e) => self.flash = Some(Flash::new(e, false)),
+            Msg::Branches(list) => {
+                // Keep the cursor on the same branch; the first time, on the current one.
+                let keep = self.selected_branch().map(|b| b.name.clone());
+                let first_load = self.branches.is_none();
+                self.branches = Some(list);
+                if let Some(Ok(l)) = &self.branches {
+                    let pos = if first_load {
+                        l.iter().position(|b| b.current)
+                    } else {
+                        keep.and_then(|n| l.iter().position(|b| b.name == n))
+                    };
+                    self.branch_cursor = pos.unwrap_or(self.branch_cursor).min(l.len().saturating_sub(1));
+                }
+            }
+            Msg::Progress(p) => self.busy = Some(p),
+            Msg::Done(result) => {
+                self.busy = None;
+                self.flash = Some(match result {
+                    Ok(summary) => Flash::new(format!("✓ {summary}"), true),
+                    Err(e) => Flash::new(e, false),
+                });
+            }
             Msg::Diff(d) => {
                 if Some(&d.path) == self.active.as_ref() && d.context == self.context() {
                     let same_file = self.diff.as_ref().is_some_and(|old| old.path == d.path);
@@ -415,11 +472,24 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
-        let page = self.areas.diff.height.max(2) as isize - 1;
+        if self.commit_box.is_some() {
+            self.on_commit_key(k);
+            return;
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
-            KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('q') => return self.quit = true,
+            KeyCode::Char('c') if ctrl => return self.quit = true,
+            KeyCode::Char('1') => return self.show_view(View::Changes),
+            KeyCode::Char('2') => return self.show_view(View::Branches),
+            _ => {}
+        }
+        if self.view == View::Branches {
+            return self.on_branches_key(k);
+        }
+        let page = self.areas.diff.height.max(2) as isize - 1;
+        match k.code {
+            KeyCode::Char('c') if !ctrl => self.open_commit_box(),
             KeyCode::Char('d') if ctrl => self.scroll_diff(page / 2),
             KeyCode::Char('u') if ctrl => self.scroll_diff(-page / 2),
             KeyCode::Up | KeyCode::Char('k') => self.move_row(-1),
@@ -459,7 +529,161 @@ impl App {
         }
     }
 
+    fn show_view(&mut self, view: View) {
+        if view == View::Branches {
+            let _ = self.jobs.send(Job::Branches);
+        }
+        self.view = view;
+    }
+
+    fn selected_branch(&self) -> Option<&BranchInfo> {
+        match &self.branches {
+            Some(Ok(l)) => l.get(self.branch_cursor),
+            _ => None,
+        }
+    }
+
+    /// Branches screen: move, `space`/`Enter` checks out, `p` pulls, `P` pushes,
+    /// `m` merges the selected branch into the current one.
+    fn on_branches_key(&mut self, k: KeyEvent) {
+        let len = match &self.branches {
+            Some(Ok(l)) => l.len(),
+            _ => 0,
+        };
+        let move_by = |c: usize, d: isize| (c as isize + d).clamp(0, len.saturating_sub(1) as isize) as usize;
+        match k.code {
+            KeyCode::Esc => self.view = View::Changes,
+            KeyCode::Up | KeyCode::Char('k') => self.branch_cursor = move_by(self.branch_cursor, -1),
+            KeyCode::Down | KeyCode::Char('j') => self.branch_cursor = move_by(self.branch_cursor, 1),
+            KeyCode::Home | KeyCode::Char('g') => self.branch_cursor = 0,
+            KeyCode::End | KeyCode::Char('G') => self.branch_cursor = len.saturating_sub(1),
+            KeyCode::Char(' ') | KeyCode::Enter => self.checkout_selected(),
+            KeyCode::Char('P') => self.push_selected(),
+            KeyCode::Char('p') => self.pull_selected(),
+            KeyCode::Char('m') => self.merge_selected(),
+            KeyCode::Char('r') => {
+                let _ = self.jobs.send(Job::Branches);
+            }
+            _ => {}
+        }
+    }
+
+    fn checkout_selected(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(b) = self.selected_branch() else { return };
+        if b.current {
+            self.flash = Some(Flash::new(format!("Already on {}", b.name), true));
+            return;
+        }
+        let name = b.name.clone();
+        self.busy = Some(format!("Switching to {name}…"));
+        let _ = self.jobs.send(Job::Checkout { name });
+    }
+
+    fn merge_selected(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(b) = self.selected_branch() else { return };
+        if b.current {
+            self.flash = Some(Flash::new(format!("{} is the branch you're on: pick another one to merge", b.name), false));
+            return;
+        }
+        let name = b.name.clone();
+        self.busy = Some(format!("Merging {name}…"));
+        let _ = self.jobs.send(Job::Merge { name });
+    }
+
+    fn pull_selected(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(b) = self.selected_branch() else { return };
+        let name = b.name.clone();
+        self.busy = Some(format!("Pulling {name}…"));
+        let _ = self.jobs.send(Job::Pull { name });
+    }
+
+    fn push_selected(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(b) = self.selected_branch() else { return };
+        let name = b.name.clone();
+        self.busy = Some(format!("Pushing {name}…"));
+        let _ = self.jobs.send(Job::Push { name });
+    }
+
+    fn open_commit_box(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let staged = self.files().iter().filter(|f| f.staged != Staged::No).count();
+        if staged == 0 {
+            self.flash = Some(Flash::new("Nothing staged yet: press space on a file to stage it".into(), false));
+            return;
+        }
+        self.flash = None;
+        self.commit_box = Some(String::new());
+    }
+
+    /// Typing in the commit box. Enter commits, Esc cancels.
+    fn on_commit_key(&mut self, k: KeyEvent) {
+        let Some(msg) = self.commit_box.as_mut() else { return };
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc => self.commit_box = None,
+            KeyCode::Char('c') if ctrl => self.commit_box = None,
+            KeyCode::Enter => {
+                let message = msg.trim().to_string();
+                if message.is_empty() {
+                    return;
+                }
+                self.commit_box = None;
+                self.busy = Some("Committing…".into());
+                let _ = self.jobs.send(Job::Commit { message });
+            }
+            KeyCode::Backspace if k.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                delete_word(msg);
+            }
+            KeyCode::Backspace => {
+                msg.pop();
+            }
+            KeyCode::Char('u') if ctrl => msg.clear(),
+            KeyCode::Char('w') if ctrl => delete_word(msg),
+            KeyCode::Char(c) if !ctrl => msg.push(c),
+            _ => {}
+        }
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) {
+        if m.kind == MouseEventKind::Down(MouseButton::Left) && m.row == 0 {
+            for (i, (x0, x1)) in self.tabs.get().iter().enumerate() {
+                if m.column >= *x0 && m.column < *x1 {
+                    return self.show_view(if i == 0 { View::Changes } else { View::Branches });
+                }
+            }
+        }
+        if self.view == View::Branches {
+            let len = match &self.branches {
+                Some(Ok(l)) => l.len(),
+                _ => 0,
+            };
+            match m.kind {
+                MouseEventKind::ScrollDown => self.branch_cursor = (self.branch_cursor + 1).min(len.saturating_sub(1)),
+                MouseEventKind::ScrollUp => self.branch_cursor = self.branch_cursor.saturating_sub(1),
+                MouseEventKind::Down(MouseButton::Left) if m.row >= 2 => {
+                    let row = self.branch_off.get() + (m.row - 2) as usize;
+                    if row < len {
+                        self.branch_cursor = row;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         let a = self.areas;
         let inside = |r: Rect| m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height;
         let in_tree = inside(a.tree);
@@ -533,6 +757,12 @@ impl App {
         self.scroll_diff(0);
     }
 
+    /// A blank row above the footer while the commit box is open, so it doesn't
+    /// sit right against the diff.
+    fn footer_gap(&self) -> u16 {
+        u16::from(self.commit_box.is_some())
+    }
+
     /// Tree on top, diff below.
     fn stacked_layout(&self, area: Rect) -> Areas {
         // Header, rule, [tree], margin, hr, margin, title, [diff], footer.
@@ -545,7 +775,7 @@ impl App {
         let tree = Rect::new(area.x, area.y + 2, area.width, tree_h);
         let splitter = tree.y + tree_h + 1;
         let title = Rect::new(area.x, splitter + 2, area.width, 1);
-        let diff_h = area.height.saturating_sub(tree_h + CHROME_ROWS);
+        let diff_h = area.height.saturating_sub(tree_h + CHROME_ROWS + self.footer_gap());
         let diff = Rect::new(area.x, title.y + 1, area.width, diff_h);
         Areas { side: false, tree, splitter, title, diff }
     }
@@ -554,7 +784,7 @@ impl App {
     fn side_layout(&self, area: Rect) -> Areas {
         // Header, rule, [tree | divider | title + diff], footer.
         let body_y = area.y + 2;
-        let body_h = area.height.saturating_sub(3);
+        let body_h = area.height.saturating_sub(3 + self.footer_gap());
         // As wide as the longest row needs, within 28 columns and 35% of the pane.
         let files = self.files();
         let needed = self
@@ -597,22 +827,34 @@ impl App {
             Some(Ok(s)) => s,
         };
 
-        self.draw_header(buf, area, snapshot);
+        self.tabs.set(self.draw_header(buf, area, snapshot));
         hline(buf, area.x, area.y + 1, area.width, p.rule);
+
+        if self.view == View::Branches {
+            self.draw_branches(buf, area);
+            self.draw_footer(buf, area);
+            return;
+        }
 
         if files.is_empty() {
             let rest = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
             center(buf, rest, "No changes ✓  working tree clean", p.faint);
+            // Still show the footer: the result of a commit that took everything lands here.
+            self.draw_footer(buf, area);
             return;
         }
 
         self.draw_tree(buf);
         self.draw_splitter(buf, area);
         self.draw_diff(buf);
-        self.draw_footer(buf, area);
+        let cursor = self.draw_footer(buf, area);
+        if let Some(pos) = cursor {
+            f.set_cursor_position(pos);
+        }
     }
 
-    fn draw_header(&self, buf: &mut Buffer, area: Rect, s: &Snapshot) {
+    /// Tabs, file count, branch, and totals. Returns the tabs' column ranges.
+    fn draw_header(&self, buf: &mut Buffer, area: Rect, s: &Snapshot) -> [(u16, u16); 2] {
         let p = &self.pal;
         let y = area.y;
         let (adds, dels) = s.files.iter().fold((0, 0), |(a, d), f| (a + f.adds, d + f.dels));
@@ -624,16 +866,109 @@ impl App {
         put(buf, &mut x, y, right, &format!(" −{dels}"), Style::new().fg(p.red));
 
         let lim = rx.saturating_sub(1);
+        let tab = |on: bool| {
+            if on { Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED) } else { Style::new().fg(p.faint) }
+        };
         let mut x = area.x + 1;
-        put(buf, &mut x, y, lim, "Changes", Style::new().add_modifier(Modifier::BOLD));
+        let changes_x = x;
+        put(buf, &mut x, y, lim, "Changes", tab(self.view == View::Changes));
         x += 1;
         let n = s.files.len();
         let pill = format!(" {n} {} ", if n == 1 { "file" } else { "files" });
         put(buf, &mut x, y, lim, &pill, Style::new().fg(p.muted).bg(p.pill_bg));
-        put(buf, &mut x, y, lim, &format!("  ⎇ {}", s.branch), Style::new().fg(p.muted));
-        let done = s.files.iter().filter(|f| f.staged == Staged::Fully).count();
-        let st = Style::new().fg(if done == n { p.green } else { p.muted });
-        put(buf, &mut x, y, lim, &format!("   ✓ {done}/{n} staged"), st);
+        let changes_end = x;
+        x += 2;
+        let branches_x = x;
+        put(buf, &mut x, y, lim, "Branches", tab(self.view == View::Branches));
+        let branches_end = x;
+        put(buf, &mut x, y, lim, &format!("   ⎇ {}", s.branch), Style::new().fg(p.muted));
+        if self.view == View::Changes && n > 0 {
+            let done = s.files.iter().filter(|f| f.staged == Staged::Fully).count();
+            let st = Style::new().fg(if done == n { p.green } else { p.muted });
+            put(buf, &mut x, y, lim, &format!("   ✓ {done}/{n} staged"), st);
+        }
+        [(changes_x, changes_end), (branches_x, branches_end)]
+    }
+
+    /// The Branches screen: one row per local branch.
+    fn draw_branches(&self, buf: &mut Buffer, area: Rect) {
+        let p = &self.pal;
+        let list_area = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(3));
+        let list = match &self.branches {
+            None => return center(buf, list_area, "Loading branches…", p.faint),
+            Some(Err(e)) => return center(buf, list_area, e, p.muted),
+            Some(Ok(l)) if l.is_empty() => {
+                return center(buf, list_area, "No branches yet: make the first commit", p.faint);
+            }
+            Some(Ok(l)) => l,
+        };
+
+        // Keep the cursor visible.
+        let h = list_area.height as usize;
+        let mut off = self.branch_off.get();
+        if self.branch_cursor < off {
+            off = self.branch_cursor;
+        } else if h > 0 && self.branch_cursor >= off + h {
+            off = self.branch_cursor + 1 - h;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let name_w = list.iter().map(|b| b.name.width()).max().unwrap_or(0).min(40) as u16;
+        let sync = |b: &BranchInfo| -> Vec<(String, Color)> {
+            match &b.upstream {
+                None => vec![("not pushed".into(), p.yellow)],
+                Some((u, 0, 0)) => vec![(format!("✓ {u}"), p.faint)],
+                Some((u, ahead, behind)) => {
+                    let mut v = Vec::new();
+                    if *ahead > 0 {
+                        v.push((format!("↑{ahead} "), p.green));
+                    }
+                    if *behind > 0 {
+                        v.push((format!("↓{behind} "), p.red));
+                    }
+                    v.push((u.clone(), p.faint));
+                    v
+                }
+            }
+        };
+        let sync_w = list
+            .iter()
+            .map(|b| sync(b).iter().map(|(t, _)| t.width()).sum::<usize>())
+            .max()
+            .unwrap_or(0) as u16;
+
+        for (i, b) in list.iter().enumerate().skip(off).take(h) {
+            let y = list_area.y + (i - off) as u16;
+            let base = if i == self.branch_cursor { Style::new().bg(p.sel_bg) } else { Style::new() };
+            buf.set_style(Rect::new(area.x, y, area.width, 1), base);
+            let right = area.x + area.width - 1;
+
+            // When, on the right.
+            let when = relative_time(now - b.time);
+            let mut x = right.saturating_sub(when.width() as u16);
+            let lim = x.saturating_sub(2);
+            put(buf, &mut x, y, right, &when, base.fg(p.faint));
+
+            let mut x = area.x + 1;
+            if b.current {
+                put(buf, &mut x, y, lim, "● ", base.fg(p.green));
+            } else {
+                x += 2;
+            }
+            let name_style = if b.current { base.add_modifier(Modifier::BOLD) } else { base };
+            let start = x;
+            put(buf, &mut x, y, (start + name_w).min(lim), &b.name, name_style);
+            x = start + name_w + 3;
+            let start = x;
+            for (t, c) in sync(b) {
+                put(buf, &mut x, y, lim, &t, base.fg(c));
+            }
+            x = start + sync_w + 3;
+            put(buf, &mut x, y, lim, &b.subject, base.fg(p.muted));
+        }
+        self.branch_off.set(off);
     }
 
     fn draw_tree(&self, buf: &mut Buffer) {
@@ -857,28 +1192,135 @@ impl App {
         }
     }
 
-    fn draw_footer(&self, buf: &mut Buffer, area: Rect) {
+    /// The bottom row: key hints, the commit box, progress, or a message.
+    /// Returns where the text cursor goes when the commit box is open.
+    fn draw_footer(&self, buf: &mut Buffer, area: Rect) -> Option<(u16, u16)> {
         let p = &self.pal;
         let y = area.y + area.height - 1;
-        let hints = [
-            ("↑↓", "navigate"),
-            ("←→", "folders"),
-            ("space", "stage/fold"),
-            ("x", "whole file"),
-            ("q", "quit"),
-        ];
         let mut x = area.x + 1;
         let right = area.x + area.width;
-        if let Some((msg, until)) = &self.flash
-            && Instant::now() < *until
-        {
-            put(buf, &mut x, y, right, msg, Style::new().fg(p.red));
-            return;
+
+        if let Some(msg) = &self.commit_box {
+            return Some(self.draw_commit_box(buf, area, y, msg));
         }
+        if let Some(busy) = &self.busy {
+            put(buf, &mut x, y, right, "◌ ", Style::new().fg(p.blue));
+            put(buf, &mut x, y, right, busy, Style::new().fg(p.muted));
+            return None;
+        }
+        if let Some(f) = &self.flash
+            && Instant::now() < f.until
+        {
+            put(buf, &mut x, y, right, &f.text, Style::new().fg(if f.ok { p.green } else { p.red }));
+            return None;
+        }
+        let hints: &[(&str, &str)] = match self.view {
+            View::Changes => &[
+                ("↑↓", "navigate"),
+                ("←→", "folders"),
+                ("space", "stage/fold"),
+                ("c", "commit"),
+                ("x", "whole file"),
+                ("2", "branches"),
+                ("q", "quit"),
+            ],
+            View::Branches => &[
+                ("↑↓", "move"),
+                ("space", "checkout"),
+                ("p", "pull"),
+                ("P", "push"),
+                ("m", "merge into current"),
+                ("1", "changes"),
+                ("q", "quit"),
+            ],
+        };
         for (key, what) in hints {
             put(buf, &mut x, y, right, key, Style::new().fg(p.muted));
             put(buf, &mut x, y, right, &format!(" {what}   "), Style::new().fg(p.faint));
         }
+        None
+    }
+
+    fn draw_commit_box(&self, buf: &mut Buffer, area: Rect, y: u16, msg: &str) -> (u16, u16) {
+        let p = &self.pal;
+        let right = area.x + area.width - 1;
+
+        // Hints on the right, shortened when the pane is narrow.
+        let hints: &[(&str, &str)] = &[("⏎", "commit"), ("esc", "cancel")];
+        let hints_w: u16 = hints
+            .iter()
+            .map(|(k, w)| (k.width() + if w.is_empty() { 0 } else { w.width() + 1 } + 2) as u16)
+            .sum();
+        let mut x = right.saturating_sub(hints_w);
+        let field_end = x.saturating_sub(1);
+        for (key, what) in hints {
+            put(buf, &mut x, y, right, key, Style::new().fg(p.muted));
+            if !what.is_empty() {
+                put(buf, &mut x, y, right, &format!(" {what}"), Style::new().fg(p.faint));
+            }
+            x += 2;
+        }
+
+        let mut x = area.x + 1;
+        put(buf, &mut x, y, field_end, "Commit ", Style::new().add_modifier(Modifier::BOLD));
+        let field_start = x;
+        let field_w = field_end.saturating_sub(field_start);
+        buf.set_style(Rect::new(field_start, y, field_w, 1), Style::new().bg(p.pill_bg));
+
+        let inner = field_w.saturating_sub(2) as usize;
+        let mut tx = field_start + 1;
+        if msg.is_empty() {
+            put(buf, &mut tx, y, field_end, "Commit message", Style::new().fg(p.faint).bg(p.pill_bg));
+            return (field_start + 1, y);
+        }
+        // Show the end of the message when it doesn't fit.
+        let mut shown = msg;
+        while shown.width() > inner.saturating_sub(1) && !shown.is_empty() {
+            let mut chars = shown.chars();
+            chars.next();
+            shown = chars.as_str();
+        }
+        put(buf, &mut tx, y, field_end, shown, Style::new().bg(p.pill_bg));
+        (tx, y)
+    }
+}
+
+/// A message shown in the footer for a few seconds.
+struct Flash {
+    text: String,
+    ok: bool,
+    until: Instant,
+}
+
+impl Flash {
+    fn new(text: String, ok: bool) -> Self {
+        let secs = if ok { 5 } else { 8 };
+        Self { text, ok, until: Instant::now() + Duration::from_secs(secs) }
+    }
+}
+
+/// "just now", "5 min ago", "3 hours ago", "2 days ago"…
+fn relative_time(secs: i64) -> String {
+    let (n, unit) = match secs.max(0) {
+        s if s < 60 => return "just now".into(),
+        s if s < 3600 => (s / 60, "min"),
+        s if s < 86_400 => (s / 3600, "hour"),
+        s if s < 7 * 86_400 => (s / 86_400, "day"),
+        s if s < 30 * 86_400 => (s / (7 * 86_400), "week"),
+        s if s < 365 * 86_400 => (s / (30 * 86_400), "month"),
+        s => (s / (365 * 86_400), "year"),
+    };
+    let plural = if n == 1 || unit == "min" { "" } else { "s" };
+    format!("{n} {unit}{plural} ago")
+}
+
+/// Ctrl+W / Option+Backspace: delete the last word.
+fn delete_word(s: &mut String) {
+    while s.ends_with(' ') {
+        s.pop();
+    }
+    while s.chars().last().is_some_and(|c| c != ' ') {
+        s.pop();
     }
 }
 
