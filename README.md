@@ -43,7 +43,8 @@ to the right.
   as usual.
 - **Branches.** Press `2` for a list of your local branches with how far each
   one is ahead/behind its upstream. Space checks one out, `p` pulls it,
-  Shift+P pushes it, and `m` merges it into the branch you're on.
+  Shift+P pushes it, `m` merges it into the branch you're on, and Enter shows
+  its commit history.
 - **A diff that reads well.** Line numbers, full-width green/red backgrounds,
   syntax colors, and the exact words that changed highlighted inside each line.
   Long lines wrap to the pane width, keeping the code's indentation.
@@ -177,7 +178,8 @@ has no upstream yet. The ahead/behind counts use what git last fetched.
 | Key | Action |
 | --- | --- |
 | `↑` `↓` / `j` `k` | Move |
-| `space` / `Enter` | Check out the branch (`git switch`) |
+| `space` | Check out the branch (`git switch`) |
+| `Enter` | Show the branch's commit history |
 | `p` | Pull the branch |
 | `P` (Shift+P) | Push the branch |
 | `m` | Merge the branch into the one you're on (updating it from its upstream first) |
@@ -202,6 +204,26 @@ fast-forwards `main` from `origin/main` (like `p`), then runs `git merge main`.
 If your local `main` has diverged from `origin/main` it stops before merging and
 tells you, so you never merge a stale `main` by accident. Conflicts are reported
 the same way as with pull.
+
+### History
+
+Press Enter on a branch to see its commits, newest first (up to 1,000):
+
+```
+ ‹ feature/frete  ·  13 commits  ·  ↑1 not pushed
+ ↑ 9005e63 (feature/frete) local: muda linha                Demo     just now
+   31cd565 remoto: novo arquivo                             Other  5 min ago
+   b829a13 (main) moeda: ajuste                             Demo  1 hour ago
+```
+
+Each row has the short hash, the branches and tags pointing at that commit,
+the message, the author (when the pane is wide enough), and when it was made.
+`↑` marks commits that aren't on the branch's upstream yet, the ones a push
+would send. A local branch and its remote counterpart on the same commit show
+as just the local name. Merge commits are dimmed.
+
+Move with `↑` `↓` (`f`/`b` for a page, `g`/`G` for the ends) and go back to the
+branches with `Esc`.
 
 ### Layout
 
