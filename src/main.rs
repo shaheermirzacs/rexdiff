@@ -22,7 +22,7 @@ Usage:
 In the panel:
   ↑↓ / j k        previous / next row (folders and files)
   ← → / h l       previous folder (above) / next folder (below)
-  space / Enter   open or close the folder under the cursor (on a file, its folder)
+  space / Enter   on a file: stage/unstage it (✓ = reviewed); on a folder: open/close
   Tab / Shift-Tab next / previous file, wrapping around
   f / b           scroll the diff one page   J K  one line   g / G  top / bottom
   x               toggle between changed hunks only and the whole file
