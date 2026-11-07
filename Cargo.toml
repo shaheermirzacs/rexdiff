@@ -5,6 +5,7 @@ edition = "2024"
 description = "Your git changes in a Rex pane, next to your terminal"
 repository = "https://github.com/victorvf/rexdiff"
 readme = "README.md"
+license = "MIT"
 
 [dependencies]
 git2 = { version = "0.21.0", default-features = false }
