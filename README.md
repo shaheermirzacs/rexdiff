@@ -1,11 +1,12 @@
 # rexdiff
 
 Your git changes in a [Rex](https://superlogical.com/rex) pane, right next to
-your terminal: a tree of the files that changed on top, and a colored diff of
-the selected file below.
+your terminal: a tree of the files that changed and a colored diff of the
+selected file. Review them, mark what you've read, commit, and handle your
+branches (checkout, pull, push, merge, history) without leaving the panel.
 
 ```
- Changes  6 files   ⎇ main   ✓ 2/6 staged                       +31 −13
+ Changes  6 files   Branches   ⎇ main   ✓ 2/6 staged             +31 −13
 ──────────────────────────────────────────────────────────────────────
  ▾ app/                                                         +24 −11
  ├─ ▾ services/                                                 +18 −10
@@ -23,11 +24,17 @@ the selected file below.
   1 + from decimal import Decimal, ROUND_HALF_UP
   2
   3   class Pagamento:
- ↑↓ navigate   ←→ folders   space stage/fold   c commit   x whole file   q quit
+ ↑↓ navigate   ←→ folders   space stage/fold   c commit   x whole file   2 branches   q quit
 ```
 
-In a wide pane (full screen or zoomed) the tree moves to the left and the diff
-to the right.
+The panel has three screens:
+
+- **Changes** (`1`): the tree and the diff above. Review, stage, and commit.
+- **Branches** (`2`): your local branches. Check out, pull, push, and merge.
+- **History** (Enter on a branch): that branch's commits.
+
+In a wide pane (full screen or zoomed) the Changes screen puts the tree on the
+left and the diff on the right.
 
 ## Features
 
@@ -58,13 +65,16 @@ to the right.
 - **Fast.** A single native binary. Only the visible lines are drawn, the diff
   is computed for the selected file only, and git is read in-process
   (libgit2) on a background thread, so the UI never blocks.
-- **Keyboard and mouse.** Arrow keys, click, scroll, and a draggable divider
-  between the tree and the diff.
+- **Keyboard and mouse.** Arrow keys, click (files, checkboxes, folders, and the
+  tabs in the header), scroll, and a draggable divider between the tree and the
+  diff.
 
 ## Requirements
 
 - [Rex](https://superlogical.com/rex) on macOS. (Linux should work but is
   untested.)
+- `git` on your `PATH`. Reading the repository doesn't need it, but commit,
+  checkout, pull, push, and merge run the real `git` command.
 - A Rust toolchain to build it: `brew install rust`, or
   [rustup](https://rustup.rs).
 
@@ -116,7 +126,7 @@ rexdiff help
 Each terminal pane gets its own panel. Running `rexdiff` again while it's open
 does nothing.
 
-### Keys
+### Changes screen
 
 | Key | Action |
 | --- | --- |
@@ -130,7 +140,7 @@ does nothing.
 | `c` | Commit what's staged (see below) |
 | `x` | Toggle between changed hunks only and the whole file |
 | `+` / `-` | Make the tree bigger / smaller |
-| `1` / `2` | Changes / Branches screen (or click the tabs in the header) |
+| `1` / `2` | Changes / Branches screen (or click the tabs in the header). They work on every screen |
 | `r` | Reload the repository |
 | `q` | Quit (the pane closes) |
 
@@ -242,7 +252,14 @@ branches with `Esc`.
    [ratatui](https://ratatui.rs):
    - a worker thread reads the repository with [git2](https://crates.io/crates/git2)
      (libgit2): the list of changed files compared with `HEAD` (staged,
-     unstaged, and untracked), and the diff of the selected file;
+     unstaged, and untracked) and their index state, the diff of the selected
+     file, the local branches with their ahead/behind counts, and a branch's
+     history;
+   - the same thread runs what you ask for. Stage and unstage go through
+     libgit2; commit, checkout, pull, push, and merge run the `git` command, so
+     hooks, commit signing, credential helpers, and your `pull.rebase` setting
+     all apply. Those commands run detached from the panel's terminal, so they
+     can never take over the screen to ask for input;
    - a file watcher (FSEvents on macOS, via [notify](https://crates.io/crates/notify))
      triggers a reload when something relevant changes, ignoring files covered
      by `.gitignore`;
@@ -255,9 +272,15 @@ branches with `Esc`.
 
 Reading the repository never takes git's index lock, so the panel can't get in
 the way of your own `git` commands. The only writes are the ones you ask for:
-stage/unstage with space (the same as `git add` and `git restore --staged`),
-commits with `c` (`git commit`), and checkout/pull/push on the Branches screen
-(`git switch`, `git pull`, and `git push`).
+
+| Where | Key | What runs |
+| --- | --- | --- |
+| Changes | `space` on a file | `git add` / `git restore --staged` |
+| Changes | `c`, then Enter | `git commit -m <message>` |
+| Branches | `space` | `git switch <branch>` |
+| Branches | `p` | `git pull` on the current branch; `git fetch <remote> <branch>:<branch>` (fast-forward only) on any other |
+| Branches | `P` | `git push`, or `git push -u origin <branch>` the first time |
+| Branches | `m` | Fast-forward the branch from its upstream, then `git merge <branch>` |
 
 If the panel ever crashes, the error is written to
 `~/.local/state/rexdiff/panic.log`.
@@ -267,8 +290,8 @@ If the panel ever crashes, the error is written to
 | File | What it does |
 | --- | --- |
 | `src/main.rs` | Command line: `show`, `hide`, `toggle`, `view`, and the Rex integration |
-| `src/app.rs` | The panel: state, keyboard/mouse, layout, and drawing |
-| `src/git.rs` | Background worker: changed files, diffs, word-level highlights |
+| `src/app.rs` | The panel: the Changes, Branches, and History screens, keyboard/mouse, layout, and drawing |
+| `src/git.rs` | Background worker: changed files, diffs, word-level highlights, branches, history, and the git commands (stage, commit, checkout, pull, push, merge) |
 | `src/highlight.rs` | Syntax highlighting with the terminal palette |
 | `src/tree.rs` | Builds the folder tree from the changed files |
 | `src/theme.rs` | Reads the terminal colors and derives the panel palette |
@@ -281,3 +304,9 @@ If the panel ever crashes, the error is written to
 - Renames show up as a deleted file plus an added one.
 - Very large diffs are cut at 50,000 lines, and syntax colors are skipped above
   20,000.
+- The ↑/↓ counts on the Branches screen use what git last fetched; there's no
+  fetch key yet (pull and merge fetch what they need).
+- Commit messages are a single line.
+- History shows up to 1,000 commits per branch.
+- Commands can't answer prompts: an SSH key without an agent, or a hook that
+  asks for input, makes them fail with a message instead.
