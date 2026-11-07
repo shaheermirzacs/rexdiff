@@ -5,15 +5,15 @@ your terminal: a tree of the files that changed on top, and a colored diff of
 the selected file below.
 
 ```
- Changes  6 files   ⎇ main                                      +31 −13
+ Changes  6 files   ⎇ main   ✓ 2/6 staged                       +31 −13
 ──────────────────────────────────────────────────────────────────────
  ▾ app/                                                         +24 −11
  ├─ ▾ services/                                                 +18 −10
-▎│  ├─ A frete.py                                                    +7
- │  ╰─ M pagamento.py                                           +11 −10
- ╰─ ▾ views/                                                      +4 −1
-    ╰─ M pedido.py                                                +4 −1
- M README.md                                                      +7 −1
+▎│  ├─ ✓ A frete.py                                                  +7
+ │  ╰─ ○ M pagamento.py                                         +11 −10
+ ╰─ ▾ views/ ✓                                                    +4 −1
+    ╰─ ✓ M pedido.py                                              +4 −1
+ ○ M README.md                                                    +7 −1
 
  ────────────────────────────────────────────────────────────────────
 
@@ -23,7 +23,7 @@ the selected file below.
   1 + from decimal import Decimal, ROUND_HALF_UP
   2
   3   class Pagamento:
- ↑↓ navigate   ←→ folders   space open/close   x whole file   q quit
+ ↑↓ navigate   ←→ folders   space stage/fold   x whole file   q quit
 ```
 
 In a wide pane (full screen or zoomed) the tree moves to the left and the diff
@@ -34,6 +34,10 @@ to the right.
 - **Tree of changed files only.** Folders with a single subfolder collapse into
   one row (`src/components/ui/`), each file shows its status (`A`, `M`, `D`)
   and `+N −N`, and folders add up their files.
+- **Mark files as reviewed.** Press space on a file to `git add` it, and again
+  to unstage it. Each file shows `✓` (staged), `◐` (staged, then changed
+  again), or `○` (not staged); reviewed files fade, folders get a `✓` when
+  everything in them is staged, and the header counts your progress.
 - **A diff that reads well.** Line numbers, full-width green/red backgrounds,
   syntax colors, and the exact words that changed highlighted inside each line.
   Long lines wrap to the pane width, keeping the code's indentation.
@@ -111,7 +115,7 @@ does nothing.
 | --- | --- |
 | `↑` `↓` / `j` `k` | Previous / next row (folders and files) |
 | `←` `→` / `h` `l` | Previous / next folder. An open folder lands on its first file |
-| `space` / `Enter` | Open or close the folder under the cursor (on a file, its folder) |
+| `space` / `Enter` | On a file: stage it, or unstage it if it's fully staged. On a folder: open or close it |
 | `Tab` / `Shift-Tab` | Next / previous file, wrapping around |
 | `f` / `b`, `PgDn` / `PgUp` | Scroll the diff one page |
 | `J` / `K` | Scroll the diff one line |
@@ -121,8 +125,12 @@ does nothing.
 | `r` | Reload the repository |
 | `q` | Quit (the pane closes) |
 
-With the mouse: click a file to show it, click a folder to open or close it,
-scroll over the tree or the diff, and drag the divider to resize.
+With the mouse: click a file to show it, click its checkbox to stage or
+unstage it, click a folder to open or close it, scroll over the tree or the
+diff, and drag the divider to resize.
+
+The diff always compares your working tree with `HEAD`, so staging a file
+doesn't change what you see, only its checkbox.
 
 ### Layout
 
@@ -152,8 +160,9 @@ scroll over the tree or the diff, and drag the divider to resize.
      green/red backgrounds are mixed from them.
 3. `q` ends the program and Rex closes the pane.
 
-It only reads the repository and never takes git's index lock, so it can't get
-in the way of your own `git` commands.
+Reading the repository never takes git's index lock, so the panel can't get in
+the way of your own `git` commands. The only writes are the stage/unstage you
+ask for with space (the same as `git add` and `git restore --staged`).
 
 If the panel ever crashes, the error is written to
 `~/.local/state/rexdiff/panic.log`.
