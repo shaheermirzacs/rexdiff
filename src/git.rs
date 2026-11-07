@@ -1,14 +1,18 @@
-//! Reads the repository on its own thread: the list of changed files and the
-//! diff (with syntax colors and word-level highlights) of the selected file.
+//! Reads the repository on its own thread: the list of changed files, the
+//! diff (with syntax colors and word-level highlights) of the selected file,
+//! and the local branches. It also runs the writes the panel asks for: stage,
+//! commit, checkout, and push.
 
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use std::collections::HashMap;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
-use git2::{Delta, DiffOptions, Patch, Repository, Status, StatusOptions, Tree};
+use git2::{BranchType, Delta, DiffOptions, Patch, Repository, Status, StatusOptions, Tree};
 
 use crate::highlight::{Highlighter, Span};
 
@@ -75,12 +79,40 @@ pub enum Job {
     Diff { path: String, context: u32 },
     /// `git add` the file (`true`) or take it back out of the index (`false`).
     Stage { path: String, add: bool },
+    /// `git commit -m message`.
+    Commit { message: String },
+    /// List the local branches.
+    Branches,
+    /// `git switch <name>`.
+    Checkout { name: String },
+    /// Push the branch to its upstream (or to `origin`, setting the upstream).
+    Push { name: String },
+    /// Pull the branch from its upstream.
+    Pull { name: String },
+    /// Update the branch from its upstream, then merge it into the current one.
+    Merge { name: String },
+}
+
+/// A local branch, for the Branches screen.
+pub struct BranchInfo {
+    pub name: String,
+    pub current: bool,
+    /// Its upstream (`origin/main`) and how many commits it's ahead and behind.
+    pub upstream: Option<(String, usize, usize)>,
+    /// The last commit's subject and time (seconds since the epoch).
+    pub subject: String,
+    pub time: i64,
 }
 
 pub enum Msg {
     Snapshot(Result<Snapshot, String>),
     Diff(FileDiff),
     Error(String),
+    Branches(Result<Vec<BranchInfo>, String>),
+    /// A long-running step is under way ("Pushing main to origin/main…").
+    Progress(String),
+    /// A commit, checkout, or push finished: a summary, or what went wrong.
+    Done(Result<String, String>),
 }
 
 pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
@@ -93,11 +125,19 @@ pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
         let mut refresh = false;
         let mut diff_job = None;
         let mut stage_jobs = Vec::new();
+        let mut commit_job = None;
+        let mut branches = false;
+        let mut actions = Vec::new();
         for job in std::iter::once(first).chain(rx.try_iter()) {
             match job {
+                Job::Branches => branches = true,
+                Job::Checkout { .. } | Job::Push { .. } | Job::Pull { .. } | Job::Merge { .. } => {
+                    actions.push(job)
+                }
                 Job::Refresh => refresh = true,
                 Job::Diff { path, context } => diff_job = Some((path, context)),
                 Job::Stage { path, add } => stage_jobs.push((path, add)),
+                Job::Commit { message } => commit_job = Some(message),
             }
         }
 
@@ -114,6 +154,36 @@ pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
                 let _ = tx.send(Msg::Error(format!("Could not {} {path}: {}", if add { "stage" } else { "unstage" }, e.message())));
             }
             refresh = true;
+        }
+
+        if let Some(message) = commit_job {
+            let done = match r.workdir() {
+                Some(dir) => commit(dir, &message),
+                None => Err("This repository has no working tree".into()),
+            };
+            let _ = tx.send(Msg::Done(done));
+            refresh = true;
+        }
+
+        for job in actions {
+            let Some(dir) = r.workdir() else { continue };
+            let done = match job {
+                Job::Checkout { name } => checkout(dir, &name),
+                Job::Push { name } => push(dir, &name, &tx),
+                Job::Pull { name } => pull(dir, &name, &tx),
+                Job::Merge { name } => merge_into_current(dir, &name, &tx),
+                _ => continue,
+            };
+            let _ = tx.send(Msg::Done(done));
+            refresh = true;
+            branches = true;
+        }
+
+        if branches {
+            let list = list_branches(r).map_err(|e| e.message().to_string());
+            if tx.send(Msg::Branches(list)).is_err() {
+                return;
+            }
         }
 
         if refresh {
@@ -170,6 +240,190 @@ fn status_char(d: Delta) -> char {
         Delta::Typechange => 'T',
         Delta::Conflicted => 'U',
         _ => '?',
+    }
+}
+
+/// Local branches, most recently committed first.
+fn list_branches(repo: &Repository) -> Result<Vec<BranchInfo>, git2::Error> {
+    let mut out = Vec::new();
+    for b in repo.branches(Some(BranchType::Local))? {
+        let (branch, _) = b?;
+        let Some(name) = branch.name()?.map(str::to_string) else { continue };
+        let commit = branch.get().peel_to_commit().ok();
+        let (subject, time) = commit
+            .map(|c| (c.summary().ok().flatten().unwrap_or_default().to_string(), c.time().seconds()))
+            .unwrap_or_default();
+        let upstream = branch.upstream().ok().and_then(|u| {
+            let uname = u.name().ok().flatten()?.to_string();
+            let (ahead, behind) = repo.graph_ahead_behind(branch.get().target()?, u.get().target()?).ok()?;
+            Some((uname, ahead, behind))
+        });
+        out.push(BranchInfo { name, current: branch.is_head(), upstream, subject, time });
+    }
+    out.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| a.name.cmp(&b.name)));
+    Ok(out)
+}
+
+fn checkout(dir: &Path, name: &str) -> Result<String, String> {
+    run_git(dir, &["switch", name])?;
+    Ok(format!("Switched to {name}"))
+}
+
+/// Pushes `name` to its upstream, or to `origin` with `--set-upstream` when it
+/// doesn't have one. Works for any local branch, not just the current one.
+fn push(dir: &Path, name: &str, tx: &Sender<Msg>) -> Result<String, String> {
+    let config = |key: &str| run_git(dir, &["config", "--get", &format!("branch.{name}.{key}")]).ok();
+    let (args, target) = match (config("remote"), config("merge")) {
+        (Some(remote), Some(merge)) => {
+            let target = format!("{remote}/{}", merge.trim_start_matches("refs/heads/"));
+            (vec!["push".to_string(), remote, format!("{name}:{merge}")], target)
+        }
+        _ => {
+            let remotes = run_git(dir, &["remote"]).unwrap_or_default();
+            let remote = if remotes.lines().any(|r| r == "origin") {
+                "origin".to_string()
+            } else {
+                remotes.lines().next().map(str::to_string).ok_or("No remote to push to")?
+            };
+            let target = format!("{remote}/{name}");
+            (vec!["push".into(), "-u".into(), remote, name.to_string()], target)
+        }
+    };
+    let _ = tx.send(Msg::Progress(format!("Pushing {name} to {target}…")));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_git(dir, &args)?;
+    Ok(format!("Pushed {name} to {target}"))
+}
+
+/// Pulls `name` from its upstream. The current branch gets a regular
+/// `git pull` (merge or rebase, as configured). Another branch can only be
+/// fast-forwarded, since merging needs a checkout.
+fn pull(dir: &Path, name: &str, tx: &Sender<Msg>) -> Result<String, String> {
+    let config = |key: &str| run_git(dir, &["config", "--get", &format!("branch.{name}.{key}")]).ok();
+    let (Some(remote), Some(merge)) = (config("remote"), config("merge")) else {
+        return Err(format!("{name} has no upstream to pull from (push it first)"));
+    };
+    let target = format!("{remote}/{}", merge.trim_start_matches("refs/heads/"));
+    let current = run_git(dir, &["symbolic-ref", "--short", "HEAD"]).ok();
+    let _ = tx.send(Msg::Progress(format!("Pulling {target} into {name}…")));
+
+    if current.as_deref() == Some(name) {
+        let out = run_git(dir, &["pull"])?;
+        if out.contains("Already up to date") {
+            return Ok(format!("{name} is already up to date"));
+        }
+    } else {
+        fast_forward(dir, name, &remote, &merge)
+            .map_err(|e| if e == DIVERGED { format!("{name} has diverged from {target}: check it out to pull") } else { e })?;
+    }
+    Ok(format!("Pulled {target} into {name}"))
+}
+
+const DIVERGED: &str = "diverged";
+
+/// Moves the local branch `name` (not checked out) up to its upstream with
+/// `git fetch <remote> <merge>:<name>`, which only succeeds as a fast-forward.
+/// Fails with `DIVERGED` when the branch has commits the remote doesn't.
+fn fast_forward(dir: &Path, name: &str, remote: &str, merge: &str) -> Result<(), String> {
+    run_git(dir, &["fetch", remote, &format!("{merge}:refs/heads/{name}")]).map(|_| ()).map_err(|e| {
+        if e.contains("non-fast-forward") || e.contains("rejected") { DIVERGED.to_string() } else { e }
+    })
+}
+
+/// Brings `name` into the branch you're on: first updates `name` from its
+/// upstream (when it has one), then `git merge name`.
+fn merge_into_current(dir: &Path, name: &str, tx: &Sender<Msg>) -> Result<String, String> {
+    let current = run_git(dir, &["symbolic-ref", "--short", "HEAD"])
+        .map_err(|_| "HEAD is detached: check out a branch first".to_string())?;
+    if current == name {
+        return Err(format!("{name} is the branch you're on: pick another one to merge"));
+    }
+
+    let config = |key: &str| run_git(dir, &["config", "--get", &format!("branch.{name}.{key}")]).ok();
+    if let (Some(remote), Some(merge)) = (config("remote"), config("merge")) {
+        let target = format!("{remote}/{}", merge.trim_start_matches("refs/heads/"));
+        let _ = tx.send(Msg::Progress(format!("Updating {name} from {target}…")));
+        fast_forward(dir, name, &remote, &merge).map_err(|e| {
+            if e == DIVERGED {
+                format!("{name} has diverged from {target}: check it out and pull first")
+            } else {
+                format!("Could not update {name}: {e}")
+            }
+        })?;
+    }
+
+    let _ = tx.send(Msg::Progress(format!("Merging {name} into {current}…")));
+    let out = run_git(dir, &["merge", name])?;
+    if out.contains("Already up to date") {
+        return Ok(format!("{current} already has everything from {name}"));
+    }
+    Ok(format!("Merged {name} into {current}"))
+}
+
+/// `git commit -m message` with what's staged.
+fn commit(dir: &Path, message: &str) -> Result<String, String> {
+    run_git(dir, &["commit", "-m", message])?;
+    let hash = run_git(dir, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+    Ok(format!("Committed {hash}"))
+}
+
+/// Runs a git command and returns its output, or the most useful line of its
+/// error. It runs in its own session, detached from the panel's terminal, so a
+/// hook that asks for input can't take over the screen (it fails instead).
+fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // A pull that merges takes the default message instead of opening an editor.
+        .env("GIT_MERGE_AUTOEDIT", "no");
+    // SAFETY: setsid only touches the child process, between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let out = cmd.output().map_err(|e| format!("could not run git: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("hint:"))
+        .collect();
+    let key = ["conflict", "error", "fatal", "rejected", "nothing to commit", "no changes added"];
+    let line = lines
+        .iter()
+        .find(|l| key.iter().any(|k| l.to_lowercase().contains(k)))
+        .or(lines.last())
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_else(|| format!("git {} failed", args[0]));
+    Err(friendly(&line))
+}
+
+/// Plain words for the git errors people hit most when switching, pushing, and pulling.
+fn friendly(line: &str) -> String {
+    let l = line.to_lowercase();
+    if l.contains("[rejected]") && (l.contains("fetch first") || l.contains("non-fast-forward")) {
+        "Push rejected: the remote has new commits, pull first".into()
+    } else if l.contains("would be overwritten by") {
+        "Your changes would be overwritten: commit or stash them first".into()
+    } else if l.contains("conflict") {
+        "Merge conflicts: fix them and commit, or run `git merge --abort`".into()
+    } else if l.contains("divergent branches") {
+        "Branches diverged: run `git config pull.rebase false` (merge) or `true` (rebase)".into()
+    } else if l.contains("permission denied") || l.contains("authentication failed") {
+        format!("Authentication failed ({line})")
+    } else if l.contains("could not read from remote") || l.contains("could not resolve host") {
+        format!("Could not reach the remote ({line})")
+    } else {
+        line.to_string()
     }
 }
 
