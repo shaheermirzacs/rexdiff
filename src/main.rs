@@ -27,6 +27,7 @@ In the panel:
   f / b           scroll the diff one page   J K  one line   g / G  top / bottom
   x               toggle between changed hunks only and the whole file
   c               commit what's staged: type the message, Enter commits, Esc cancels
+  d               discard the changes of the file or folder under the cursor (y confirms)
   1 / 2           Changes / Branches screen
 
 On the Branches screen:
