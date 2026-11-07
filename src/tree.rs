@@ -2,10 +2,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::git::FileEntry;
+use crate::git::{FileEntry, Staged};
 
 pub enum Item {
-    Dir { path: String, label: String, collapsed: bool, adds: usize, dels: usize },
+    Dir { path: String, label: String, collapsed: bool, adds: usize, dels: usize, all_staged: bool },
     File { idx: usize, name: String },
 }
 
@@ -32,6 +32,11 @@ struct Node {
 }
 
 impl Node {
+    fn all_staged(&self, files: &[FileEntry]) -> bool {
+        self.files.iter().all(|(_, i)| files[*i].staged == Staged::Fully)
+            && self.dirs.values().all(|n| n.all_staged(files))
+    }
+
     fn totals(&self, files: &[FileEntry]) -> (usize, usize) {
         let mut t = self
             .files
@@ -94,10 +99,11 @@ fn walk(
         let path = if parent.is_empty() { label.clone() } else { format!("{parent}/{label}") };
         let is_collapsed = collapsed.contains(&path);
         let (adds, dels) = n.totals(files);
+        let all_staged = n.all_staged(files);
         let (guide, child_prefix) = guides(prefix, root, last);
         out.push(TreeRow {
             guide,
-            item: Item::Dir { path: path.clone(), label, collapsed: is_collapsed, adds, dels },
+            item: Item::Dir { path: path.clone(), label, collapsed: is_collapsed, adds, dels, all_staged },
         });
         if !is_collapsed {
             walk(n, &path, &child_prefix, false, files, collapsed, out);

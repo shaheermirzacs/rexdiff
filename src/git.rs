@@ -5,7 +5,10 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
-use git2::{Delta, DiffOptions, Patch, Repository, Tree};
+use std::collections::HashMap;
+use std::path::Path;
+
+use git2::{Delta, DiffOptions, Patch, Repository, Status, StatusOptions, Tree};
 
 use crate::highlight::{Highlighter, Span};
 
@@ -18,6 +21,16 @@ pub struct FileEntry {
     pub adds: usize,
     pub dels: usize,
     pub binary: bool,
+    pub staged: Staged,
+}
+
+/// How much of a file's change is in the index (`git add`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Staged {
+    No,
+    /// Staged, then changed again in the working tree.
+    Partly,
+    Fully,
 }
 
 pub struct Snapshot {
@@ -60,11 +73,14 @@ pub struct FileDiff {
 pub enum Job {
     Refresh,
     Diff { path: String, context: u32 },
+    /// `git add` the file (`true`) or take it back out of the index (`false`).
+    Stage { path: String, add: bool },
 }
 
 pub enum Msg {
     Snapshot(Result<Snapshot, String>),
     Diff(FileDiff),
+    Error(String),
 }
 
 pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
@@ -73,12 +89,15 @@ pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
 
     while let Ok(first) = rx.recv() {
         // Coalesce queued requests: only the latest of each kind matters.
+        // Stage requests all run, in order.
         let mut refresh = false;
         let mut diff_job = None;
+        let mut stage_jobs = Vec::new();
         for job in std::iter::once(first).chain(rx.try_iter()) {
             match job {
                 Job::Refresh => refresh = true,
                 Job::Diff { path, context } => diff_job = Some((path, context)),
+                Job::Stage { path, add } => stage_jobs.push((path, add)),
             }
         }
 
@@ -89,6 +108,13 @@ pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
             let _ = tx.send(Msg::Snapshot(Err("This folder is not a git repository".into())));
             continue;
         };
+
+        for (path, add) in stage_jobs {
+            if let Err(e) = stage(r, &path, add) {
+                let _ = tx.send(Msg::Error(format!("Could not {} {path}: {}", if add { "stage" } else { "unstage" }, e.message())));
+            }
+            refresh = true;
+        }
 
         if refresh {
             let snap = snapshot(r).map_err(|e| e.message().to_string());
@@ -147,6 +173,56 @@ fn status_char(d: Delta) -> char {
     }
 }
 
+/// `git add <path>` / `git restore --staged <path>`.
+fn stage(repo: &Repository, path: &str, add: bool) -> Result<(), git2::Error> {
+    if add {
+        let mut idx = repo.index()?;
+        idx.read(false)?;
+        let on_disk = repo.workdir().is_some_and(|w| w.join(path).symlink_metadata().is_ok());
+        if on_disk {
+            idx.add_path(Path::new(path))?;
+        } else {
+            // Deleted file: staging it means removing it from the index.
+            idx.remove_path(Path::new(path))?;
+        }
+        idx.write()
+    } else {
+        // Put the HEAD version back in the index (or drop the entry for a file
+        // HEAD doesn't have, including in a repository without commits).
+        let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        repo.reset_default(head.as_ref().map(|c| c.as_object()), [path])
+    }
+}
+
+/// Index state of every changed path.
+fn staged_states(repo: &Repository) -> HashMap<String, Staged> {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true).recurse_untracked_dirs(true).include_ignored(false);
+    let Ok(statuses) = repo.statuses(Some(&mut opts)) else { return HashMap::new() };
+    let index = Status::INDEX_NEW
+        | Status::INDEX_MODIFIED
+        | Status::INDEX_DELETED
+        | Status::INDEX_RENAMED
+        | Status::INDEX_TYPECHANGE;
+    let worktree = Status::WT_NEW
+        | Status::WT_MODIFIED
+        | Status::WT_DELETED
+        | Status::WT_RENAMED
+        | Status::WT_TYPECHANGE;
+    statuses
+        .iter()
+        .filter_map(|e| {
+            let st = e.status();
+            let state = match (st.intersects(index), st.intersects(worktree)) {
+                (true, false) => Staged::Fully,
+                (true, true) => Staged::Partly,
+                _ => Staged::No,
+            };
+            Some((e.path().ok()?.to_string(), state))
+        })
+        .collect()
+}
+
 fn snapshot(repo: &Repository) -> Result<Snapshot, git2::Error> {
     // Re-read the index if it changed on disk (after a `git add`, for example).
     if let Ok(mut idx) = repo.index() {
@@ -157,6 +233,7 @@ fn snapshot(repo: &Repository) -> Result<Snapshot, git2::Error> {
     opts.context_lines(0);
     let diff = repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))?;
 
+    let staged = staged_states(repo);
     let mut files = Vec::with_capacity(diff.deltas().len());
     for i in 0..diff.deltas().len() {
         let delta = diff.get_delta(i).expect("delta in range");
@@ -173,7 +250,8 @@ fn snapshot(repo: &Repository) -> Result<Snapshot, git2::Error> {
             }
             None => (0, 0, true),
         };
-        files.push(FileEntry { path, status: status_char(delta.status()), adds, dels, binary });
+        let staged = staged.get(&path).copied().unwrap_or(Staged::No);
+        files.push(FileEntry { path, status: status_char(delta.status()), adds, dels, binary, staged });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Snapshot { branch: branch_name(repo), files })

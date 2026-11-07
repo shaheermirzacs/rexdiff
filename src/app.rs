@@ -16,7 +16,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::git::{self, FileDiff, Job, Msg, RowKind, Snapshot};
+use crate::git::{self, FileDiff, Job, Msg, RowKind, Snapshot, Staged};
 use crate::theme::{self, Palette};
 use crate::tree::{self, Item, TreeRow};
 use crate::wrap::{wrap_row, WrapCache};
@@ -70,6 +70,8 @@ struct App {
 
     areas: Areas,
     dragging: bool,
+    /// A short message in the footer (errors, mostly) and when it goes away.
+    flash: Option<(String, Instant)>,
     quit: bool,
 }
 
@@ -109,6 +111,7 @@ pub fn run(cwd: PathBuf) -> std::io::Result<()> {
         full_context: false,
         areas: Areas::default(),
         dragging: false,
+        flash: None,
         quit: false,
     };
 
@@ -196,6 +199,10 @@ impl App {
                 self.on_msg(msg);
                 dirty = true;
             }
+            if self.flash.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
+                self.flash = None;
+                dirty = true;
+            }
 
             if fs.try_iter().count() > 0 && refresh_due.is_none() {
                 refresh_due = Some(Instant::now() + FS_DEBOUNCE);
@@ -259,6 +266,7 @@ impl App {
                     self.request_diff();
                 }
             }
+            Msg::Error(e) => self.flash = Some((e, Instant::now() + Duration::from_secs(6))),
             Msg::Diff(d) => {
                 if Some(&d.path) == self.active.as_ref() && d.context == self.context() {
                     let same_file = self.diff.as_ref().is_some_and(|old| old.path == d.path);
@@ -385,25 +393,20 @@ impl App {
         self.rebuild(Some(&path));
     }
 
-    /// The folder containing row `row` (the closest one, not the root).
-    fn parent_dir(&self, row: usize) -> Option<usize> {
-        let key = self.rows.get(row)?.key(self.files());
-        (0..row).rev().find(|&i| match &self.rows[i].item {
-            Item::Dir { path, .. } => key.starts_with(&format!("{path}/")),
-            _ => false,
-        })
+    /// Space: on a folder, open/close it; on a file, stage it (or unstage it
+    /// if it's fully staged), to mark it as reviewed.
+    fn toggle_here(&mut self) {
+        match self.rows.get(self.cursor).map(|r| &r.item) {
+            Some(Item::Dir { .. }) => self.toggle_dir(self.cursor),
+            Some(Item::File { idx, .. }) => self.toggle_stage(*idx),
+            None => {}
+        }
     }
 
-    /// Space: open/close the folder under the cursor; on a file, close its folder.
-    fn toggle_here(&mut self) {
-        let target = match self.rows.get(self.cursor).map(|r| &r.item) {
-            Some(Item::Dir { .. }) => Some(self.cursor),
-            Some(Item::File { .. }) => self.parent_dir(self.cursor),
-            None => None,
-        };
-        if let Some(t) = target {
-            self.toggle_dir(t);
-        }
+    fn toggle_stage(&mut self, idx: usize) {
+        let Some(f) = self.files().get(idx) else { return };
+        let add = f.staged != Staged::Fully;
+        let _ = self.jobs.send(Job::Stage { path: f.path.clone(), add });
     }
 
     fn scroll_diff(&mut self, delta: isize) {
@@ -478,10 +481,16 @@ impl App {
                 let row = self.tree_off + (m.row - a.tree.y) as usize;
                 if row < self.rows.len() {
                     self.cursor = row;
-                    if matches!(self.rows[row].item, Item::Dir { .. }) {
-                        self.toggle_dir(row);
-                    } else {
-                        self.sync_active_from_cursor();
+                    match self.rows[row].item {
+                        Item::Dir { .. } => self.toggle_dir(row),
+                        Item::File { idx, .. } => {
+                            self.sync_active_from_cursor();
+                            // A click right on the checkbox stages/unstages.
+                            let checkbox = a.tree.x + 1 + self.rows[row].guide.width() as u16;
+                            if m.column == checkbox {
+                                self.toggle_stage(idx);
+                            }
+                        }
                     }
                 }
             }
@@ -622,6 +631,9 @@ impl App {
         let pill = format!(" {n} {} ", if n == 1 { "file" } else { "files" });
         put(buf, &mut x, y, lim, &pill, Style::new().fg(p.muted).bg(p.pill_bg));
         put(buf, &mut x, y, lim, &format!("  ⎇ {}", s.branch), Style::new().fg(p.muted));
+        let done = s.files.iter().filter(|f| f.staged == Staged::Fully).count();
+        let st = Style::new().fg(if done == n { p.green } else { p.muted });
+        put(buf, &mut x, y, lim, &format!("   ✓ {done}/{n} staged"), st);
     }
 
     fn draw_tree(&self, buf: &mut Buffer) {
@@ -655,10 +667,13 @@ impl App {
             let mut x = a.x + 1;
             put(buf, &mut x, y, lim, &row.guide, base.fg(p.rule));
             match &row.item {
-                Item::Dir { label, collapsed, .. } => {
+                Item::Dir { label, collapsed, all_staged, .. } => {
                     put(buf, &mut x, y, lim, if *collapsed { "▸ " } else { "▾ " }, base.fg(p.faint));
                     put(buf, &mut x, y, lim, label, base.fg(p.muted));
                     put(buf, &mut x, y, lim, "/", base.fg(p.faint));
+                    if *all_staged {
+                        put(buf, &mut x, y, lim, " ✓", base.fg(p.green));
+                    }
                 }
                 Item::File { idx, name } => {
                     let f = &files[*idx];
@@ -672,9 +687,20 @@ impl App {
                         'M' => p.yellow,
                         _ => p.blue,
                     };
+                    // The checkbox: staged = reviewed.
+                    let (mark, mark_fg) = match f.staged {
+                        Staged::Fully => ("✓", p.green),
+                        Staged::Partly => ("◐", p.yellow),
+                        Staged::No => ("○", p.faint),
+                    };
+                    put(buf, &mut x, y, lim, mark, base.fg(mark_fg).add_modifier(Modifier::BOLD));
+                    x += 1;
                     put(buf, &mut x, y, lim, &f.status.to_string(), base.fg(sc).add_modifier(Modifier::BOLD));
                     x += 1;
                     let mut name_style = base;
+                    if f.staged == Staged::Fully {
+                        name_style = name_style.fg(p.muted);
+                    }
                     if active {
                         name_style = name_style.add_modifier(Modifier::BOLD);
                     }
@@ -837,12 +863,18 @@ impl App {
         let hints = [
             ("↑↓", "navigate"),
             ("←→", "folders"),
-            ("space", "open/close"),
+            ("space", "stage/fold"),
             ("x", "whole file"),
             ("q", "quit"),
         ];
         let mut x = area.x + 1;
         let right = area.x + area.width;
+        if let Some((msg, until)) = &self.flash
+            && Instant::now() < *until
+        {
+            put(buf, &mut x, y, right, msg, Style::new().fg(p.red));
+            return;
+        }
         for (key, what) in hints {
             put(buf, &mut x, y, right, key, Style::new().fg(p.muted));
             put(buf, &mut x, y, right, &format!(" {what}   "), Style::new().fg(p.faint));
