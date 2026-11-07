@@ -23,7 +23,7 @@ the selected file below.
   1 + from decimal import Decimal, ROUND_HALF_UP
   2
   3   class Pagamento:
- ↑↓ navigate   ←→ folders   space stage/fold   x whole file   q quit
+ ↑↓ navigate   ←→ folders   space stage/fold   c commit   x whole file   q quit
 ```
 
 In a wide pane (full screen or zoomed) the tree moves to the left and the diff
@@ -38,6 +38,12 @@ to the right.
   to unstage it. Each file shows `✓` (staged), `◐` (staged, then changed
   again), or `○` (not staged); reviewed files fade, folders get a `✓` when
   everything in them is staged, and the header counts your progress.
+- **Commit from the panel.** Press `c`, type the message, and Enter commits
+  what's staged. It runs the real `git`, so your hooks and commit signing work
+  as usual.
+- **Branches.** Press `2` for a list of your local branches with how far each
+  one is ahead/behind its upstream. Space checks one out, `p` pulls it,
+  Shift+P pushes it, and `m` merges it into the branch you're on.
 - **A diff that reads well.** Line numbers, full-width green/red backgrounds,
   syntax colors, and the exact words that changed highlighted inside each line.
   Long lines wrap to the pane width, keeping the code's indentation.
@@ -120,8 +126,10 @@ does nothing.
 | `f` / `b`, `PgDn` / `PgUp` | Scroll the diff one page |
 | `J` / `K` | Scroll the diff one line |
 | `g` / `G` | Top / bottom of the diff |
+| `c` | Commit what's staged (see below) |
 | `x` | Toggle between changed hunks only and the whole file |
 | `+` / `-` | Make the tree bigger / smaller |
+| `1` / `2` | Changes / Branches screen (or click the tabs in the header) |
 | `r` | Reload the repository |
 | `q` | Quit (the pane closes) |
 
@@ -131,6 +139,69 @@ diff, and drag the divider to resize.
 
 The diff always compares your working tree with `HEAD`, so staging a file
 doesn't change what you see, only its checkbox.
+
+### Commit
+
+Stage the files you want with space, then press `c` to open the commit box in
+the footer:
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Commit |
+| `Esc` | Cancel |
+| `Ctrl+W` / `Option+Backspace` | Delete the last word |
+| `Ctrl+U` | Clear the message |
+
+The footer shows the result, such as `✓ Committed 1a2b3c4`, or what went
+wrong. Nothing is pushed.
+
+`git` runs detached from the panel's terminal, so it can't stop to ask for
+anything: a hook that needs input makes the commit fail with a message instead
+of hanging.
+
+### Branches
+
+Press `2` (or click **Branches** in the header) to see your local branches,
+most recently committed first:
+
+```
+ ● feature/frete   ✓ origin/feature/frete   frete: ajuste          2 min ago
+   main            ↑5 ↓1 origin/main        pedido: só commit      1 hour ago
+   old-idea        not pushed               try another layout     3 weeks ago
+```
+
+`●` marks the branch you're on. Next to each one: `✓` when it matches its
+upstream, `↑N` commits to push, `↓N` commits to pull, or `not pushed` when it
+has no upstream yet. The ahead/behind counts use what git last fetched.
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓` / `j` `k` | Move |
+| `space` / `Enter` | Check out the branch (`git switch`) |
+| `p` | Pull the branch |
+| `P` (Shift+P) | Push the branch |
+| `m` | Merge the branch into the one you're on (updating it from its upstream first) |
+| `Esc` / `1` | Back to Changes |
+
+Push sends the branch to its upstream, or to `origin` with `--set-upstream`
+when it doesn't have one yet (`git push -u origin <branch>`). It works on any
+branch in the list, not just the current one. If the remote has commits you
+don't have, the push is rejected and the footer tells you to pull first.
+Checkout refuses when your uncommitted changes would be overwritten.
+
+Pull on the branch you're on runs `git pull`, so it merges or rebases as your
+git config says. On any other branch it can only fast-forward (merging needs a
+checkout); if that branch has diverged, the footer asks you to check it out
+first. Problems show up in the footer in plain words: merge conflicts (fix them
+in the Changes screen, then commit), diverged branches with no `pull.rebase`
+setting, or local changes in the way.
+
+`m` brings another branch into the one you're on, the usual "update my feature
+branch with `main`": on `feature/x`, press `m` on `main`. It first
+fast-forwards `main` from `origin/main` (like `p`), then runs `git merge main`.
+If your local `main` has diverged from `origin/main` it stops before merging and
+tells you, so you never merge a stale `main` by accident. Conflicts are reported
+the same way as with pull.
 
 ### Layout
 
@@ -161,8 +232,10 @@ doesn't change what you see, only its checkbox.
 3. `q` ends the program and Rex closes the pane.
 
 Reading the repository never takes git's index lock, so the panel can't get in
-the way of your own `git` commands. The only writes are the stage/unstage you
-ask for with space (the same as `git add` and `git restore --staged`).
+the way of your own `git` commands. The only writes are the ones you ask for:
+stage/unstage with space (the same as `git add` and `git restore --staged`),
+commits with `c` (`git commit`), and checkout/pull/push on the Branches screen
+(`git switch`, `git pull`, and `git push`).
 
 If the panel ever crashes, the error is written to
 `~/.local/state/rexdiff/panic.log`.
