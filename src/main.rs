@@ -32,11 +32,13 @@ In the panel:
 
 On the Branches screen:
   ↑↓ / j k        move between local branches
-  space           check out the branch
+  space           check out the branch (a remote one gets a local branch that tracks it)
   Enter           commit history of the branch (Esc goes back)
   p               pull the branch (current: git pull; others: fast-forward only)
   P (Shift+P)     push the branch (to its upstream, or `origin` with -u)
   m               update the branch from its upstream, then merge it into the current one
+  d / D           delete the local branch (y confirms); D deletes it even if it isn't merged
+  f               fetch from all remotes (git fetch --all --prune)
   Esc / 1         back to Changes
   + -             tree height                r    reload the repository   q  quit
   The mouse works too: click, scroll, and drag the divider.
