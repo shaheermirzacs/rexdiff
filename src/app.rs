@@ -503,11 +503,11 @@ impl App {
             self.on_commit_key(k);
             return;
         }
-        // A pending discard: `y` goes ahead, any other key cancels.
+        // A pending confirmation: `y` goes ahead, any other key cancels.
         if let Some(c) = self.confirm.take() {
             if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                self.busy = Some(format!("Discarding {}…", c.label));
-                let _ = self.jobs.send(Job::Discard { restore: c.restore, new: c.new, label: c.label });
+                self.busy = Some(c.busy);
+                let _ = self.jobs.send(c.job);
             }
             return;
         }
@@ -600,6 +600,9 @@ impl App {
             KeyCode::Char('P') => self.push_selected(),
             KeyCode::Char('p') => self.pull_selected(),
             KeyCode::Char('m') => self.merge_selected(),
+            KeyCode::Char('d') => self.ask_delete_branch(false),
+            KeyCode::Char('f') => self.fetch(),
+            KeyCode::Char('D') => self.ask_delete_branch(true),
             KeyCode::Char('r') => {
                 let _ = self.jobs.send(Job::Branches);
             }
@@ -650,9 +653,29 @@ impl App {
             self.flash = Some(Flash::new(format!("Already on {}", b.name), true));
             return;
         }
-        let name = b.name.clone();
+        let (name, remote) = (b.name.clone(), b.remote);
         self.busy = Some(format!("Switching to {name}…"));
-        let _ = self.jobs.send(Job::Checkout { name });
+        let _ = self.jobs.send(Job::Checkout { name, remote });
+    }
+
+    /// The selected branch, unless it's a remote one: those can only be checked
+    /// out, merged, or browsed, so the other actions say so in the footer.
+    fn selected_local_branch(&mut self) -> Option<String> {
+        let b = self.selected_branch()?;
+        if b.remote {
+            let msg = format!("{} is a remote branch: check it out first (space)", b.name);
+            self.flash = Some(Flash::new(msg, false));
+            return None;
+        }
+        Some(b.name.clone())
+    }
+
+    fn fetch(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.busy = Some("Fetching…".into());
+        let _ = self.jobs.send(Job::Fetch);
     }
 
     fn merge_selected(&mut self) {
@@ -673,8 +696,7 @@ impl App {
         if self.busy.is_some() {
             return;
         }
-        let Some(b) = self.selected_branch() else { return };
-        let name = b.name.clone();
+        let Some(name) = self.selected_local_branch() else { return };
         self.busy = Some(format!("Pulling {name}…"));
         let _ = self.jobs.send(Job::Pull { name });
     }
@@ -683,8 +705,7 @@ impl App {
         if self.busy.is_some() {
             return;
         }
-        let Some(b) = self.selected_branch() else { return };
-        let name = b.name.clone();
+        let Some(name) = self.selected_local_branch() else { return };
         self.busy = Some(format!("Pushing {name}…"));
         let _ = self.jobs.send(Job::Push { name });
     }
@@ -710,13 +731,47 @@ impl App {
         let label = if picked.len() > 1 { format!("{label} ({} files)", picked.len()) } else { label };
         // New files aren't in HEAD: discarding them means deleting them.
         let (new, restore): (Vec<_>, Vec<_>) = picked.into_iter().partition(|f| f.status == 'A');
+        let warning = match new.len() {
+            0 => None,
+            1 => Some("1 new file will be deleted for good.".to_string()),
+            n => Some(format!("{n} new files will be deleted for good.")),
+        };
         let confirm = Confirm {
-            label,
-            restore: restore.iter().map(|f| f.path.clone()).collect(),
-            new: new.iter().map(|f| f.path.clone()).collect(),
+            question: format!("Discard changes to {label}?"),
+            warning,
+            verb: "discard",
+            busy: format!("Discarding {label}…"),
+            job: Job::Discard {
+                restore: restore.iter().map(|f| f.path.clone()).collect(),
+                new: new.iter().map(|f| f.path.clone()).collect(),
+                label,
+            },
         };
         self.flash = None;
         self.confirm = Some(confirm);
+    }
+
+    /// `d` / `D` on the Branches screen: ask before deleting the local branch.
+    /// `d` lets git refuse a branch with unmerged commits; `D` deletes it anyway.
+    fn ask_delete_branch(&mut self, force: bool) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(b) = self.selected_branch() else { return };
+        if b.current {
+            self.flash = Some(Flash::new(format!("{} is the branch you're on: check out another one first", b.name), false));
+            return;
+        }
+        let Some(name) = self.selected_local_branch() else { return };
+        let warning = force.then(|| "Commits that only exist on it will be lost.".to_string());
+        self.flash = None;
+        self.confirm = Some(Confirm {
+            question: format!("{} branch {name}?", if force { "Force-delete" } else { "Delete" }),
+            warning,
+            verb: "delete",
+            busy: format!("Deleting {name}…"),
+            job: Job::DeleteBranch { name, force },
+        });
     }
 
     fn open_commit_box(&mut self) {
@@ -1122,6 +1177,9 @@ impl App {
             .map_or(0, |d| d.as_secs() as i64);
         let name_w = list.iter().map(|b| b.name.width()).max().unwrap_or(0).min(40) as u16;
         let sync = |b: &BranchInfo| -> Vec<(String, Color)> {
+            if b.remote {
+                return vec![("remote".into(), p.blue)];
+            }
             match &b.upstream {
                 None => vec![("not pushed".into(), p.yellow)],
                 Some((u, 0, 0)) => vec![(format!("✓ {u}"), p.faint)],
@@ -1162,7 +1220,11 @@ impl App {
             } else {
                 x += 2;
             }
-            let name_style = if b.current { base.add_modifier(Modifier::BOLD) } else { base };
+            let name_style = match (b.current, b.remote) {
+                (true, _) => base.add_modifier(Modifier::BOLD),
+                (_, true) => base.fg(p.muted),
+                _ => base,
+            };
             let start = x;
             put(buf, &mut x, y, (start + name_w).min(lim), &b.name, name_style);
             x = start + name_w + 3;
@@ -1410,14 +1472,12 @@ impl App {
         }
         if let Some(c) = &self.confirm {
             let red = Style::new().fg(p.red);
-            put(buf, &mut x, y, right, &format!("Discard changes to {}? ", c.label), red.add_modifier(Modifier::BOLD));
-            if !c.new.is_empty() {
-                let n = c.new.len();
-                let files = if n == 1 { "new file" } else { "new files" };
-                put(buf, &mut x, y, right, &format!("{n} {files} will be deleted for good. "), red);
+            put(buf, &mut x, y, right, &format!("{} ", c.question), red.add_modifier(Modifier::BOLD));
+            if let Some(w) = &c.warning {
+                put(buf, &mut x, y, right, &format!("{w} "), red);
             }
             put(buf, &mut x, y, right, "y", Style::new().fg(p.muted));
-            put(buf, &mut x, y, right, " discard   ", Style::new().fg(p.faint));
+            put(buf, &mut x, y, right, &format!(" {}   ", c.verb), Style::new().fg(p.faint));
             put(buf, &mut x, y, right, "any key", Style::new().fg(p.muted));
             put(buf, &mut x, y, right, " cancel", Style::new().fg(p.faint));
             return None;
@@ -1451,6 +1511,8 @@ impl App {
                 ("p", "pull"),
                 ("P", "push"),
                 ("m", "merge into current"),
+                ("d", "delete"),
+                ("f", "fetch"),
                 ("⏎", "history"),
                 ("1", "changes"),
                 ("q", "quit"),
@@ -1507,13 +1569,18 @@ impl App {
     }
 }
 
-/// What `d` is about to throw away, until `y` confirms it.
+/// Something destructive waiting for `y` in the footer: discarding changes
+/// (`d` on Changes) or deleting a branch (`d`/`D` on Branches).
 struct Confirm {
-    label: String,
-    /// Files `HEAD` has: they go back to it.
-    restore: Vec<String>,
-    /// New files: they get deleted.
-    new: Vec<String>,
+    /// "Discard changes to app/?", "Delete branch old-idea?"
+    question: String,
+    /// What can't be undone, if anything.
+    warning: Option<String>,
+    /// The word next to `y`.
+    verb: &'static str,
+    /// The footer while it runs.
+    busy: String,
+    job: Job,
 }
 
 /// A message shown in the footer for a few seconds.
