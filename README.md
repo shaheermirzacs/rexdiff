@@ -3,7 +3,8 @@
 Your git changes in a [Rex](https://superlogical.com/rex) pane, right next to
 your terminal: a tree of the files that changed and a colored diff of the
 selected file. Review them, mark what you've read, commit, and handle your
-branches (checkout, pull, push, merge, history) without leaving the panel.
+branches (fetch, checkout, pull, push, merge, delete, history) without leaving
+the panel.
 
 ```
  Changes  6 files   Branches   ⎇ main   ✓ 2/6 staged             +31 −13
@@ -30,7 +31,8 @@ branches (checkout, pull, push, merge, history) without leaving the panel.
 The panel has three screens:
 
 - **Changes** (`1`): the tree and the diff above. Review, stage, and commit.
-- **Branches** (`2`): your local branches. Check out, pull, push, and merge.
+- **Branches** (`2`): your local branches, plus remote ones you don't have yet.
+  Fetch, check out, pull, push, merge, and delete.
 - **History** (Enter on a branch): that branch's commits.
 
 In a wide pane (full screen or zoomed) the Changes screen puts the tree on the
@@ -51,9 +53,10 @@ left and the diff on the right.
   what's staged. It runs the real `git`, so your hooks and commit signing work
   as usual.
 - **Branches.** Press `2` for a list of your local branches with how far each
-  one is ahead/behind its upstream. Space checks one out, `p` pulls it,
-  Shift+P pushes it, `m` merges it into the branch you're on, and Enter shows
-  its commit history.
+  one is ahead/behind its upstream, followed by remote branches you haven't
+  checked out yet. `f` fetches, space checks one out, `p` pulls it,
+  Shift+P pushes it, `m` merges it into the branch you're on, `d` deletes it,
+  and Enter shows its commit history.
 - **A diff that reads well.** Line numbers, full-width green/red backgrounds,
   syntax colors, and the exact words that changed highlighted inside each line.
   Long lines wrap to the pane width, keeping the code's indentation.
@@ -199,16 +202,27 @@ most recently committed first:
 
 `●` marks the branch you're on. Next to each one: `✓` when it matches its
 upstream, `↑N` commits to push, `↓N` commits to pull, or `not pushed` when it
-has no upstream yet. The ahead/behind counts use what git last fetched.
+has no upstream yet. The ahead/behind counts use what git last fetched; press
+`f` to fetch.
+
+Below your local branches come the remote ones that no local branch tracks
+yet, dimmed and marked `remote` (`origin/pr/new-screen`). Space on one creates
+a local branch that tracks it and switches to it, which is how you check out
+someone's pull request: `f`, find the branch, space. Enter shows its history
+and `m` merges it into your branch; pull, push, and delete ask you to check it
+out first.
 
 | Key | Action |
 | --- | --- |
 | `↑` `↓` / `j` `k` | Move |
-| `space` | Check out the branch (`git switch`) |
+| `space` | Check out the branch (`git switch`). On a remote branch, create a local one that tracks it (`git switch --track`) |
 | `Enter` | Show the branch's commit history |
 | `p` | Pull the branch |
 | `P` (Shift+P) | Push the branch |
 | `m` | Merge the branch into the one you're on (updating it from its upstream first) |
+| `d` | Delete the local branch, after `y` |
+| `D` (Shift+D) | Delete it even if it has unmerged commits, after `y` |
+| `f` | Fetch from all remotes, dropping remote branches deleted there (`git fetch --all --prune`) |
 | `Esc` / `1` | Back to Changes |
 
 Push sends the branch to its upstream, or to `origin` with `--set-upstream`
@@ -230,6 +244,12 @@ fast-forwards `main` from `origin/main` (like `p`), then runs `git merge main`.
 If your local `main` has diverged from `origin/main` it stops before merging and
 tells you, so you never merge a stale `main` by accident. Conflicts are reported
 the same way as with pull.
+
+`d` deletes the local branch after you confirm with `y` (`git branch -d`). Git
+refuses when the branch has commits that aren't on its upstream or on the
+branch you're on, and the footer says so; `D` (Shift+D) deletes it anyway
+(`git branch -D`), with a warning that those commits will be lost. You can't
+delete the branch you're on, and the remote branch is left alone.
 
 ### History
 
@@ -294,10 +314,12 @@ the way of your own `git` commands. The only writes are the ones you ask for:
 | Changes | `space` on a file | `git add` / `git restore --staged` |
 | Changes | `c`, then Enter | `git commit -m <message>` |
 | Changes | `d`, then `y` | `git restore --source=HEAD --staged --worktree` for files the last commit has; new files are unstaged and deleted |
-| Branches | `space` | `git switch <branch>` |
+| Branches | `space` | `git switch <branch>`, or `git switch --track <remote>/<branch>` on a remote branch |
+| Branches | `f` | `git fetch --all --prune` |
 | Branches | `p` | `git pull` on the current branch; `git fetch <remote> <branch>:<branch>` (fast-forward only) on any other |
 | Branches | `P` | `git push`, or `git push -u origin <branch>` the first time |
 | Branches | `m` | Fast-forward the branch from its upstream, then `git merge <branch>` |
+| Branches | `d` / `D`, then `y` | `git branch -d <branch>` / `git branch -D <branch>` |
 
 If the panel ever crashes, the error is written to
 `~/.local/state/rexdiff/panic.log`.
@@ -321,8 +343,10 @@ If the panel ever crashes, the error is written to
 - Renames show up as a deleted file plus an added one.
 - Very large diffs are cut at 50,000 lines, and syntax colors are skipped above
   20,000.
-- The ↑/↓ counts on the Branches screen use what git last fetched; there's no
-  fetch key yet (pull and merge fetch what they need).
+- The ↑/↓ counts and the remote branches on the Branches screen are as of the
+  last fetch; press `f` to update them.
+- Pull requests from forks aren't on your remotes, so they don't show up as
+  remote branches; use `gh pr checkout` for those.
 - Commit messages are a single line.
 - History shows up to 1,000 commits per branch.
 - Commands can't answer prompts: an SSH key without an agent, or a hook that
