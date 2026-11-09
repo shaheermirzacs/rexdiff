@@ -653,6 +653,11 @@ impl App {
             self.flash = Some(Flash::new(format!("Already on {}", b.name), true));
             return;
         }
+        if let Some(wt) = &b.worktree {
+            let msg = format!("{} is open in worktree {}: switch there ({})", b.name, folder_name(wt), tilde(wt));
+            self.flash = Some(Flash::new(msg, false));
+            return;
+        }
         let (name, remote) = (b.name.clone(), b.remote);
         self.busy = Some(format!("Switching to {name}…"));
         let _ = self.jobs.send(Job::Checkout { name, remote });
@@ -760,6 +765,11 @@ impl App {
         let Some(b) = self.selected_branch() else { return };
         if b.current {
             self.flash = Some(Flash::new(format!("{} is the branch you're on: check out another one first", b.name), false));
+            return;
+        }
+        if let Some(wt) = &b.worktree {
+            let msg = format!("{} is open in worktree {}: remove it first ({})", b.name, folder_name(wt), tilde(wt));
+            self.flash = Some(Flash::new(msg, false));
             return;
         }
         let Some(name) = self.selected_local_branch() else { return };
@@ -1175,7 +1185,14 @@ impl App {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
-        let name_w = list.iter().map(|b| b.name.width()).max().unwrap_or(0).min(40) as u16;
+        // A branch open in another worktree shows its folder: `aux/worktree (sistema_2)`.
+        let wt_suffix = |b: &BranchInfo| b.worktree.as_deref().map(|wt| format!(" ({})", folder_name(wt)));
+        let name_w = list
+            .iter()
+            .map(|b| b.name.width() + wt_suffix(b).map_or(0, |s| s.width()))
+            .max()
+            .unwrap_or(0)
+            .min(48) as u16;
         let sync = |b: &BranchInfo| -> Vec<(String, Color)> {
             if b.remote {
                 return vec![("remote".into(), p.blue)];
@@ -1217,6 +1234,8 @@ impl App {
             let mut x = area.x + 1;
             if b.current {
                 put(buf, &mut x, y, lim, "● ", base.fg(p.green));
+            } else if b.worktree.is_some() {
+                put(buf, &mut x, y, lim, "◆ ", base.fg(p.blue));
             } else {
                 x += 2;
             }
@@ -1227,6 +1246,9 @@ impl App {
             };
             let start = x;
             put(buf, &mut x, y, (start + name_w).min(lim), &b.name, name_style);
+            if let Some(suffix) = wt_suffix(b) {
+                put(buf, &mut x, y, (start + name_w).min(lim), &suffix, base.fg(p.blue));
+            }
             x = start + name_w + 3;
             let start = x;
             for (t, c) in sync(b) {
@@ -1594,6 +1616,20 @@ impl Flash {
     fn new(text: String, ok: bool) -> Self {
         let secs = if ok { 5 } else { 8 };
         Self { text, ok, until: Instant::now() + Duration::from_secs(secs) }
+    }
+}
+
+/// The last folder of a path (`~/code/app-review` → `app-review`).
+fn folder_name(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |f| f.to_string_lossy().into_owned())
+}
+
+/// A path with the home folder written as `~`.
+fn tilde(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
