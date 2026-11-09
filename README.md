@@ -200,7 +200,11 @@ most recently committed first:
    old-idea        not pushed               try another layout     3 weeks ago
 ```
 
-`●` marks the branch you're on. Next to each one: `✓` when it matches its
+`●` marks the branch you're on and `◆` a branch that's checked out in another
+worktree (`git worktree`), with that worktree's folder in parentheses:
+`aux/worktree (sistema_2)`. Git only lets
+a branch be checked out in one place, so space and `d` on a `◆` branch tell you
+which worktree has it instead of trying. Next to each one: `✓` when it matches its
 upstream, `↑N` commits to push, `↓N` commits to pull, or `not pushed` when it
 has no upstream yet. The ahead/behind counts use what git last fetched; press
 `f` to fetch.

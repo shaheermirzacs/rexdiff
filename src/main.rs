@@ -32,7 +32,8 @@ In the panel:
 
 On the Branches screen:
   ↑↓ / j k        move between local branches
-  space           check out the branch (a remote one gets a local branch that tracks it)
+  space           check out the branch (a remote one gets a local branch that tracks it;
+                  ◆ marks branches open in another worktree, which can't be checked out here)
   Enter           commit history of the branch (Esc goes back)
   p               pull the branch (current: git pull; others: fast-forward only)
   P (Shift+P)     push the branch (to its upstream, or `origin` with -u)
