@@ -125,6 +125,8 @@ pub struct BranchInfo {
     pub current: bool,
     /// A remote branch (`origin/feature-y`) that no local branch tracks yet.
     pub remote: bool,
+    /// Where it's checked out, when that's another worktree (`git worktree`).
+    pub worktree: Option<PathBuf>,
     /// Its upstream (`origin/main`) and how many commits it's ahead and behind.
     pub upstream: Option<(String, usize, usize)>,
     /// The last commit's subject and time (seconds since the epoch).
@@ -301,6 +303,7 @@ fn status_char(d: Delta) -> char {
 
 /// Local branches, most recently committed first.
 fn list_branches(repo: &Repository) -> Result<Vec<BranchInfo>, git2::Error> {
+    let worktrees = repo.workdir().map(worktree_branches).unwrap_or_default();
     let mut out = Vec::new();
     for b in repo.branches(Some(BranchType::Local))? {
         let (branch, _) = b?;
@@ -314,7 +317,9 @@ fn list_branches(repo: &Repository) -> Result<Vec<BranchInfo>, git2::Error> {
             let (ahead, behind) = repo.graph_ahead_behind(branch.get().target()?, u.get().target()?).ok()?;
             Some((uname, ahead, behind))
         });
-        out.push(BranchInfo { name, current: branch.is_head(), remote: false, upstream, subject, time });
+        let current = branch.is_head();
+        let worktree = if current { None } else { worktrees.get(&name).cloned() };
+        out.push(BranchInfo { name, current, remote: false, worktree, upstream, subject, time });
     }
     out.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| a.name.cmp(&b.name)));
 
@@ -333,7 +338,7 @@ fn list_branches(repo: &Repository) -> Result<Vec<BranchInfo>, git2::Error> {
             .peel_to_commit()
             .map(|c| (c.summary().ok().flatten().unwrap_or_default().to_string(), c.time().seconds()))
             .unwrap_or_default();
-        remotes.push(BranchInfo { name, current: false, remote: true, upstream: None, subject, time });
+        remotes.push(BranchInfo { name, current: false, remote: true, worktree: None, upstream: None, subject, time });
     }
     remotes.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| a.name.cmp(&b.name)));
     out.extend(remotes);
@@ -414,6 +419,23 @@ fn is_remote_label(repo: &Repository, label: &str) -> bool {
 fn delete_branch(dir: &Path, name: &str, force: bool) -> Result<String, String> {
     run_git(dir, &["branch", if force { "-D" } else { "-d" }, name])?;
     Ok(format!("Deleted branch {name}"))
+}
+
+/// Branch name → the worktree folder it's checked out in, from
+/// `git worktree list --porcelain` (blocks of `worktree <path>` and
+/// `branch refs/heads/<name>`).
+fn worktree_branches(dir: &Path) -> HashMap<String, PathBuf> {
+    let Ok(out) = run_git(dir, &["worktree", "list", "--porcelain"]) else { return HashMap::new() };
+    let mut map = HashMap::new();
+    let mut path = None;
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(p));
+        } else if let (Some(b), Some(p)) = (line.strip_prefix("branch refs/heads/"), &path) {
+            map.insert(b.to_string(), p.clone());
+        }
+    }
+    map
 }
 
 /// Checks out a local branch, or creates a local branch tracking a remote one
