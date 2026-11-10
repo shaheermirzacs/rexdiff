@@ -1352,6 +1352,11 @@ mod tests {
         assert_eq!(r.cursor().col, 6);
         r.search_next(&d, true, 2).unwrap();
         assert_eq!(r.cursor().col, 6, "N reverses and wraps");
+        r.search(&d, r"FOO\s\S").unwrap_err();
+        r.search(&d, r"foo\s\S").unwrap();
+        assert_eq!(r.cursor().row, 1, "escapes like \\S don't make the search case-sensitive");
+        r.search(&d, "bar|baz").unwrap();
+        r.search_next(&d, false, 1).unwrap();
         assert!(r.search(&d, "[").is_err());
         assert_eq!(r.cursor().col, 6, "invalid pattern keeps the cursor");
         assert_eq!(r.search.as_ref().unwrap().pattern, "bar|baz");

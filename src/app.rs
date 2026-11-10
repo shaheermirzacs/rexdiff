@@ -192,7 +192,8 @@ pub fn run(cwd: PathBuf) -> std::io::Result<()> {
     log_panics();
     let detected = theme::query(Duration::from_millis(400));
     execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
+        // Event types let held keys arrive as repeats, so only movement repeats.
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES | KeyboardEnhancementFlags::REPORT_EVENT_TYPES))?;
 
     let mut app = App::new(job_tx, cwd, detected);
 

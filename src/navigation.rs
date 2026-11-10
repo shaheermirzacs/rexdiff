@@ -11,10 +11,17 @@ pub struct Search {
 }
 
 impl Search {
-    /// Smart case: case-insensitive unless the pattern has an uppercase letter.
+    /// Smart case: case-insensitive unless the pattern has an uppercase
+    /// letter outside an escape (`\S`, `\W` don't count).
     pub fn new(pattern: &str) -> Result<Self, String> {
+        let mut escaped = false;
+        let upper = pattern.chars().any(|c| {
+            let literal = !escaped;
+            escaped = !escaped && c == '\\';
+            literal && c.is_uppercase()
+        });
         let regex = RegexBuilder::new(pattern)
-            .case_insensitive(!pattern.chars().any(char::is_uppercase))
+            .case_insensitive(!upper)
             .build()
             .map_err(|e| {
                 e.to_string()
