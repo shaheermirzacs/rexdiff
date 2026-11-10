@@ -67,7 +67,7 @@ left and the diff on the right.
   follows.
 - **Live.** It watches the repository and updates as soon as a file changes,
   including after `git add` or a commit.
-- **Fast.** A single native binary. Only the visible lines are drawn, the diff
+- **Fast.** A native Rust app with one embedded Neovim process. The diff
   is computed for the selected file only, and git is read in-process
   (libgit2) on a background thread, so the UI never blocks.
 - **Keyboard and mouse.** Arrow keys, click (files, checkboxes, folders, and the
@@ -80,6 +80,7 @@ left and the diff on the right.
   untested.)
 - `git` on your `PATH`. Reading the repository doesn't need it, but commit,
   checkout, pull, push, and merge run the real `git` command.
+- Neovim 0.10 or newer (`nvim` on your `PATH`) for the read-only file reader.
 - A Rust toolchain to build it: `brew install rust`, or
   [rustup](https://rustup.rs).
 
@@ -133,6 +134,19 @@ does nothing.
 
 ### Changes screen
 
+The file reader embeds a clean Neovim instance (without your personal config or
+plugins). Motions, counts, regex search, text objects, registers, and character,
+line, or block selections are native Neovim. The buffer contains displayed diff
+rows; source line numbers and diff signs live in the gutter, outside selectable
+text. `:42` and `42G` address buffer rows; `:Source 42` jumps to source line 42,
+opening whole-file mode when necessary. Search covers the displayed content.
+
+Review actions in the reader use a Space prefix: `Space+a` annotates,
+`Space+s` sends notes, `Space+l` lists notes, `Space+x` toggles whole-file mode,
+and `Space+p` opens the file picker. `Tab` returns to the tree, where the existing
+Git, branch, and review shortcuts apply. `:q` closes the panel. Reader buffers
+are nonmodifiable scratch buffers; source files are not opened for editing.
+
 | Key | Action |
 | --- | --- |
 | `↑` `↓` / `j` `k` | Previous / next row (folders and files) |
@@ -140,45 +154,50 @@ does nothing.
 | `space` | Stage/unstage a changed file; fold a folder. Unchanged/ignored files are read-only |
 | `Enter` | Focus the selected file |
 | `t` | Toggle Changed files / All files, including hidden and ignored project files |
-| `Ctrl+p` | Fuzzy project-file picker (excludes Git-ignored files); type a path abbreviation, arrows or Ctrl+n/p to choose, Enter to open, Esc to cancel |
+| `Ctrl+p` in the tree / `Space+p` in the reader | Fuzzy project-file picker (excludes Git-ignored files); type a path abbreviation, arrows or Ctrl+n/p to choose, Enter to open, Esc to cancel |
 | `:e PATH` in the file | Open a readable project file; paths outside the project are rejected |
 | `\` | Hide/show the left sidebar |
 | `Tab` / `Shift-Tab` | Switch focus between the tree and file |
-| `H` (Shift+h) | Browse commits in the checked-out branch; `Enter` opens the selected commit's diff |
-| `D` (Shift+d), in Changes or History | View all committed branch changes from the merge base with the default branch |
-| `B` (Shift+b), in Changes or History | Enter a different comparison base, such as `origin/main` or `develop` |
-| `W` (Shift+w) | Return to staged, unstaged, and untracked working-tree changes |
+| `H` (Shift+h) in the tree | Browse commits in the checked-out branch; `Enter` opens the selected commit's diff |
+| `D` (Shift+d), in the tree or History | View all committed branch changes from the merge base with the default branch |
+| `B` (Shift+b), in the tree or History | Enter a different comparison base, such as `origin/main` or `develop` |
+| `W` (Shift+w) in the tree | Return to staged, unstaged, and untracked working-tree changes |
 | `↑` `↓` `←` `→` / `h` `j` `k` `l` in the file | Move the file cursor |
-| `v` / `V` (Shift+v) in the file | Select text / whole lines; move to extend; `Esc` clears |
-| `a` | Annotate the selection, or the whole file when nothing is selected. Arrow keys move the text cursor; `Shift+Enter` inserts a newline, `Enter` saves, `Esc` cancels |
-| `s` | Paste queued annotations into an agent's input in this tab; `↑↓` and `Enter` pick when multiple agents are available |
+| `v` / `V` / `Ctrl+v` in the reader | Select characters / whole lines / a block; move or use text objects to extend; `Esc` clears |
+| `a` in the tree / `Space+a` in the reader | Annotate the selection, or the whole file when nothing is selected. Arrow keys move the text cursor; `Shift+Enter` inserts a newline, `Enter` saves, `Esc` cancels |
+| `s` in the tree / `Space+s` in the reader | Paste queued annotations into an agent's input in this tab; `↑↓` and `Enter` pick when multiple agents are available |
 | `Ctrl+f/b`, `Ctrl+d/u`, `PgDn` / `PgUp` | Full/half-page movement |
-| `J` / `K` | Scroll the diff one line |
-| `gg` / `G`, `42G`, `:42` | First/last/source line; a hidden line automatically opens whole-file mode |
+| `Ctrl+e` / `Ctrl+y` in the reader | Scroll one line |
+| `gg` / `G`, `42G`, `:42` | First/last/buffer row; `:Source 42` jumps by source line and opens whole-file mode if needed |
 | `0` / `^` / `$`, `w` / `b` / `e` | Line and word motions; counts such as `10j` repeat motions |
-| `/` / `?`, `n` / `N` | Literal smart-case content search forward/backward; repeat/reverse with wraparound |
-| `L` (Shift+l) | List pending annotations; j/k previews, Enter edits, d deletes, Esc/q closes |
-| `c` | Commit what's staged (see below) |
-| `d` | Discard the changes of the file or folder under the cursor (see below) |
-| `x` | Toggle between changed hunks only and the whole file |
-| `+` / `-` | Make the tree bigger / smaller |
+| `/` / `?`, `n` / `N` | Native regex smart-case search forward/backward; repeat/reverse with wraparound |
+| `L` in the tree / `Space+l` in the reader | List pending annotations; j/k previews, Enter edits, d deletes, Esc/q closes |
+| `c` in the tree | Commit what's staged (see below) |
+| `d` in the tree | Discard the changes of the file or folder under the cursor (see below) |
+| `x` in the tree / `Space+x` in the reader | Toggle between changed hunks only and the whole file |
+| `+` / `-` in the tree | Make the tree bigger / smaller |
 | `1` / `2` in the tree | Changes / Branches screen (or click the tabs in the header). In the file, digits form motion counts |
-| `r` | Reload the repository |
-| `q` | Quit (the pane closes) |
+| `r` in the tree | Reload the repository |
+| `q` in the tree / `:q` in the reader | Quit (the pane closes) |
 
 Annotations are queued for the panel session. Add as many as needed, then press
-`s` to paste them together into an agent's input without submitting. Only agents
+`s` in the tree or `Space+s` in the reader to paste them together into an agent's input without submitting. Only agents
 in the panel's tab are offered. Failed delivery keeps the notes for retry; closing
 the panel discards unsent notes. Selected diff text includes old/new line numbers,
-so deleted lines remain identifiable. Use `x` to select beyond the changed hunks.
-Gutter dots mark annotated lines. Notes keep their original snippets; after a
+so deleted lines remain identifiable. Use `Space+x` in the reader to select beyond the changed hunks.
+Amber gutter rails mark annotated lines, with comment callouts above the selection.
+The annotation list highlights the selected entry and shows its old/new source-line
+ranges. It reserves space below the reader so jumping between notes keeps the code
+visible; wide panes also show the captured snippet beside the list. In narrow panes,
+the file tree temporarily gives its space to the reader while the list is open.
+Notes keep their original snippets; after a
 file changes, the list marks them stale rather than moving them to an inaccurate
 location. Preview is limited to 8 MiB and 50,000 rows; binary and oversized files
 can still receive whole-file annotations. Files are never edited by rexdiff.
 
 The fuzzy picker ranks path abbreviations (for example `sapr` for `src/app.rs`),
 highlights matched characters, and scans incrementally in the background. Its
-search is separate from literal `/` and `?` searches inside a file.
+search is separate from Neovim's `/` and `?` searches inside a file.
 
 With the mouse: click a file to show it, click its checkbox to stage or
 unstage it, click a folder to open or close it, scroll over the tree or the
