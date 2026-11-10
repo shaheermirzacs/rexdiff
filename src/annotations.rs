@@ -63,10 +63,27 @@ pub fn revision(root: &std::path::Path, path: &str) -> u64 {
     hash.finish()
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Position {
     pub row: usize,
     pub col: usize,
+}
+
+/// A reader selection from `anchor` to the cursor: characters, or whole
+/// lines (`V`). `old_side` is the split side it was made on (`None` when
+/// stacked), so resizing or changing layout never changes what it captures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: Position,
+    pub lines: bool,
+    pub old_side: Option<bool>,
+}
+
+impl Selection {
+    pub fn contains(&self, cursor: Position, pos: Position) -> bool {
+        let (lo, hi) = (self.anchor.min(cursor), self.anchor.max(cursor));
+        if self.lines { (lo.row..=hi.row).contains(&pos.row) } else { (lo..=hi).contains(&pos) }
+    }
 }
 
 

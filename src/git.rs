@@ -1234,4 +1234,23 @@ mod tests {
         drop(tx); worker.join().unwrap(); drop(tree); drop(index); drop(repo);
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn checkout_switches_the_current_root_without_a_worktree() {
+        let remote = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let git = |dir: &Path, args: &[&str]| run_git(dir, args).unwrap();
+        let head = |dir: &Path| git(dir, &["symbolic-ref", "--short", "HEAD"]).trim().to_string();
+        git(remote.path(), &["init", "-q", "-b", "main"]);
+        git(remote.path(), &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "root"]);
+        git(remote.path(), &["branch", "topic"]);
+        git(local.path(), &["clone", "-q", remote.path().to_str().unwrap(), "."]);
+        git(local.path(), &["branch", "feature"]);
+        checkout(local.path(), "feature", false).unwrap();
+        assert_eq!(head(local.path()), "feature");
+        checkout(local.path(), "origin/topic", true).unwrap();
+        assert_eq!(head(local.path()), "topic");
+        assert_eq!(git(local.path(), &["rev-parse", "--abbrev-ref", "topic@{upstream}"]).trim(), "origin/topic");
+        assert_eq!(git(local.path(), &["worktree", "list", "--porcelain"]).matches("worktree ").count(), 1);
+    }
 }

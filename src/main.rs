@@ -1,11 +1,14 @@
 mod app;
 mod annotations;
 mod project;
+mod keymap;
+mod navigation;
 mod reader;
 mod git;
 mod highlight;
 mod theme;
 mod tree;
+mod wrap;
 
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -21,37 +24,35 @@ Usage:
       --focus                              focus the panel when it opens
   rexdiff view                             run the panel in the current terminal
 
-In the panel:
-  ↑↓ / j k        previous / next row (folders and files)
-  ← → / h l       collapse/parent or expand/enter a folder
-  space           stage/unstage a changed file; on a folder: open/close
-  Enter           focus the selected file
-  Tab / Shift-Tab switch focus between the tree and file
-  v / V / Ctrl+v  in the file: native character / line / block selection; Esc clears
-  Space+a         in the file: annotate selection, or the whole file; Enter adds
+In the panel (? shows the keys for the current screen and focus):
+  ↑↓ / j k        tree: previous / next row, previewing the file; reader: move
+  ← → / h l       tree: collapse/parent or expand/enter a folder; reader: move
+  Enter / Tab     open the selected file at its first hunk (Enter on a folder folds it)
+  Tab / Shift-Tab cycle the tree, reader, and notes
+  z               in the tree: stage/unstage a file; on a folder: open/close
+  Space e / h / l hide/show the tree / old side / new side of a split diff
+  [ ] / { }       previous / next hunk / file
+  g / G / NG      top / bottom / source line N (also :N and :Source N)
+  0 ^ $ w b e     line and word motions; counts repeat motions (12j)
+  Ctrl+f/b/d/u    full/half-page movement; Ctrl+e/y scroll; zt zz zb place; zh zl pan split
+  v / V           select characters / lines; Esc clears selection, then search
+  / n N           regex smart-case search; next / previous match
+  a / A           annotate the line or selection (the file, in the tree) / the whole file
                   in notes: arrows move the cursor; Shift+Enter inserts a newline
-  Space+s         in the file: paste queued annotations to an agent in this tab
-  Space+l         in the file: list annotations: Enter edits, d deletes, Esc closes
-  a / s / L       in the tree: annotate file / send notes / list annotations
+  s               paste queued annotations to an agent in this tab
+  L               show/focus the notes; again hides: Enter edits, d deletes
+  x / S           whole file / split or stacked layout
+  Ctrl+p          fuzzy file picker; :e PATH opens a project file
+  :               command line: :N :e :base :diff :context :notes :commit :reload
+                  :changes :branches :help :q (Tab completes)
   H (Shift+h)     browse checked-out branch commits; Enter opens a commit diff
   D (Shift+d)     in Changes/History: combined branch diff from the merge base
   B (Shift+b)     in Changes/History: choose the branch comparison base
   W (Shift+w)     return to working-tree changes
   t               toggle changed files / all project files (including ignored files)
-  Ctrl+p          in the tree: fuzzy file picker (Space+p in the file); :e PATH opens a project file
-  \\               hide/show the left sidebar
-  gg / G / :N     first / last / source line N; NG and :Source N also use source lines
-  0 ^ $ w b e     line and word motions in the file
-  / ? n N         native regex smart-case search forward/backward, repeat/reverse
-  Ctrl+f/b/d/u    full/half-page movement; Ctrl+e/y scroll one line
-  x               in the tree: toggle whole file (Space+x in the file)
-  S               in the tree: toggle stacked/split diff (Space+d in the file)
-  Ctrl+w h/l      in split view: focus the old/new side
-  :q              quit from the file reader (q from the tree)
-  Neovim 0.10+ is required; the reader uses a clean config and read-only scratch buffers.
   c               commit what's staged: type the message, Enter commits, Esc cancels
   d               discard the changes of the file or folder under the cursor (y confirms)
-  1 / 2           Changes / Branches screen
+  1 / 2           Changes / Branches screen (in the reader, digits are counts)
 
 On the Branches screen:
   ↑↓ / j k        move between local branches
@@ -61,7 +62,7 @@ On the Branches screen:
   p               pull the branch (current: git pull; others: fast-forward only)
   P (Shift+P)     push the branch (to its upstream, or `origin` with -u)
   m               update the branch from its upstream, then merge it into the current one
-  d / D           delete the local branch (y confirms); D deletes it even if it isn't merged
+  d / D           delete the local branch (y/Enter confirms); D deletes it even if it isn't merged
   f               fetch from all remotes (git fetch --all --prune)
   Esc / 1         back to Changes
   + -             tree height                r    reload the repository   q  quit
