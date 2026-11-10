@@ -1,4 +1,7 @@
 mod app;
+mod annotations;
+mod project;
+mod navigation;
 mod git;
 mod highlight;
 mod theme;
@@ -21,10 +24,26 @@ Usage:
 
 In the panel:
   ↑↓ / j k        previous / next row (folders and files)
-  ← → / h l       previous folder (above) / next folder (below)
-  space / Enter   on a file: stage/unstage it (✓ = reviewed); on a folder: open/close
-  Tab / Shift-Tab next / previous file, wrapping around
-  f / b           scroll the diff one page   J K  one line   g / G  top / bottom
+  ← → / h l       collapse/parent or expand/enter a folder
+  space           stage/unstage a changed file; on a folder: open/close
+  Enter           focus the selected file
+  Tab / Shift-Tab switch focus between the tree and file
+  v / V           in the file: select text / whole lines; arrows or h j k l extend; Esc clears
+  a               annotate selection, or the whole file without a selection; Enter adds
+                  in notes: arrows move the cursor; Shift+Enter inserts a newline
+  s               paste queued annotations to an agent in this tab (picker if multiple)
+  L (Shift+l)     list annotations: Enter edits, d deletes, Esc closes
+  H (Shift+h)     browse checked-out branch commits; Enter opens a commit diff
+  D (Shift+d)     in Changes/History: combined branch diff from the merge base
+  B (Shift+b)     in Changes/History: choose the branch comparison base
+  W (Shift+w)     return to working-tree changes
+  t               toggle changed files / all project files (including ignored files)
+  Ctrl+p          fuzzy file picker; :e PATH opens a project file directly
+  \\               hide/show the left sidebar
+  gg / G / :N     first / last / source line N; counts repeat motions (10j, 42G)
+  0 ^ $ w b e     line and word motions in the file
+  / ? n N         literal smart-case search forward/backward, repeat/reverse
+  Ctrl+f/b/d/u    full/half-page movement; J K scroll one visual line
   x               toggle between changed hunks only and the whole file
   c               commit what's staged: type the message, Enter commits, Esc cancels
   d               discard the changes of the file or folder under the cursor (y confirms)

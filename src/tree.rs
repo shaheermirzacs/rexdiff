@@ -33,7 +33,7 @@ struct Node {
 
 impl Node {
     fn all_staged(&self, files: &[FileEntry]) -> bool {
-        self.files.iter().all(|(_, i)| files[*i].staged == Staged::Fully)
+        (!self.files.is_empty() || !self.dirs.is_empty()) && self.files.iter().all(|(_, i)| files[*i].staged == Staged::Fully)
             && self.dirs.values().all(|n| n.all_staged(files))
     }
 
@@ -55,12 +55,12 @@ pub fn build(files: &[FileEntry], collapsed: &HashSet<String>) -> Vec<TreeRow> {
     let mut root = Node::default();
     for (idx, f) in files.iter().enumerate() {
         let mut parts: Vec<&str> = f.path.split('/').collect();
-        let name = parts.pop().unwrap_or_default().to_string();
+        let name = if f.status == '\0' { String::new() } else { parts.pop().unwrap_or_default().to_string() };
         let mut node = &mut root;
         for p in parts {
             node = node.dirs.entry(p.to_string()).or_default();
         }
-        node.files.push((name, idx));
+        if f.status != '\0' { node.files.push((name, idx)); }
     }
     let mut out = Vec::new();
     walk(&root, "", "", true, files, collapsed, &mut out);

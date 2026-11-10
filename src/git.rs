@@ -22,6 +22,7 @@ const MAX_HISTORY: usize = 1000;
 /// Larger diffs are truncated (nobody reads 50k lines in a pane).
 const MAX_ROWS: usize = 50_000;
 
+#[derive(Clone)]
 pub struct FileEntry {
     pub path: String,
     pub status: char,
@@ -45,6 +46,23 @@ pub struct Snapshot {
     pub files: Vec<FileEntry>,
 }
 
+#[derive(Clone)]
+pub struct Comparison {
+    pub is_commit: bool,
+    pub base: Option<Oid>,
+    pub tip: Oid,
+    pub label: String,
+}
+
+impl Comparison {
+    pub fn revision(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        ("comparison", self.base, self.tip).hash(&mut hash);
+        hash.finish()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
     Hunk,
@@ -56,6 +74,7 @@ pub enum RowKind {
 
 /// A run of text with one color. `fg` is an index into the terminal's ANSI
 /// palette (so syntax colors follow the Rex theme); `None` is the default color.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Seg {
     pub text: String,
     pub fg: Option<u8>,
@@ -63,6 +82,7 @@ pub struct Seg {
     pub emph: bool,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct DRow {
     pub kind: RowKind,
     pub old: Option<u32>,
@@ -70,7 +90,9 @@ pub struct DRow {
     pub segs: Vec<Seg>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct FileDiff {
+    pub revision: u64,
     pub path: String,
     pub context: u32,
     pub rows: Vec<DRow>,
@@ -78,8 +100,11 @@ pub struct FileDiff {
 }
 
 pub enum Job {
+    Reload,
     Refresh,
     Diff { path: String, context: u32 },
+    Review { request: u64, commit: Option<String>, base: String },
+    ReviewDiff { comparison: Comparison, path: String, context: u32 },
     /// `git add` the file (`true`) or take it back out of the index (`false`).
     Stage { path: String, add: bool },
     /// `git commit -m message`.
@@ -108,6 +133,7 @@ pub enum Job {
 
 /// One commit, for the history screen.
 pub struct CommitInfo {
+    pub oid: String,
     pub short: String,
     pub subject: String,
     pub author: String,
@@ -135,6 +161,7 @@ pub struct BranchInfo {
 }
 
 pub enum Msg {
+    Review { request: u64, result: Result<(Comparison, Snapshot), String> },
     Snapshot(Result<Snapshot, String>),
     Diff(FileDiff),
     Error(String),
@@ -149,8 +176,10 @@ pub enum Msg {
 pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
     let hl = Highlighter::new();
     let mut repo: Option<Repository> = None;
+    let mut cache: Vec<(String, u64, u32, FileDiff)> = Vec::new();
+    let mut pending = std::collections::VecDeque::new();
 
-    while let Ok(first) = rx.recv() {
+    while let Some(first) = pending.pop_front().or_else(|| rx.recv().ok()) {
         // Coalesce queued requests: only the latest of each kind matters.
         // Stage requests all run, in order.
         let mut refresh = false;
@@ -161,8 +190,11 @@ pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
         let mut history_job = None;
         let mut discard_job = None;
         let mut actions = Vec::new();
+        let mut reviews = Vec::new();
         for job in std::iter::once(first).chain(rx.try_iter()) {
             match job {
+                Job::Review { .. } | Job::ReviewDiff { .. } => reviews.push(job),
+                Job::Reload => { cache.clear(); refresh = true; }
                 Job::Branches => branches = true,
                 Job::History { branch } => history_job = Some(branch),
                 Job::Discard { restore, new, label } => discard_job = Some((restore, new, label)),
@@ -188,6 +220,27 @@ pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
             let _ = tx.send(Msg::Snapshot(Err("This folder is not a git repository".into())));
             continue;
         };
+
+        for review in reviews {
+            match review {
+                Job::Review { request, commit, base } => {
+                    let result = comparison(r, commit.as_deref(), &base)
+                        .and_then(|c| comparison_snapshot(r, &c).map(|s| (c, s)))
+                        .map_err(|e| e.message().to_string());
+                    let _ = tx.send(Msg::Review { request, result });
+                }
+                Job::ReviewDiff { comparison, path, context } => {
+                    let diff = file_diff_source(r, &hl, &path, context, &tx, || {
+                        pending.extend(rx.try_iter());
+                        !pending.iter().any(|j| matches!(j, Job::Diff {..} | Job::Review {..} | Job::ReviewDiff {..} | Job::Reload))
+                    }, Some(&comparison));
+                    if !pending.iter().any(|j| matches!(j, Job::Diff {..} | Job::Review {..} | Job::ReviewDiff {..} | Job::Reload)) {
+                        let _ = tx.send(Msg::Diff(diff));
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
 
         for (path, add) in stage_jobs {
             if let Err(e) = stage(r, &path, add) {
@@ -251,7 +304,18 @@ pub fn run_worker(cwd: PathBuf, rx: Receiver<Job>, tx: Sender<Msg>) {
             }
         }
         if let Some((path, context)) = diff_job {
-            let diff = file_diff(r, &hl, &path, context);
+            let revision = crate::annotations::revision(r.workdir().unwrap_or(&cwd), &path);
+            cache.retain(|(p, rev, _, _)| p == &path && *rev == revision);
+            if let Some((_, _, _, d)) = cache.iter().find(|(_,_,c,_)| *c == context) {
+                let _ = tx.send(Msg::Diff(d.clone()));
+                continue;
+            }
+            let diff = file_diff(r, &hl, &path, context, &tx, || {
+                pending.extend(rx.try_iter());
+                !pending.iter().any(|j| matches!(j, Job::Diff {..} | Job::Review {..} | Job::ReviewDiff {..} | Job::Reload))
+            });
+            if pending.iter().any(|j| matches!(j, Job::Diff {..} | Job::Review {..} | Job::ReviewDiff {..} | Job::Reload)) { continue; }
+            cache.push((path, revision, context, diff.clone()));
             if tx.send(Msg::Diff(diff)).is_err() {
                 return;
             }
@@ -350,9 +414,9 @@ fn list_branches(repo: &Repository) -> Result<Vec<BranchInfo>, git2::Error> {
 fn history(repo: &Repository, name: &str) -> Result<Vec<CommitInfo>, git2::Error> {
     let branch = repo
         .find_branch(name, BranchType::Local)
-        .or_else(|_| repo.find_branch(name, BranchType::Remote))?;
-    let tip = branch.get().target().ok_or_else(|| git2::Error::from_str("this branch has no commits"))?;
-    let unpushed: HashSet<Oid> = match branch.upstream().ok().and_then(|u| u.get().target()) {
+        .or_else(|_| repo.find_branch(name, BranchType::Remote)).ok();
+    let tip = repo.revparse_single(name)?.peel_to_commit()?.id();
+    let unpushed: HashSet<Oid> = match branch.and_then(|b| b.upstream().ok()).and_then(|u| u.get().target()) {
         Some(up) => {
             let mut walk = repo.revwalk()?;
             walk.push(tip)?;
@@ -372,6 +436,7 @@ fn history(repo: &Repository, name: &str) -> Result<Vec<CommitInfo>, git2::Error
         let c = repo.find_commit(oid)?;
         let author = c.author();
         out.push(CommitInfo {
+            oid: oid.to_string(),
             short: c.as_object().short_id()?.as_str().unwrap_or_default().to_string(),
             subject: sanitize(c.summary().ok().flatten().unwrap_or_default()),
             author: author.name().ok().unwrap_or("?").to_string(),
@@ -707,6 +772,35 @@ fn staged_states(repo: &Repository) -> HashMap<String, Staged> {
         .collect()
 }
 
+fn comparison(repo: &Repository, commit: Option<&str>, base: &str) -> Result<Comparison, git2::Error> {
+    if let Some(oid) = commit {
+        let commit = repo.find_commit(Oid::from_str(oid)?)?;
+        let base = if commit.parent_count() == 0 { None } else { Some(commit.parent_id(0)?) };
+        return Ok(Comparison { is_commit: true, base, tip: commit.id(), label: format!("commit {} · {}", &oid[..7], sanitize(commit.summary().ok().flatten().unwrap_or_default())) });
+    }
+    let base = if base.trim().is_empty() {
+        let remote_default = repo.references_glob("refs/remotes/*/HEAD")?.flatten()
+            .find_map(|r| r.symbolic_target().ok().flatten().map(str::to_owned));
+        remote_default.or_else(|| ["refs/remotes/origin/main", "refs/remotes/origin/master", "refs/heads/main", "refs/heads/master"]
+            .into_iter().find(|name| repo.find_reference(name).is_ok()).map(str::to_owned))
+            .ok_or_else(|| git2::Error::from_str("No default branch found; press B and enter a base branch"))?
+    } else { base.trim().to_string() };
+    let tip = repo.head()?.peel_to_commit()?.id();
+    let target = repo.revparse_single(&base)?.peel_to_commit()?.id();
+    let merge_base = repo.merge_base(target, tip)?;
+    let label = base.strip_prefix("refs/remotes/").or_else(|| base.strip_prefix("refs/heads/")).unwrap_or(&base);
+    Ok(Comparison { is_commit: false, base: Some(merge_base), tip, label: format!("{label}...{} · {}", branch_name(repo), &tip.to_string()[..7]) })
+}
+
+fn comparison_snapshot(repo: &Repository, comparison: &Comparison) -> Result<Snapshot, git2::Error> {
+    let old = comparison.base.map(|id| repo.find_commit(id)?.tree()).transpose()?;
+    let new = repo.find_commit(comparison.tip)?.tree()?;
+    let mut opts = base_opts();
+    opts.context_lines(0);
+    let diff = repo.diff_tree_to_tree(old.as_ref(), Some(&new), Some(&mut opts))?;
+    Ok(Snapshot { branch: comparison.label.clone(), files: diff_files(&diff, &HashMap::new())? })
+}
+
 fn snapshot(repo: &Repository) -> Result<Snapshot, git2::Error> {
     // Re-read the index if it changed on disk (after a `git add`, for example).
     if let Ok(mut idx) = repo.index() {
@@ -718,6 +812,10 @@ fn snapshot(repo: &Repository) -> Result<Snapshot, git2::Error> {
     let diff = repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))?;
 
     let staged = staged_states(repo);
+    Ok(Snapshot { branch: branch_name(repo), files: diff_files(&diff, &staged)? })
+}
+
+fn diff_files(diff: &git2::Diff<'_>, staged: &HashMap<String, Staged>) -> Result<Vec<FileEntry>, git2::Error> {
     let mut files = Vec::with_capacity(diff.deltas().len());
     for i in 0..diff.deltas().len() {
         let delta = diff.get_delta(i).expect("delta in range");
@@ -727,7 +825,7 @@ fn snapshot(repo: &Repository) -> Result<Snapshot, git2::Error> {
             .or_else(|| delta.old_file().path())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let (adds, dels, binary) = match Patch::from_diff(&diff, i)? {
+        let (adds, dels, binary) = match Patch::from_diff(diff, i)? {
             Some(p) => {
                 let (_, a, d) = p.line_stats()?;
                 (a, d, p.delta().flags().is_binary())
@@ -738,7 +836,7 @@ fn snapshot(repo: &Repository) -> Result<Snapshot, git2::Error> {
         files.push(FileEntry { path, status: status_char(delta.status()), adds, dels, binary, staged });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(Snapshot { branch: branch_name(repo), files })
+    Ok(files)
 }
 
 fn meta(text: &str) -> DRow {
@@ -758,12 +856,25 @@ struct Raw {
     text: String,
 }
 
-fn file_diff(repo: &Repository, hl: &Highlighter, path: &str, context: u32) -> FileDiff {
-    let mut out = FileDiff { path: path.to_string(), context, rows: Vec::new(), max_lineno: 0 };
-    match collect_raw(repo, path, context) {
+fn file_diff(repo: &Repository, hl: &Highlighter, path: &str, context: u32, tx: &Sender<Msg>, keep_going: impl FnMut() -> bool) -> FileDiff {
+    file_diff_source(repo, hl, path, context, tx, keep_going, None)
+}
+
+fn file_diff_source(repo: &Repository, hl: &Highlighter, path: &str, context: u32, tx: &Sender<Msg>, mut keep_going: impl FnMut() -> bool, comparison: Option<&Comparison>) -> FileDiff {
+    let revision = comparison.map_or_else(|| crate::annotations::revision(repo.workdir().unwrap_or(Path::new(".")),path), Comparison::revision);
+    let mut out = FileDiff { revision, path: path.to_string(), context, rows: Vec::new(), max_lineno: 0 };
+    let raw = match comparison { Some(c) => collect_comparison_raw(repo, c, path, context), None => collect_raw(repo, path, context) };
+    match raw {
         Ok(Some(raw)) => {
             out.max_lineno = raw.iter().filter_map(|r| r.new.max(r.old)).max().unwrap_or(0);
-            out.rows = colorize(raw, hl, path);
+            out.rows = raw.iter().map(|r| DRow { kind: r.kind, old: r.old, new: r.new, segs: build_segs(&r.text, &[], &[]) }).collect();
+            let _ = tx.send(Msg::Diff(out.clone()));
+            let mut published = 0;
+            out.rows = colorize(raw, hl, path, &mut keep_going, &mut |rows| {
+                out.rows[published..rows.len()].clone_from_slice(&rows[published..]);
+                published = rows.len();
+                let _ = tx.send(Msg::Diff(out.clone()));
+            });
         }
         Ok(None) => out.rows.push(meta("Binary file — no text diff")),
         Err(e) => out.rows.push(meta(&format!("Could not read the diff: {}", e.message()))),
@@ -775,14 +886,53 @@ fn file_diff(repo: &Repository, hl: &Highlighter, path: &str, context: u32) -> F
 }
 
 fn collect_raw(repo: &Repository, path: &str, context: u32) -> Result<Option<Vec<Raw>>, git2::Error> {
+    if let Some(root) = repo.workdir() {
+        let file = root.join(path);
+        if file.exists() {
+            let safe = crate::project::contained(root, path).map_err(|e| git2::Error::from_str(&e))?;
+            if std::fs::metadata(safe).map_err(|e| git2::Error::from_str(&e.to_string()))?.len() > 8 * 1024 * 1024 {
+                return Err(git2::Error::from_str("File exceeds the 8 MiB preview limit"));
+            }
+        }
+    }
     let tree = head_tree(repo);
     let mut opts = base_opts();
     opts.context_lines(context).pathspec(path).disable_pathspec_match(true);
     let diff = repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))?;
     if diff.deltas().len() == 0 {
-        return Ok(Some(Vec::new()));
+        let root = repo.workdir().ok_or_else(|| git2::Error::from_str("No working tree"))?;
+        let file = crate::project::contained(root, path).map_err(|e| git2::Error::from_str(&e))?;
+        if std::fs::metadata(&file).map_err(|e| git2::Error::from_str(&e.to_string()))?.len() > 8 * 1024 * 1024 {
+            return Err(git2::Error::from_str("File exceeds the 8 MiB preview limit"));
+        }
+        let bytes = std::fs::read(file).map_err(|e| git2::Error::from_str(&e.to_string()))?;
+        if bytes.contains(&0) { return Ok(None); }
+        let mut raw: Vec<_> = String::from_utf8_lossy(&bytes).lines().take(MAX_ROWS+1).enumerate().map(|(i,s)| Raw { kind: RowKind::Ctx, old: None, new: Some(i as u32+1), text: s.into() }).collect();
+        if raw.len() > MAX_ROWS { raw.pop(); raw.push(Raw {kind:RowKind::Meta,old:None,new:None,text:format!("… file truncated to the first {MAX_ROWS} lines")}); }
+        return Ok(Some(raw));
     }
-    let Some(patch) = Patch::from_diff(&diff, 0)? else { return Ok(None) };
+    patch_rows(&diff)
+}
+
+fn collect_comparison_raw(repo: &Repository, comparison: &Comparison, path: &str, context: u32) -> Result<Option<Vec<Raw>>, git2::Error> {
+    let old = comparison.base.map(|id| repo.find_commit(id)?.tree()).transpose()?;
+    let new = repo.find_commit(comparison.tip)?.tree()?;
+    for tree in old.iter().chain(std::iter::once(&new)) {
+        if let Ok(entry) = tree.get_path(Path::new(path))
+            && let Ok(blob) = repo.find_blob(entry.id())
+            && blob.size() > 8 * 1024 * 1024 {
+            return Err(git2::Error::from_str("File exceeds the 8 MiB preview limit"));
+        }
+    }
+    let mut opts = base_opts();
+    opts.context_lines(context).pathspec(path).disable_pathspec_match(true);
+    let diff = repo.diff_tree_to_tree(old.as_ref(), Some(&new), Some(&mut opts))?;
+    if diff.deltas().len() == 0 { return Ok(Some(Vec::new())); }
+    patch_rows(&diff)
+}
+
+fn patch_rows(diff: &git2::Diff<'_>) -> Result<Option<Vec<Raw>>, git2::Error> {
+    let Some(patch) = Patch::from_diff(diff, 0)? else { return Ok(None) };
     if patch.delta().flags().is_binary() {
         return Ok(None);
     }
@@ -828,32 +978,36 @@ fn collect_raw(repo: &Repository, path: &str, context: u32) -> Result<Option<Vec
 }
 
 /// Applies syntax colors and highlights the words that changed.
-fn colorize(raw: Vec<Raw>, hl: &Highlighter, path: &str) -> Vec<DRow> {
+fn colorize(raw: Vec<Raw>, hl: &Highlighter, path: &str, keep_going: &mut impl FnMut() -> bool, progress: &mut impl FnMut(&[DRow])) -> Vec<DRow> {
     let emph = word_emphasis(&raw);
     let mut file_hl = hl.for_path(path, raw.len());
-
-    raw.into_iter()
-        .zip(emph)
-        .map(|(r, em)| {
-            let spans = match r.kind {
-                RowKind::Hunk => {
-                    file_hl.reset();
-                    Vec::new()
-                }
-                RowKind::Meta => Vec::new(),
-                RowKind::Ctx => file_hl.both(&r.text),
-                RowKind::Add => file_hl.new_side(&r.text),
-                RowKind::Del => file_hl.old_side(&r.text),
-            };
-            let segs = match r.kind {
-                RowKind::Hunk | RowKind::Meta => {
-                    vec![Seg { text: sanitize(&r.text), fg: None, bold: false, emph: false }]
-                }
-                _ => build_segs(&r.text, &spans, &em),
-            };
-            DRow { kind: r.kind, old: r.old, new: r.new, segs }
-        })
-        .collect()
+    let mut rows = Vec::with_capacity(raw.len());
+    let mut last_publish = std::time::Instant::now();
+    for (i, (r, em)) in raw.into_iter().zip(emph).enumerate() {
+        if i % 64 == 0 && !keep_going() { break; }
+        let spans = match r.kind {
+            RowKind::Hunk => {
+                file_hl.reset();
+                Vec::new()
+            }
+            RowKind::Meta => Vec::new(),
+            RowKind::Ctx => file_hl.both(&r.text),
+            RowKind::Add => file_hl.new_side(&r.text),
+            RowKind::Del => file_hl.old_side(&r.text),
+        };
+        let segs = match r.kind {
+            RowKind::Hunk | RowKind::Meta => {
+                vec![Seg { text: sanitize(&r.text), fg: None, bold: false, emph: false }]
+            }
+            _ => build_segs(&r.text, &spans, &em),
+        };
+        rows.push(DRow { kind: r.kind, old: r.old, new: r.new, segs });
+        if rows.len() == 64 || last_publish.elapsed() >= std::time::Duration::from_millis(100) {
+            progress(&rows);
+            last_publish = std::time::Instant::now();
+        }
+    }
+    rows
 }
 
 /// For each "deleted lines followed by added lines" block, pairs the lines up
@@ -963,4 +1117,124 @@ pub fn sanitize(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn commit_and_branch_comparisons_ignore_the_worktree() {
+        let dir = std::env::temp_dir().join(format!("rexdiff-review-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let commit = |files: &[(&str, &[u8])], parents: &[Oid]| {
+            let mut builder = repo.treebuilder(None).unwrap();
+            for (path, bytes) in files { builder.insert(path, repo.blob(bytes).unwrap(), 0o100644).unwrap(); }
+            let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+            let parents: Vec<_> = parents.iter().map(|id| repo.find_commit(*id).unwrap()).collect();
+            repo.commit(None, &sig, &sig, "fixture", &tree, &parents.iter().collect::<Vec<_>>()).unwrap()
+        };
+        let root = commit(&[("sample.rs", b"base\n"), ("gone.txt", b"deleted\n")], &[]);
+        let first = commit(&[("sample.rs", b"first\n")], &[root]);
+        let tip = commit(&[("sample.rs", b"second\n"), ("binary", b"\0binary"), ("新.txt", b"new\n")], &[first]);
+        let main = commit(&[("sample.rs", b"base\n"), ("gone.txt", b"deleted\n"), ("main-only", b"main\n")], &[root]);
+        repo.reference("refs/heads/main", main, true, "fixture").unwrap();
+        repo.reference("refs/heads/feature", tip, true, "fixture").unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.join("sample.rs"), "staged\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("sample.rs")).unwrap(); index.write().unwrap();
+        std::fs::write(dir.join("sample.rs"), "dirty\n").unwrap();
+        let index_before = std::fs::read(dir.join(".git/index")).unwrap();
+
+        let branch = comparison(&repo, None, "").unwrap();
+        assert_eq!(branch.base, Some(root));
+        assert_eq!(branch.tip, tip);
+        let snapshot = comparison_snapshot(&repo, &branch).unwrap();
+        assert!(snapshot.files.iter().any(|f| f.path == "gone.txt" && f.status == 'D'));
+        assert!(snapshot.files.iter().any(|f| f.path == "新.txt"));
+        assert!(!snapshot.files.iter().any(|f| f.path == "main-only"));
+        assert!(collect_comparison_raw(&repo, &branch, "binary", 3).unwrap().is_none());
+        let raw = collect_comparison_raw(&repo, &branch, "sample.rs", 1_000_000).unwrap().unwrap();
+        assert!(raw.iter().any(|r| r.kind == RowKind::Add && r.text == "second"));
+        assert!(raw.iter().any(|r| r.kind == RowKind::Del && r.text == "base"));
+        assert!(!raw.iter().any(|r| r.text == "dirty" || r.text == "staged"));
+        let single = comparison(&repo, Some(&tip.to_string()), "").unwrap();
+        assert_eq!(single.base, Some(first));
+        assert!(!comparison_snapshot(&repo, &single).unwrap().files.iter().any(|f| f.path == "gone.txt"));
+        let initial = comparison(&repo, Some(&root.to_string()), "").unwrap();
+        assert!(initial.base.is_none());
+        assert_eq!(comparison_snapshot(&repo, &initial).unwrap().files.len(), 2);
+        let merge = commit(&[("sample.rs", b"merged\n")], &[tip, main]);
+        assert_eq!(comparison(&repo, Some(&merge.to_string()), "").unwrap().base, Some(tip));
+        assert!(comparison(&repo, None, "missing-base").is_err());
+        assert!(comparison_snapshot(&repo, &comparison(&repo, None, "feature").unwrap()).unwrap().files.is_empty());
+        assert_eq!(history(&repo, "HEAD").unwrap()[0].oid, tip.to_string());
+        assert_eq!(std::fs::read(dir.join(".git/index")).unwrap(), index_before);
+        assert_eq!(std::fs::read_to_string(dir.join("sample.rs")).unwrap(), "dirty\n");
+        assert_eq!(repo.head().unwrap().target(), Some(tip));
+        drop(index); drop(repo);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn progressive_load_cache_and_unchanged_file() {
+        let dir = std::env::temp_dir().join(format!("rexdiff-load-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        let source: String = (0..2000).map(|i| format!("let item_{i} = {i};\n")).collect();
+        std::fs::write(dir.join("sample.rs"),&source).unwrap();
+        let mut index = repo.index().unwrap(); index.add_path(Path::new("sample.rs")).unwrap(); index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("test","test@example.com").unwrap();
+        repo.commit(Some("HEAD"),&sig,&sig,"fixture",&tree,&[]).unwrap();
+        std::fs::write(dir.join("sample.rs"),source.replace("item_1000 = 1000", "item_1000 = 42")).unwrap();
+        let raw_start = Instant::now();
+        let raw = collect_raw(&repo,"sample.rs",1_000_000).unwrap().unwrap();
+        eprintln!("full extraction: {:?}",raw_start.elapsed());
+        let hl = Highlighter::new();
+        let color_start = Instant::now();
+        let rows = colorize(raw,&hl,"sample.rs",&mut || true,&mut |_| {});
+        eprintln!("full highlighting: {:?}",color_start.elapsed());
+        let start = Instant::now();
+        let mut wrap = crate::wrap::WrapCache::default(); wrap.rebuild(&rows,60,1);
+        eprintln!("full wrapping: {:?}",start.elapsed());
+        let (tx,rx) = std::sync::mpsc::channel();
+        let (result,msgs) = std::sync::mpsc::channel();
+        let cwd = dir.clone();
+        let worker = std::thread::spawn(move || run_worker(cwd,rx,result));
+        for context in [3,1_000_000] {
+            tx.send(Job::Diff{path:"sample.rs".into(),context}).unwrap();
+            let Msg::Diff(plain) = msgs.recv_timeout(Duration::from_secs(10)).unwrap() else { panic!() };
+            assert!(plain.rows.iter().flat_map(|r| &r.segs).all(|s|s.fg.is_none()));
+            tx.send(Job::Refresh).unwrap();
+            let mut updates = 0;
+            loop {
+                match msgs.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    Msg::Diff(colored) => {
+                        assert_eq!(plain.rows.len(),colored.rows.len());
+                        assert!(colored.rows.iter().flat_map(|r| &r.segs).any(|s|s.fg.is_some()));
+                        updates += 1;
+                    }
+                    Msg::Snapshot(_) => break,
+                    _ => panic!(),
+                }
+            }
+            assert!(updates >= if context == 3 { 1 } else { 2 });
+        }
+        let start = Instant::now();
+        tx.send(Job::Diff{path:"sample.rs".into(),context:3}).unwrap();
+        assert!(matches!(msgs.recv_timeout(Duration::from_secs(10)).unwrap(),Msg::Diff(_)));
+        eprintln!("warm cached mode: {:?}",start.elapsed());
+        assert!(msgs.recv_timeout(Duration::from_millis(30)).is_err());
+        std::fs::write(dir.join(".gitignore"),"ignored.txt\n").unwrap();
+        std::fs::write(dir.join("ignored.txt"),"read and annotate me\n").unwrap();
+        let raw = collect_raw(&repo,"ignored.txt",3).unwrap().unwrap(); assert_eq!(raw[0].text,"read and annotate me");
+        assert_eq!(raw[0].new,Some(1));
+        drop(tx); worker.join().unwrap(); drop(tree); drop(index); drop(repo);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -11,6 +11,7 @@ license = "MIT"
 git2 = { version = "0.21.0", default-features = false }
 libc = "0.2.191"
 notify = "8.2.1"
+nucleo = "0.5"
 ratatui = "0.30.2"
 serde_json = "1.0.154"
 similar = "3.2.1"

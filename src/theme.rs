@@ -111,6 +111,8 @@ pub struct Palette {
     pub red: Color,
     pub yellow: Color,
     pub blue: Color,
+    pub selection_fg: Color,
+    pub search_fg: Color,
     pub add_bg: Color,
     pub add_gutter: Color,
     pub add_emph: Color,
@@ -131,6 +133,15 @@ fn luma(c: Rgb) -> f32 {
 
 fn rgb(c: Rgb) -> Color {
     Color::Rgb(c.0, c.1, c.2)
+}
+
+fn contrast_text((r, g, b): Rgb) -> Color {
+    let linear = |c: u8| {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let luminance = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+    if luminance > 0.179 { Color::Rgb(0, 0, 0) } else { Color::Rgb(255, 255, 255) }
 }
 
 impl Palette {
@@ -160,6 +171,8 @@ impl Palette {
             red: rgb(red),
             yellow: rgb(yellow),
             blue: rgb(blue),
+            selection_fg: contrast_text(blue),
+            search_fg: contrast_text(yellow),
             add_bg: rgb(mix(bg, green, row)),
             add_gutter: rgb(mix(bg, green, gutter)),
             add_emph: rgb(mix(bg, green, emph)),

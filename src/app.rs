@@ -10,6 +10,7 @@ use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
@@ -17,6 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
+use crate::annotations::{self, Agent, Position, Selection};
 use crate::git::{self, BranchInfo, CommitInfo, FileDiff, Job, Msg, RowKind, Snapshot, Staged};
 use crate::theme::{self, Palette};
 use crate::tree::{self, Item, TreeRow};
@@ -33,6 +35,8 @@ const THEME_EVERY: Duration = Duration::from_secs(4);
 #[derive(Default, Clone, Copy)]
 struct Areas {
     side: bool,
+    tree_frame: Rect,
+    file_frame: Rect,
     tree: Rect,
     /// Stacked: the hr row (it and the blank rows around it drag the divider).
     /// Side by side: the divider column.
@@ -58,6 +62,35 @@ enum View {
 }
 
 struct App {
+    root: PathBuf,
+    picker: Option<crate::project::Picker>,
+    inventory: Option<crate::project::Browser>,
+    other_collapsed: HashSet<String>,
+    catalog: Vec<git::FileEntry>,
+    all_files: bool,
+    sidebar: bool,
+    note_list: Option<usize>,
+    editing_note: Option<usize>,
+    command: Option<String>,
+    search: String,
+    search_backward: bool,
+    search_hits: Vec<(Position, usize)>,
+    count: String,
+    pending_g: bool,
+    file_focus: bool,
+    file_cursor: Position,
+    selection: Option<Selection>,
+    notes: Vec<annotations::Note>,
+    next_note: u64,
+    pending_line: Option<u32>,
+    pending_exact: bool,
+    document_revision: u64,
+    cached: Vec<(u64, FileDiff)>,
+    note_box: Option<(String, String)>,
+    note_cursor: usize,
+    draft_note: Option<annotations::Note>,
+    agent_picker: Option<(Vec<Agent>, usize)>,
+    annotation_rx: Option<Receiver<AnnotationResult>>,
     jobs: Sender<Job>,
     view: View,
     /// Column ranges of the "Changes" and "Branches" tabs in the header, for clicks.
@@ -70,6 +103,10 @@ struct App {
 
     hist_branch: String,
     history: Option<Result<Vec<CommitInfo>, String>>,
+    comparison: Option<git::Comparison>,
+    review_request: Option<u64>,
+    review_sequence: u64,
+    review_base: String,
     hist_cursor: usize,
     hist_off: Cell<usize>,
     pal: Palette,
@@ -80,6 +117,7 @@ struct App {
     rows: Vec<TreeRow>,
     cursor: usize,
     tree_off: usize,
+    tree_scrolling: bool,
     tree_pref: Option<u16>,
     tree_pref_w: Option<u16>,
 
@@ -104,6 +142,11 @@ struct App {
     quit: bool,
 }
 
+enum AnnotationResult {
+    Agents(Result<Vec<Agent>, String>),
+    Sent(Result<(), String>),
+}
+
 pub fn run(cwd: PathBuf) -> std::io::Result<()> {
     let (job_tx, job_rx) = mpsc::channel();
     let (msg_tx, msg_rx) = mpsc::channel();
@@ -119,47 +162,88 @@ pub fn run(cwd: PathBuf) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
     log_panics();
     let detected = theme::query(Duration::from_millis(400));
-    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES))?;
 
-    let mut app = App {
-        jobs: job_tx,
-        view: View::Changes,
-        tabs: Cell::new([(0, 0); 2]),
-        branches: None,
-        branch_cursor: 0,
-        branch_off: Cell::new(0),
-        hist_branch: String::new(),
-        history: None,
-        hist_cursor: 0,
-        hist_off: Cell::new(0),
-        pal: Palette::from(detected),
-        detected,
-        snapshot: None,
-        collapsed: HashSet::new(),
-        rows: Vec::new(),
-        cursor: 0,
-        tree_off: 0,
-        tree_pref: None,
-        tree_pref_w: None,
-        active: None,
-        diff: None,
-        diff_scroll: 0,
-        diff_gen: 0,
-        wrap: WrapCache::default(),
-        full_context: false,
-        areas: Areas::default(),
-        dragging: false,
-        flash: None,
-        commit_box: None,
-        confirm: None,
-        busy: None,
-        quit: false,
-    };
+    let mut app = App::new(job_tx, cwd, detected);
 
     let res = app.event_loop(&mut terminal, &msg_rx, &fs_rx);
-    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags, DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     res
+}
+
+impl App {
+    fn new(jobs: Sender<Job>, cwd: PathBuf, detected: Option<theme::Detected>) -> Self {
+        Self {
+            picker: None,
+            inventory: None,
+            other_collapsed: HashSet::new(),
+            catalog: Vec::new(),
+            all_files: false,
+            sidebar: true,
+            note_list: None,
+            editing_note: None,
+            command: None,
+            search: String::new(),
+            search_backward: false,
+            search_hits: Vec::new(),
+            count: String::new(),
+            pending_g: false,
+            root: git2::Repository::discover(&cwd).ok().and_then(|r| r.workdir().map(Path::to_path_buf)).unwrap_or(cwd),
+            file_focus: false,
+            file_cursor: Position::default(),
+            selection: None,
+            notes: Vec::new(),
+            next_note: 1,
+            pending_line: None,
+            pending_exact: true,
+            document_revision: 0,
+            cached: Vec::new(),
+            note_box: None,
+            note_cursor: 0,
+            draft_note: None,
+            agent_picker: None,
+            annotation_rx: None,
+            jobs,
+            view: View::Changes,
+            tabs: Cell::new([(0, 0); 2]),
+            branches: None,
+            branch_cursor: 0,
+            branch_off: Cell::new(0),
+            hist_branch: String::new(),
+            history: None,
+            comparison: None,
+            review_request: None,
+            review_sequence: 0,
+            review_base: String::new(),
+            hist_cursor: 0,
+            hist_off: Cell::new(0),
+            pal: Palette::from(detected),
+            detected,
+            snapshot: None,
+            collapsed: HashSet::new(),
+            rows: Vec::new(),
+            cursor: 0,
+            tree_off: 0,
+            tree_scrolling: false,
+            tree_pref: None,
+            tree_pref_w: None,
+            active: None,
+            diff: None,
+            diff_scroll: 0,
+            diff_gen: 0,
+            wrap: WrapCache::default(),
+            full_context: false,
+            areas: Areas::default(),
+            dragging: false,
+            flash: None,
+            commit_box: None,
+            confirm: None,
+            busy: None,
+            quit: false,
+        }
+    }
 }
 
 /// Writes panics to `~/.local/state/rexdiff/panic.log`: the pane closes along
@@ -216,6 +300,13 @@ impl App {
         let mut last_input = Instant::now();
 
         while !self.quit {
+            if let Some(picker) = &mut self.picker { picker.poll(); dirty = true; }
+            if let Some(scan) = &mut self.inventory && scan.poll() {
+                    let key = self.rows.get(self.cursor).map(|r| r.key(self.files()).to_string());
+                    self.update_catalog();
+                    self.rebuild(key.as_deref());
+                    dirty = true;
+            }
             if dirty {
                 terminal.draw(|f| self.draw(f))?;
                 dirty = false;
@@ -227,7 +318,15 @@ impl App {
                         Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
                         Event::Mouse(m) => self.on_mouse(m),
                         Event::Paste(text) => {
-                            if let Some(msg) = self.commit_box.as_mut() {
+                            if let Some(picker) = self.picker.as_mut() {
+                                picker.query.push_str(&text.replace(['\n','\r','\x1b'], " ")); picker.update();
+                            } else if let Some(command) = self.command.as_mut() {
+                                command.push_str(&text.replace(['\n','\r','\x1b'], " "));
+                            } else if let Some((_, msg)) = self.note_box.as_mut() {
+                                let text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\x1b', "");
+                                msg.insert_str(self.note_cursor, &text);
+                                self.note_cursor += text.len();
+                            } else if let Some(msg) = self.commit_box.as_mut() {
                                 msg.push_str(&text.replace(['\n', '\r'], " "));
                             }
                         }
@@ -245,6 +344,25 @@ impl App {
                 self.on_msg(msg);
                 dirty = true;
             }
+            if let Some(result) = self.annotation_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                self.annotation_rx = None;
+                match result {
+                    AnnotationResult::Agents(Ok(mut agents)) if agents.len() == 1 => self.send_notes(agents.remove(0)),
+                    AnnotationResult::Agents(Ok(agents)) if !agents.is_empty() => self.agent_picker = Some((agents, 0)),
+                    AnnotationResult::Agents(Ok(_)) => {
+                        self.flash = Some(Flash::new("No agents found in this tab; annotations kept".into(), false))
+                    }
+                    AnnotationResult::Sent(Ok(())) => {
+                        self.notes.clear();
+                        self.flash =
+                            Some(Flash::new("Annotations pasted into agent input (not submitted)".into(), true));
+                    }
+                    AnnotationResult::Agents(Err(e)) | AnnotationResult::Sent(Err(e)) => {
+                        self.flash = Some(Flash::new(e, false))
+                    }
+                }
+                dirty = true;
+            }
             if self.flash.as_ref().is_some_and(|f| Instant::now() >= f.until) {
                 self.flash = None;
                 dirty = true;
@@ -255,6 +373,7 @@ impl App {
             }
             let now = Instant::now();
             if refresh_due.is_some_and(|t| now >= t) || now - last_refresh >= FALLBACK_REFRESH {
+                if let Some(scan) = &self.inventory { scan.refresh(); }
                 let _ = self.jobs.send(Job::Refresh);
                 match self.view {
                     View::Branches => {
@@ -289,6 +408,7 @@ impl App {
     // ---------------------------------------------------------------- data
 
     fn files(&self) -> &[git::FileEntry] {
+        if self.all_files { return &self.catalog; }
         match &self.snapshot {
             Some(Ok(s)) => &s.files,
             _ => &[],
@@ -299,27 +419,52 @@ impl App {
         if self.full_context { FULL_CONTEXT } else { CONTEXT }
     }
 
+    fn open_path(&mut self, path: &str) {
+        if self.comparison.is_some() { self.flash = Some(Flash::new("Press W for working-tree files".into(), false)); return; }
+        match crate::project::contained(&self.root, path) {
+            Ok(file) => {
+                let path = file.strip_prefix(&self.root).unwrap_or(&file).to_string_lossy().into_owned();
+                self.set_active(path);
+                self.file_focus = true;
+            }
+            Err(e) => self.flash = Some(Flash::new(e, false)),
+        }
+    }
+
+    fn update_catalog(&mut self) {
+        self.catalog = self.snapshot.as_ref().and_then(|s| s.as_ref().ok()).map(|s| s.files.clone()).unwrap_or_default();
+        if let Some(scan) = &self.inventory {
+            let mut known: HashSet<String> = self.catalog.iter().map(|f| f.path.clone()).collect();
+            for entry in scan.entries.values().flatten() {
+                if known.insert(entry.path.clone()) {
+                    if entry.status == '\0' && !scan.entries.contains_key(&entry.path) {
+                        let expanded = self.catalog.iter().any(|f| f.status != ' ' && f.status != '\0' && f.path.starts_with(&format!("{}/",entry.path)));
+                        if !expanded { if self.all_files { self.collapsed.insert(entry.path.clone()); } else { self.other_collapsed.insert(entry.path.clone()); } }
+                    }
+                    self.catalog.push(entry.clone());
+                }
+            }
+        }
+        self.catalog.sort_by(|a,b| a.path.cmp(&b.path));
+    }
+
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Snapshot(snap) => {
-                let cursor_key = self.rows.get(self.cursor).map(|r| r.key(self.files()).to_string());
-                self.snapshot = Some(snap);
-                self.rebuild(cursor_key.as_deref());
-
-                let files = self.files();
-                let still_there = self.active.as_ref().is_some_and(|a| files.iter().any(|f| &f.path == a));
-                if !still_there {
-                    self.active = None;
-                    self.diff = None;
-                    // Start on the first file in the tree.
-                    if let Some(i) = self.rows.iter().position(|r| matches!(r.item, Item::File { .. })) {
-                        self.cursor = i;
+            Msg::Review { request, result } => {
+                if self.review_request != Some(request) { return; }
+                self.review_request = None;
+                match result {
+                    Ok((comparison, snapshot)) => {
+                        self.comparison = Some(comparison);
+                        self.reset_diff_view();
+                        self.apply_snapshot(Ok(snapshot));
+                        self.view = View::Changes;
                     }
-                    self.sync_active_from_cursor();
-                } else {
-                    // The content may have changed: request the diff again, keeping the scroll.
-                    self.request_diff();
+                    Err(e) => self.flash = Some(Flash::new(e, false)),
                 }
+            }
+            Msg::Snapshot(snap) => {
+                if self.comparison.is_none() && self.review_request.is_none() { self.apply_snapshot(snap); }
             }
             Msg::Error(e) => self.flash = Some(Flash::new(e, false)),
             Msg::Branches(list) => {
@@ -352,16 +497,84 @@ impl App {
                 });
             }
             Msg::Diff(d) => {
-                if Some(&d.path) == self.active.as_ref() && d.context == self.context() {
+                if Some(&d.path) == self.active.as_ref() && d.context == self.context()
+                    && self.review_request.is_none() && d.revision == self.revision(&d.path) {
+                    if self.diff.as_ref() == Some(&d) { return; }
+                    let revision = self.revision(&d.path);
+                    self.cached.retain(|(rev, old)| old.path == d.path && *rev == revision && old.context != d.context);
+                    self.cached.push((revision, d.clone()));
                     let same_file = self.diff.as_ref().is_some_and(|old| old.path == d.path);
                     if !same_file {
                         self.diff_scroll = 0;
+                        self.file_cursor = Position::default();
                     }
+                    // A selection refers to the displayed snapshot, not a later reload.
+                    if self.diff.as_ref().is_some_and(|old| !same_rows(old, &d)) {
+                        self.selection = None;
+                    }
+                    self.file_cursor.row = self.file_cursor.row.min(d.rows.len().saturating_sub(1));
                     self.diff = Some(d);
+                    self.search_hits = crate::navigation::matches(self.diff.as_ref().unwrap(), &self.search);
                     self.diff_gen += 1;
+                    if let Some(path) = &self.active { self.document_revision = self.revision(path); }
+                    if let Some(line) = self.pending_line.take() {
+                        if self.pending_exact { self.goto_line(line); } else { self.nearest_line(line); }
+                    }
                 }
             }
         }
+    }
+
+    fn revision(&self, path: &str) -> u64 {
+        self.comparison.as_ref().map_or_else(|| annotations::revision(&self.root, path), git::Comparison::revision)
+    }
+
+    fn apply_snapshot(&mut self, snap: Result<Snapshot, String>) {
+        let key = self.rows.get(self.cursor).map(|r| r.key(self.files()).to_string());
+        self.snapshot = Some(snap);
+        self.update_catalog();
+        self.rebuild(key.as_deref());
+        let still_there = self.active.as_ref().is_some_and(|a| self.files().iter().any(|f| &f.path == a)
+            || (self.comparison.is_none() && self.root.join(a).is_file()));
+        if !still_there {
+            self.active = None;
+            self.diff = None;
+            if let Some(i) = self.rows.iter().position(|r| matches!(r.item, Item::File { .. })) { self.cursor = i; }
+            self.sync_active_from_cursor();
+        } else { self.request_diff(); }
+    }
+
+    fn reset_diff_view(&mut self) {
+        self.active = None;
+        self.diff = None;
+        self.cached.clear();
+        self.selection = None;
+        self.pending_line = None;
+        self.file_cursor = Position::default();
+        self.diff_scroll = 0;
+        self.cursor = 0;
+        self.tree_off = 0;
+        self.tree_scrolling = false;
+        self.all_files = false;
+        self.collapsed.clear();
+        self.file_focus = false;
+    }
+
+    fn open_review(&mut self, commit: Option<String>) {
+        self.review_sequence += 1;
+        self.review_request = Some(self.review_sequence);
+        let _ = self.jobs.send(Job::Review { request: self.review_sequence, commit, base: self.review_base.clone() });
+        self.flash = Some(Flash::new("Loading comparison…".into(), true));
+    }
+
+    fn working_tree(&mut self) {
+        self.review_request = None;
+        self.comparison = None;
+        self.reset_diff_view();
+        self.snapshot = None;
+        self.rows.clear();
+        self.view = View::Changes;
+        let _ = self.jobs.send(Job::Refresh);
     }
 
     fn rebuild(&mut self, cursor_key: Option<&str>) {
@@ -373,7 +586,11 @@ impl App {
 
     fn request_diff(&self) {
         if let Some(path) = &self.active {
-            let _ = self.jobs.send(Job::Diff { path: path.clone(), context: self.context() });
+            let job = match &self.comparison {
+                Some(comparison) => Job::ReviewDiff { comparison: comparison.clone(), path: path.clone(), context: self.context() },
+                None => Job::Diff { path: path.clone(), context: self.context() },
+            };
+            let _ = self.jobs.send(job);
         }
     }
 
@@ -402,6 +619,8 @@ impl App {
 
     fn set_active(&mut self, path: String) {
         if self.active.as_ref() != Some(&path) {
+            self.selection = None;
+            self.file_cursor = Position::default();
             self.active = Some(path);
             self.request_diff();
         }
@@ -411,6 +630,7 @@ impl App {
 
     /// One row up or down the tree, through folders and files.
     fn move_row(&mut self, delta: isize) {
+        self.tree_scrolling = false;
         if self.rows.is_empty() {
             return;
         }
@@ -422,57 +642,29 @@ impl App {
     /// Moves to the next (or previous) folder. An open folder puts the cursor
     /// on its first visible entry (its first file, or a collapsed subfolder);
     /// a collapsed folder keeps the cursor on the folder itself.
-    fn step_folder(&mut self, forward: bool) {
-        let candidates: Box<dyn Iterator<Item = usize>> = if forward {
-            Box::new(self.cursor + 1..self.rows.len())
-        } else {
-            Box::new((0..self.cursor).rev())
-        };
-        for i in candidates {
-            if !matches!(self.rows[i].item, Item::Dir { .. }) {
-                continue;
-            }
-            let land = self.landing(i);
-            // Skip folders whose landing spot is where we already are (or behind us),
-            // e.g. the folder that holds the file the cursor is on.
-            if (forward && land > self.cursor) || (!forward && land < self.cursor) {
-                self.cursor = land;
-                self.sync_active_from_cursor();
-                return;
-            }
+    fn tree_motion(&mut self, forward: bool) {
+        self.tree_scrolling = false;
+        if let Some(Item::Dir { collapsed, .. }) = self.rows.get(self.cursor).map(|r| &r.item)
+            && *collapsed == forward {
+            self.toggle_dir(self.cursor); return;
         }
-    }
-
-    /// Where the cursor lands for the folder at `row`: down through open folders
-    /// until it reaches a file or a collapsed folder.
-    fn landing(&self, mut row: usize) -> usize {
-        while let Some(Item::Dir { collapsed: false, .. }) = self.rows.get(row).map(|r| &r.item) {
-            if row + 1 >= self.rows.len() {
-                break;
-            }
-            row += 1;
-        }
-        row
-    }
-
-    /// Next file, wrapping around (Tab).
-    fn jump_file(&mut self, forward: bool) {
-        let n = self.rows.len();
-        for step in 1..=n {
-            let i = if forward { (self.cursor + step) % n } else { (self.cursor + n - step) % n };
-            if matches!(self.rows[i].item, Item::File { .. }) {
-                self.cursor = i;
-                self.sync_active_from_cursor();
-                return;
-            }
+        if forward { self.move_row(1); }
+        else if let Some(row) = self.rows.get(self.cursor) {
+            let path = row.key(self.files()).to_string();
+            if let Some(i) = (0..self.cursor).rev().find(|&i| match &self.rows[i].item {
+                Item::Dir { path: parent, .. } => path.starts_with(&format!("{parent}/")), _ => false,
+            }) { self.cursor = i; }
         }
     }
 
     fn toggle_dir(&mut self, row: usize) {
+        self.tree_scrolling = false;
         let Some(TreeRow { item: Item::Dir { path, .. }, .. }) = self.rows.get(row) else { return };
         let path = path.clone();
         if !self.collapsed.remove(&path) {
             self.collapsed.insert(path.clone());
+        } else if self.all_files && let Some(scan) = &self.inventory {
+            scan.request(&path);
         }
         self.rebuild(Some(&path));
     }
@@ -488,7 +680,9 @@ impl App {
     }
 
     fn toggle_stage(&mut self, idx: usize) {
+        if self.comparison.is_some() { return; }
         let Some(f) = self.files().get(idx) else { return };
+        if f.status == ' ' { return; }
         let add = f.staged != Staged::Fully;
         let _ = self.jobs.send(Job::Stage { path: f.path.clone(), add });
     }
@@ -498,7 +692,298 @@ impl App {
         self.diff_scroll = (self.diff_scroll as isize + delta).clamp(0, max as isize) as usize;
     }
 
+    fn move_file_cursor(&mut self, rows: isize, cols: isize) {
+        let Some(d) = self.diff.as_ref().filter(|d| Some(&d.path) == self.active.as_ref()) else {
+            return;
+        };
+        if d.rows.is_empty() {
+            return;
+        }
+        self.file_cursor.row = self.file_cursor.row.saturating_add_signed(rows).min(d.rows.len() - 1);
+        while matches!(d.rows[self.file_cursor.row].kind, RowKind::Hunk | RowKind::Meta) {
+            let next = if rows < 0 { self.file_cursor.row.checked_sub(1) }
+                else { self.file_cursor.row.checked_add(1).filter(|&r| r < d.rows.len()) };
+            let Some(next) = next else { break };
+            self.file_cursor.row = next;
+        }
+        let len = annotations::text(&d.rows[self.file_cursor.row]).chars().count();
+        self.file_cursor.col = self.file_cursor.col.saturating_add_signed(cols).min(len.saturating_sub(1));
+        self.keep_file_cursor_visible();
+    }
+
+    fn keep_file_cursor_visible(&mut self) {
+        let Some(d) = &self.diff else { return };
+        let Some(row) = d.rows.get(self.file_cursor.row) else {
+            return;
+        };
+        let Some(first) = self.wrap.first.get(self.file_cursor.row) else {
+            return;
+        };
+        let w = wrap_row(row, Geom::new(d, self.areas.diff).text_w as usize);
+        let sub = w.starts.partition_point(|&start| start <= self.file_cursor.col).saturating_sub(1);
+        let v = first + sub;
+        let h = self.areas.diff.height.max(1) as usize;
+        if v < self.diff_scroll {
+            self.diff_scroll = v;
+        } else if v >= self.diff_scroll + h {
+            self.diff_scroll = v + 1 - h;
+        }
+        self.scroll_diff(0);
+    }
+
+    fn open_note(&mut self) {
+        self.editing_note = None;
+        if self.annotation_rx.is_some() {
+            return;
+        }
+        let Some(d) = self.diff.as_ref().filter(|d| Some(&d.path) == self.active.as_ref()) else {
+            return;
+        };
+        let path = self.root.join(&d.path).display().to_string();
+        let path = self.comparison.as_ref().map_or(path.clone(), |c| format!("{path} [commit {} vs {}]", c.tip, c.base.map_or("empty tree".into(), |id| id.to_string())));
+        let target = annotations::target(&path, d, self.selection.as_ref(), self.file_cursor);
+        let pos = self.selection.as_ref().map(|s| s.anchor.min(self.file_cursor));
+        let row = pos.and_then(|p| d.rows.get(p.row));
+        self.draft_note = Some(annotations::Note {
+            id: self.next_note, path: d.path.clone(), line: row.and_then(|r|r.new.or(r.old)), old_side: row.is_some_and(|r|r.new.is_none()),
+            locations: self.selection.as_ref().map(|s| d.rows.iter().enumerate().filter(|(i,_)| (s.anchor.row.min(self.file_cursor.row)..=s.anchor.row.max(self.file_cursor.row)).contains(i)).map(|(_,r)|(r.old,r.new)).collect()).unwrap_or_default(),
+            revision: self.document_revision, target: target.clone(), comment: String::new(),
+            preview: annotations::preview(d, self.selection.as_ref(), self.file_cursor),
+            historical: self.comparison.is_some(),
+        });
+        self.note_box = Some((target, String::new()));
+        self.note_cursor = 0;
+    }
+
+    fn on_note_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let Some((_, msg)) = self.note_box.as_mut() else {
+            return;
+        };
+        match k.code {
+            KeyCode::Esc => self.note_box = None,
+            KeyCode::Char('c') if ctrl => self.note_box = None,
+            KeyCode::Enter if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                msg.insert(self.note_cursor, '\n');
+                self.note_cursor += 1;
+            }
+            KeyCode::Enter if !msg.trim().is_empty() => {
+                let (_, msg) = self.note_box.take().unwrap();
+                if let Some(i) = self.editing_note.take() { self.notes[i].comment = msg.trim().into(); }
+                else {
+                    let Some(mut note) = self.draft_note.take() else { return };
+                    note.comment = msg.trim().into();
+                    self.notes.push(note);
+                    self.next_note += 1;
+                    self.notes.sort_by(|a,b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)).then(a.id.cmp(&b.id)));
+                }
+                self.selection = None;
+                self.flash = Some(Flash::new(format!("{} annotation(s) queued · s to send", self.notes.len()), true));
+            }
+            KeyCode::Left => self.note_cursor = msg[..self.note_cursor].char_indices().next_back().map_or(0, |(i,_)| i),
+            KeyCode::Right => self.note_cursor += msg[self.note_cursor..].chars().next().map_or(0, char::len_utf8),
+            KeyCode::Home => self.note_cursor = msg[..self.note_cursor].rfind('\n').map_or(0, |i| i + 1),
+            KeyCode::End => self.note_cursor += msg[self.note_cursor..].find('\n').unwrap_or(msg.len() - self.note_cursor),
+            KeyCode::Up | KeyCode::Down => {
+                let start = msg[..self.note_cursor].rfind('\n').map_or(0, |i| i + 1);
+                let col = msg[start..self.note_cursor].chars().count();
+                let line = if k.code == KeyCode::Up {
+                    (start > 0).then(|| {
+                        let end = start - 1;
+                        (msg[..end].rfind('\n').map_or(0, |i| i + 1), end)
+                    })
+                } else {
+                    msg[self.note_cursor..].find('\n').map(|i| {
+                        let start = self.note_cursor + i + 1;
+                        (start, start + msg[start..].find('\n').unwrap_or(msg.len() - start))
+                    })
+                };
+                if let Some((start, end)) = line {
+                    self.note_cursor = start + msg[start..end].char_indices().nth(col).map_or(end - start, |(i,_)| i);
+                }
+            }
+            KeyCode::Backspace if k.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+                let suffix = msg.split_off(self.note_cursor);
+                delete_word(msg);
+                self.note_cursor = msg.len();
+                msg.push_str(&suffix);
+            }
+            KeyCode::Backspace => {
+                if self.note_cursor > 0 {
+                    let start = msg[..self.note_cursor].char_indices().next_back().unwrap().0;
+                    msg.drain(start..self.note_cursor);
+                    self.note_cursor = start;
+                }
+            }
+            KeyCode::Delete => {
+                if self.note_cursor < msg.len() { msg.remove(self.note_cursor); }
+            }
+            KeyCode::Char('u') if ctrl => { msg.clear(); self.note_cursor = 0; }
+            KeyCode::Char('w') if ctrl => {
+                let suffix = msg.split_off(self.note_cursor);
+                delete_word(msg);
+                self.note_cursor = msg.len();
+                msg.push_str(&suffix);
+            }
+            KeyCode::Char(c) if !ctrl && !c.is_control() => {
+                msg.insert(self.note_cursor, c);
+                self.note_cursor += c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    fn find_agents(&mut self) {
+        if self.notes.is_empty() || self.annotation_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.annotation_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(AnnotationResult::Agents(annotations::agents()));
+        });
+    }
+
+    fn goto_line(&mut self, line: u32) {
+        if let Some(d) = &self.diff {
+            if let Some(row) = d.rows.iter().position(|r| r.new == Some(line)).or_else(|| d.rows.iter().position(|r| r.old == Some(line))) {
+                self.file_cursor = Position { row, col: 0 };
+                self.keep_file_cursor_visible();
+            } else if !self.full_context {
+                self.pending_line = Some(line);
+                self.pending_exact = true;
+                self.full_context = true;
+                self.request_diff();
+            } else { self.flash = Some(Flash::new(format!("Line {line} does not exist or exceeds the preview limit"), false)); }
+        }
+    }
+
+    fn nearest_line(&mut self, line: u32) {
+        if let Some(d) = &self.diff && let Some((row,_)) = d.rows.iter().enumerate().filter_map(|(i,r)| r.new.or(r.old).map(|n| (i,n.abs_diff(line)))).min_by_key(|(_,distance)| *distance) {
+            self.file_cursor = Position {row,col:0}; self.keep_file_cursor_visible();
+        }
+    }
+
+    fn search_next(&mut self, backward: bool) {
+        if self.search.is_empty() { return; }
+        let Some(d) = &self.diff else { return };
+        let found = crate::navigation::matches(d, &self.search);
+        self.search_hits = found.clone();
+        let next = if backward {
+            found.iter().rev().find(|(p,_)| *p < self.file_cursor).or(found.last())
+        } else { found.iter().find(|(p,_)| *p > self.file_cursor).or(found.first()) };
+            if let Some((pos,_)) = next {
+            self.file_cursor = *pos; self.keep_file_cursor_visible(); return;
+        }
+        self.flash = Some(Flash::new("Pattern not found".into(), false));
+    }
+
+    fn send_notes(&mut self, agent: Agent) {
+        let notes: Vec<_> = self.notes.iter().map(annotations::Note::format).collect();
+        let (tx, rx) = mpsc::channel();
+        self.annotation_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(AnnotationResult::Sent(annotations::send(&agent, &notes)));
+        });
+    }
+
+    fn on_agent_key(&mut self, k: KeyEvent) {
+        let Some((agents, cursor)) = self.agent_picker.as_mut() else {
+            return;
+        };
+        match k.code {
+            KeyCode::Esc => self.agent_picker = None,
+            KeyCode::Up | KeyCode::Char('k') => *cursor = cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => *cursor = (*cursor + 1).min(agents.len() - 1),
+            KeyCode::Enter => {
+                let (mut agents, cursor) = self.agent_picker.take().unwrap();
+                self.send_notes(agents.remove(cursor));
+            }
+            _ => {}
+        }
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
+        if let Some(mut picker) = self.picker.take() {
+            if matches!(k.code, KeyCode::Up | KeyCode::Down) || (k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('n' | 'p'))) { picker.user_selected = true; }
+            let items = picker.matches().to_vec();
+            match k.code {
+                KeyCode::Esc => return,
+                KeyCode::Enter => {
+                    if let Some(path) = items.get(picker.cursor) { self.open_path(path); }
+                    return;
+                }
+                KeyCode::Down => picker.cursor = (picker.cursor + 1).min(items.len().saturating_sub(1)),
+                KeyCode::Up => picker.cursor = picker.cursor.saturating_sub(1),
+                KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => picker.cursor = (picker.cursor+1).min(items.len().saturating_sub(1)),
+                KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => picker.cursor = picker.cursor.saturating_sub(1),
+                KeyCode::Backspace => { picker.query.pop(); picker.update(); }
+                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => { picker.query.push(c); picker.update(); }
+                _ => {}
+            }
+            self.picker = Some(picker); return;
+        }
+        if let Some(mut command) = self.command.take() {
+            match k.code {
+                KeyCode::Esc => return,
+                KeyCode::Enter => {
+                    if command.starts_with('/') || command.starts_with('?') {
+                        self.search = command[1..].to_string();
+                        self.search_hits.clear();
+                        self.search_backward = command.starts_with('?');
+                        self.search_next(self.search_backward);
+                    } else if let Some(base) = command.strip_prefix(":base ") {
+                        self.review_base = base.trim().to_string();
+                        self.open_review(None);
+                    } else if let Some(path) = command.strip_prefix(":e ") {
+                        self.open_path(path);
+                    } else if let Ok(line) = command.trim_start_matches(':').parse::<u32>() {
+                        self.goto_line(line);
+                    }
+                    return;
+                }
+                KeyCode::Backspace => { command.pop(); }
+                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => command.push(c),
+                _ => {}
+            }
+            self.command = Some(command);
+            return;
+        }
+        if self.note_box.is_none() && let Some(i) = self.note_list {
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.note_list = None,
+                KeyCode::Down | KeyCode::Char('j') => self.note_list = Some((i + 1).min(self.notes.len().saturating_sub(1))),
+                KeyCode::Up | KeyCode::Char('k') => self.note_list = Some(i.saturating_sub(1)),
+                KeyCode::Char('d') if self.annotation_rx.is_none() && !self.notes.is_empty() => {
+                    self.notes.remove(i);
+                    self.note_list = if self.notes.is_empty() { None } else { Some(i.min(self.notes.len()-1)) };
+                }
+                KeyCode::Enter if self.annotation_rx.is_none() && !self.notes.is_empty() => {
+                    self.note_box = Some((self.notes[i].target.clone(), self.notes[i].comment.clone()));
+                    self.note_cursor = self.notes[i].comment.len();
+                    self.editing_note = Some(i);
+                }
+                _ => {}
+            }
+            if let Some(i) = self.note_list && let Some(note) = self.notes.get(i).cloned()
+                && self.revision(&note.path) == note.revision {
+                    self.pending_line = note.line;
+                    self.set_active(note.path);
+                    if let Some(line) = note.line {
+                        if note.old_side && let Some(d) = &self.diff && let Some(row) = d.rows.iter().position(|r| r.old == Some(line)) { self.file_cursor = Position{row,col:0}; self.keep_file_cursor_visible(); }
+                        else { self.goto_line(line); }
+                    }
+            }
+            return;
+        }
+        if self.note_box.is_some() {
+            self.on_note_key(k);
+            return;
+        }
+        if self.agent_picker.is_some() {
+            self.on_agent_key(k);
+            return;
+        }
         if self.commit_box.is_some() {
             self.on_commit_key(k);
             return;
@@ -512,11 +997,54 @@ impl App {
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if self.view == View::Changes && self.file_focus {
+            match k.code {
+                KeyCode::Char(c @ '0'..='9') if c != '0' || !self.count.is_empty() => {
+                    if self.count.len() < 8 { self.count.push(c); }
+                    return;
+                }
+                KeyCode::Char('g') if !self.pending_g => { self.pending_g = true; return; }
+                _ => {}
+            }
+            let n = self.count.parse::<usize>().unwrap_or(1);
+            let counted = !self.count.is_empty();
+            self.count.clear();
+            let gg = std::mem::take(&mut self.pending_g) && k.code == KeyCode::Char('g');
+            match k.code {
+                KeyCode::Char('f' | 'b' | 'd' | 'u') if ctrl => {
+                    let page = self.areas.diff.height.max(2) as isize - 1;
+                    let delta = match k.code { KeyCode::Char('b') => -page, KeyCode::Char('d') => page/2, KeyCode::Char('u') => -page/2, _ => page };
+                    self.move_file_cursor(delta.saturating_mul(n as isize),0); return;
+                }
+                KeyCode::Char(c @ ('w' | 'b' | 'e')) => {
+                    if let Some(d) = &self.diff { self.file_cursor = crate::navigation::word(d,self.file_cursor,c,n); }
+                    self.keep_file_cursor_visible(); return;
+                }
+                KeyCode::Char('h') | KeyCode::Left if n > 1 => { self.move_file_cursor(0,-(n as isize)); return; }
+                KeyCode::Char('l') | KeyCode::Right if n > 1 => { self.move_file_cursor(0,n as isize); return; }
+                KeyCode::Char('g') if gg => { self.goto_line(if counted { n as u32 } else { 1 }); return; }
+                KeyCode::Char('G') if counted => { self.goto_line(n as u32); return; }
+                KeyCode::Char('/') | KeyCode::Char('?') | KeyCode::Char(':') => { self.command = Some(match k.code { KeyCode::Char(c) => c.to_string(), _ => unreachable!() }); return; }
+                KeyCode::Char('n') | KeyCode::Char('N') => { for _ in 0..n { self.search_next(self.search_backward ^ (k.code == KeyCode::Char('N'))); } return; }
+                KeyCode::Char('0') => { self.file_cursor.col = 0; self.keep_file_cursor_visible(); return; }
+                KeyCode::Char('$') | KeyCode::Char('^') => {
+                    if let Some(row) = self.diff.as_ref().and_then(|d| d.rows.get(self.file_cursor.row)) {
+                        let text = annotations::text(row);
+                        self.file_cursor.col = if k.code == KeyCode::Char('$') { text.chars().count().saturating_sub(1) } else { text.chars().take_while(|c| c.is_whitespace()).count() };
+                    }
+                    self.keep_file_cursor_visible(); return;
+                }
+                KeyCode::Char('j') | KeyCode::Down if n > 1 => { self.move_file_cursor(n as isize, 0); return; }
+                KeyCode::Char('k') | KeyCode::Up if n > 1 => { self.move_file_cursor(-(n as isize), 0); return; }
+                _ => {}
+            }
+        }
         match k.code {
             KeyCode::Char('q') => return self.quit = true,
             KeyCode::Char('c') if ctrl => return self.quit = true,
             KeyCode::Char('1') => return self.show_view(View::Changes),
             KeyCode::Char('2') => return self.show_view(View::Branches),
+            KeyCode::Char('W') => return self.working_tree(),
             _ => {}
         }
         match self.view {
@@ -526,17 +1054,103 @@ impl App {
         }
         let page = self.areas.diff.height.max(2) as isize - 1;
         match k.code {
+            KeyCode::Char('H') => {
+                self.hist_branch = "HEAD".into();
+                self.history = None;
+                self.hist_cursor = 0;
+                self.hist_off.set(0);
+                self.view = View::History;
+                let _ = self.jobs.send(Job::History { branch: self.hist_branch.clone() });
+                return;
+            }
+            KeyCode::Char('D') => { self.open_review(None); return; }
+            KeyCode::Char('B') => { self.command = Some(format!(":base {}", self.review_base)); return; }
+            KeyCode::Esc if self.comparison.is_some() && self.selection.is_none() => {
+                if self.comparison.as_ref().is_some_and(|c| c.is_commit) {
+                    self.view = View::History;
+                    if self.history.is_none() {
+                        self.hist_branch = "HEAD".into();
+                        let _ = self.jobs.send(Job::History { branch: self.hist_branch.clone() });
+                    }
+                } else { self.working_tree(); }
+                return;
+            }
+            KeyCode::Char('p') if ctrl => { if self.comparison.is_none() { self.picker = Some(crate::project::Picker::new(self.root.clone())); } else { self.flash = Some(Flash::new("Press W for working-tree files".into(), false)); } return; }
+            KeyCode::Char('t') => {
+                if self.comparison.is_some() { self.flash = Some(Flash::new("Press W for the project file tree".into(), false)); return; }
+                self.all_files = !self.all_files;
+                std::mem::swap(&mut self.collapsed, &mut self.other_collapsed);
+                if self.inventory.is_none() {
+                    let browser = crate::project::Browser::new(self.root.clone());
+                    if let Some(Ok(snap)) = &self.snapshot {
+                        for file in &snap.files {
+                            let mut parent = Path::new(&file.path).parent();
+                            while let Some(p) = parent { if let Some(p) = p.to_str() { browser.request(p); } parent = p.parent(); }
+                        }
+                    }
+                    self.inventory = Some(browser);
+                }
+                self.update_catalog(); self.rebuild(None); return;
+            }
+            KeyCode::Char('L') => { self.note_list = Some(0); return; }
+            KeyCode::Char('\\') => { self.sidebar = !self.sidebar; self.file_focus = !self.sidebar; return; }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.file_focus = !self.file_focus;
+                if !self.file_focus { self.sidebar = true; }
+                self.selection = None;
+                self.move_file_cursor(0, 0);
+                return;
+            }
+            KeyCode::Char('a') => {
+                self.open_note();
+                return;
+            }
+            KeyCode::Char('s') => {
+                self.find_agents();
+                return;
+            }
+            _ => {}
+        }
+        if self.file_focus {
+            match k.code {
+                KeyCode::Esc => {
+                    self.selection = None;
+                    return;
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    let lines = k.code == KeyCode::Char('V');
+                    self.selection = if self.selection.as_ref().is_some_and(|s| s.lines == lines) {
+                        None
+                    } else {
+                        Some(Selection { anchor: self.file_cursor, lines })
+                    };
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => return self.move_file_cursor(-1, 0),
+                KeyCode::Down | KeyCode::Char('j') => return self.move_file_cursor(1, 0),
+                KeyCode::Left | KeyCode::Char('h') => return self.move_file_cursor(0, -1),
+                KeyCode::Right | KeyCode::Char('l') => return self.move_file_cursor(0, 1),
+                KeyCode::Char('g') | KeyCode::Home => return self.move_file_cursor(isize::MIN / 2, 0),
+                KeyCode::Char('G') | KeyCode::End => return self.move_file_cursor(isize::MAX / 2, 0),
+                KeyCode::Char('f') | KeyCode::PageDown => return self.move_file_cursor(page, 0),
+                KeyCode::Char('b') | KeyCode::PageUp => return self.move_file_cursor(-page, 0),
+                KeyCode::Char('d') if ctrl => return self.move_file_cursor(page / 2, 0),
+                KeyCode::Char('u') if ctrl => return self.move_file_cursor(-page / 2, 0),
+                KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Char('d') => return,
+                _ => {}
+            }
+        }
+        match k.code {
             KeyCode::Char('c') if !ctrl => self.open_commit_box(),
             KeyCode::Char('d') if !ctrl => self.ask_discard(),
             KeyCode::Char('d') if ctrl => self.scroll_diff(page / 2),
             KeyCode::Char('u') if ctrl => self.scroll_diff(-page / 2),
             KeyCode::Up | KeyCode::Char('k') => self.move_row(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_row(1),
-            KeyCode::Left | KeyCode::Char('h') => self.step_folder(false),
-            KeyCode::Right | KeyCode::Char('l') => self.step_folder(true),
-            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_here(),
-            KeyCode::Tab => self.jump_file(true),
-            KeyCode::BackTab => self.jump_file(false),
+            KeyCode::Left | KeyCode::Char('h') => self.tree_motion(false),
+            KeyCode::Right | KeyCode::Char('l') => self.tree_motion(true),
+            KeyCode::Char(' ') => self.toggle_here(),
+            KeyCode::Enter => { self.sync_active_from_cursor(); self.file_focus = true; self.move_file_cursor(0,0); }
             KeyCode::Char('J') => self.scroll_diff(1),
             KeyCode::Char('K') => self.scroll_diff(-1),
             KeyCode::Char('f') | KeyCode::PageDown => self.scroll_diff(page),
@@ -544,24 +1158,31 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.diff_scroll = 0,
             KeyCode::Char('G') | KeyCode::End => self.scroll_diff(isize::MAX / 2),
             KeyCode::Char('x') => {
+                let location = self.diff.as_ref().and_then(|d| d.rows.get(self.file_cursor.row)).and_then(|r| r.new.or(r.old));
                 self.full_context = !self.full_context;
-                self.diff = None;
-                self.request_diff();
+                self.selection = None;
+                let revision = self.active.as_ref().map(|p| self.revision(p));
+                if let Some((_, d)) = self.cached.iter().find(|(rev,d)| Some(*rev) == revision && Some(&d.path) == self.active.as_ref() && d.context == self.context()) {
+                    self.diff = Some(d.clone()); self.diff_gen += 1;
+                    self.search_hits = crate::navigation::matches(self.diff.as_ref().unwrap(), &self.search);
+                    if let Some(line) = location { self.nearest_line(line); }
+                } else { self.pending_line = location; self.pending_exact = false; self.request_diff(); }
             }
             KeyCode::Char('+') | KeyCode::Char('=') if self.areas.side => {
-                self.tree_pref_w = Some(self.areas.tree.width + 2);
+                self.tree_pref_w = Some(self.areas.tree_frame.width + 2);
             }
             KeyCode::Char('-') if self.areas.side => {
-                self.tree_pref_w = Some(self.areas.tree.width.saturating_sub(2));
+                self.tree_pref_w = Some(self.areas.tree_frame.width.saturating_sub(2));
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
-                self.tree_pref = Some(self.areas.tree.height + 1);
+                self.tree_pref = Some(self.areas.tree_frame.height + 1);
             }
             KeyCode::Char('-') => {
-                self.tree_pref = Some(self.areas.tree.height.saturating_sub(1).max(1));
+                self.tree_pref = Some(self.areas.tree_frame.height.saturating_sub(1).max(1));
             }
             KeyCode::Char('r') => {
-                let _ = self.jobs.send(Job::Refresh);
+                self.cached.clear();
+                if self.comparison.is_some() { self.request_diff(); } else { let _ = self.jobs.send(Job::Reload); }
             }
             _ => {}
         }
@@ -633,6 +1254,13 @@ impl App {
         let page = (self.areas.diff.height.max(2) as isize).max(10);
         let move_by = |c: usize, d: isize| (c as isize + d).clamp(0, len.saturating_sub(1) as isize) as usize;
         match k.code {
+            KeyCode::Enter => {
+                if let Some(Ok(commits)) = &self.history && let Some(commit) = commits.get(self.hist_cursor) {
+                    self.open_review(Some(commit.oid.clone()));
+                }
+            }
+            KeyCode::Char('D') => self.open_review(None),
+            KeyCode::Char('B') => self.command = Some(format!(":base {}", self.review_base)),
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => self.view = View::Branches,
             KeyCode::Up | KeyCode::Char('k') => self.hist_cursor = move_by(self.hist_cursor, -1),
             KeyCode::Down | KeyCode::Char('j') => self.hist_cursor = move_by(self.hist_cursor, 1),
@@ -718,6 +1346,7 @@ impl App {
     /// `d`: get ready to throw away the changes of the file or folder under
     /// the cursor, and ask for confirmation in the footer.
     fn ask_discard(&mut self) {
+        if self.comparison.is_some() { return; }
         if self.busy.is_some() {
             return;
         }
@@ -727,12 +1356,13 @@ impl App {
             Item::File { idx, .. } => (files[*idx].path.clone(), vec![&files[*idx]]),
             Item::Dir { path, .. } => {
                 let prefix = format!("{path}/");
-                (prefix.clone(), files.iter().filter(|f| f.path.starts_with(&prefix)).collect())
+                (prefix.clone(), files.iter().filter(|f| f.status != ' ' && f.path.starts_with(&prefix)).collect())
             }
         };
         if picked.is_empty() {
             return;
         }
+        if picked.iter().all(|f| f.status == ' ') { return; }
         let label = if picked.len() > 1 { format!("{label} ({} files)", picked.len()) } else { label };
         // New files aren't in HEAD: discarding them means deleting them.
         let (new, restore): (Vec<_>, Vec<_>) = picked.into_iter().partition(|f| f.status == 'A');
@@ -785,6 +1415,7 @@ impl App {
     }
 
     fn open_commit_box(&mut self) {
+        if self.comparison.is_some() { return; }
         if self.busy.is_some() {
             return;
         }
@@ -827,6 +1458,10 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        if self.picker.is_some() || self.command.is_some() || self.note_list.is_some() || self.note_box.is_some() || self.agent_picker.is_some() || self.commit_box.is_some() || self.confirm.is_some()
+        {
+            return;
+        }
         if m.kind == MouseEventKind::Down(MouseButton::Left) && m.row == 0 {
             for (i, (x0, x1)) in self.tabs.get().iter().enumerate() {
                 if m.column >= *x0 && m.column < *x1 {
@@ -871,21 +1506,29 @@ impl App {
         let a = self.areas;
         let inside = |r: Rect| m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height;
         let in_tree = inside(a.tree);
+        let over_tree = inside(a.tree_frame);
         let on_splitter = if a.side {
             m.column + 1 >= a.splitter && m.column <= a.splitter + 1 && m.row >= a.tree.y
         } else {
             a.splitter > 0 && m.row + 1 >= a.splitter && m.row <= a.splitter + 1
         };
         match m.kind {
-            MouseEventKind::ScrollDown if in_tree => {
+            MouseEventKind::ScrollDown if over_tree => {
+                self.tree_scrolling = true;
                 let max = self.rows.len().saturating_sub(a.tree.height as usize);
                 self.tree_off = (self.tree_off + 1).min(max);
             }
-            MouseEventKind::ScrollUp if in_tree => self.tree_off = self.tree_off.saturating_sub(1),
+            MouseEventKind::ScrollUp if over_tree => {
+                self.tree_scrolling = true;
+                self.tree_off = self.tree_off.saturating_sub(1);
+            }
             MouseEventKind::ScrollDown => self.scroll_diff(3),
             MouseEventKind::ScrollUp => self.scroll_diff(-3),
             MouseEventKind::Down(MouseButton::Left) if on_splitter => self.dragging = true,
             MouseEventKind::Down(MouseButton::Left) if in_tree => {
+                self.tree_scrolling = false;
+                self.file_focus = false;
+                self.selection = None;
                 let row = self.tree_off + (m.row - a.tree.y) as usize;
                 if row < self.rows.len() {
                     self.cursor = row;
@@ -902,13 +1545,19 @@ impl App {
                     }
                 }
             }
+            MouseEventKind::Down(MouseButton::Left) if inside(a.diff) => {
+                self.file_focus = true;
+                self.selection = None;
+                self.file_cursor.row = self.wrap.locate(self.diff_scroll + (m.row - a.diff.y) as usize).0;
+                self.file_cursor.col = 0;
+            }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging && a.side => {
                 // The divider sits one column after the end of the tree.
-                self.tree_pref_w = Some(m.column.saturating_sub(a.tree.x + 1));
+                self.tree_pref_w = Some(m.column.saturating_sub(a.tree_frame.x + 1));
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
                 // The pointer sits on the hr, one row below the end of the tree.
-                self.tree_pref = Some(m.row.saturating_sub(a.tree.y + 1).max(1));
+                self.tree_pref = Some(m.row.saturating_sub(a.tree_frame.y + 1).max(1));
             }
             MouseEventKind::Up(MouseButton::Left) => self.dragging = false,
             _ => {}
@@ -918,14 +1567,31 @@ impl App {
     // ---------------------------------------------------------------- drawing
 
     fn layout(&mut self, area: Rect) {
-        self.areas = if area.width >= SIDE_MIN_WIDTH { self.side_layout(area) } else { self.stacked_layout(area) };
+        self.areas = if self.sidebar {
+            if area.width >= SIDE_MIN_WIDTH { self.side_layout(area) } else { self.stacked_layout(area) }
+        } else {
+            let mut a = self.stacked_layout(area);
+            a.tree.height = 0;
+            a.title = Rect::new(area.x, area.y + 2, area.width, 1);
+            a.diff = Rect::new(area.x, area.y + 3, area.width, area.height.saturating_sub(4));
+            a
+        };
+        use ratatui::widgets::Block;
+        let body = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(3 + self.footer_gap()));
+        self.areas.tree_frame = self.areas.tree.intersection(body);
+        self.areas.file_frame = Rect::new(self.areas.title.x, self.areas.title.y,
+            self.areas.title.width, self.areas.title.height + self.areas.diff.height).intersection(body);
+        self.areas.tree = Block::bordered().inner(self.areas.tree_frame);
+        let inner = Block::bordered().inner(self.areas.file_frame);
+        self.areas.title = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
+        self.areas.diff = Rect::new(inner.x, inner.y + inner.height.min(1), inner.width, inner.height.saturating_sub(1));
         let tree_h = self.areas.tree.height;
 
         // Keep the cursor visible in the tree.
         let h = tree_h as usize;
-        if self.cursor < self.tree_off {
+        if !self.tree_scrolling && self.cursor < self.tree_off {
             self.tree_off = self.cursor;
-        } else if h > 0 && self.cursor >= self.tree_off + h {
+        } else if !self.tree_scrolling && h > 0 && self.cursor >= self.tree_off + h {
             self.tree_off = self.cursor + 1 - h;
         }
         self.tree_off = self.tree_off.min(self.rows.len().saturating_sub(h));
@@ -944,24 +1610,24 @@ impl App {
     /// A blank row above the footer while the commit box is open, so it doesn't
     /// sit right against the diff.
     fn footer_gap(&self) -> u16 {
-        u16::from(self.commit_box.is_some())
+        u16::from(self.commit_box.is_some() || self.note_box.is_some())
     }
 
     /// Tree on top, diff below.
     fn stacked_layout(&self, area: Rect) -> Areas {
         // Header, rule, [tree], margin, hr, margin, title, [diff], footer.
         let avail = area.height.saturating_sub(CHROME_ROWS);
-        let want = self.rows.len() as u16;
+        let want = (self.rows.len() as u16).saturating_add(2);
         // The tree takes up to ~32% of the free rows (the rest goes to the diff).
         let auto = want.min((avail * 8 / 25).max(3));
-        let max_tree = avail.saturating_sub(3).max(1);
-        let tree_h = self.tree_pref.unwrap_or(auto).clamp(1, max_tree).min(avail);
+        let max_tree = avail.saturating_sub(5).max(3);
+        let tree_h = self.tree_pref.unwrap_or(auto).clamp(3, max_tree).min(avail);
         let tree = Rect::new(area.x, area.y + 2, area.width, tree_h);
         let splitter = tree.y + tree_h + 1;
         let title = Rect::new(area.x, splitter + 2, area.width, 1);
         let diff_h = area.height.saturating_sub(tree_h + CHROME_ROWS + self.footer_gap());
         let diff = Rect::new(area.x, title.y + 1, area.width, diff_h);
-        Areas { side: false, tree, splitter, title, diff }
+        Areas { side: false, tree, splitter, title, diff, tree_frame: Rect::default(), file_frame: Rect::default() }
     }
 
     /// Tree on the left, a vertical divider, diff on the right.
@@ -977,14 +1643,14 @@ impl App {
             .map(|r| {
                 let (label, adds, dels) = match &r.item {
                     Item::Dir { label, adds, dels, .. } => (label.width() + 3, *adds, *dels),
-                    Item::File { idx, name } => (name.width() + 2, files[*idx].adds, files[*idx].dels),
+                    Item::File { idx, name } => (name.width() + 4, files[*idx].adds, files[*idx].dels),
                 };
                 let counts: usize = counts_text(adds, dels).iter().map(|(s, _)| s.width()).sum();
                 (1 + r.guide.width() + label + 3 + counts + 1) as u16
             })
             .max()
             .unwrap_or(0);
-        let auto = needed.clamp(28, (area.width * 35 / 100).max(28));
+        let auto = needed.clamp(28, (area.width * 35 / 100).max(28)).saturating_add(2);
         let tree_w = self.tree_pref_w.unwrap_or(auto).clamp(20, area.width / 2);
         let tree = Rect::new(area.x, body_y, tree_w, body_h);
         let splitter = area.x + tree_w + 1;
@@ -992,7 +1658,7 @@ impl App {
         let dw = (area.x + area.width).saturating_sub(dx);
         let title = Rect::new(dx, body_y, dw, 1);
         let diff = Rect::new(dx, body_y + 1, dw, body_h.saturating_sub(1));
-        Areas { side: true, tree, splitter, title, diff }
+        Areas { side: true, tree, splitter, title, diff, tree_frame: Rect::default(), file_frame: Rect::default() }
     }
 
     fn draw(&mut self, f: &mut Frame) {
@@ -1028,9 +1694,9 @@ impl App {
             View::Changes => {}
         }
 
-        if files.is_empty() {
+        if files.is_empty() && self.active.is_none() {
             let rest = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
-            center(buf, rest, "No changes ✓  working tree clean", p.faint);
+            center(buf, rest, if self.comparison.is_some() { "No changes in this comparison" } else { "No changes ✓  working tree clean" }, p.faint);
             // Still show the footer: the result of a commit that took everything lands here.
             self.draw_footer(buf, area);
             return;
@@ -1039,9 +1705,24 @@ impl App {
         self.draw_tree(buf);
         self.draw_splitter(buf, area);
         self.draw_diff(buf);
+        self.draw_pane_borders(buf);
         let cursor = self.draw_footer(buf, area);
         if let Some(pos) = cursor {
             f.set_cursor_position(pos);
+        }
+    }
+
+    fn draw_pane_borders(&self, buf: &mut Buffer) {
+        use ratatui::widgets::{Block, BorderType, Widget};
+        for (area, focused, title) in [
+            (self.areas.tree_frame, !self.file_focus, " Files "),
+            (self.areas.file_frame, self.file_focus, " File "),
+        ] {
+            if area.is_empty() { continue; }
+            Block::bordered().title(title)
+                .border_type(if focused { BorderType::Thick } else { BorderType::Plain })
+                .border_style(Style::new().fg(if focused { self.pal.blue } else { self.pal.rule }))
+                .render(area, buf);
         }
     }
 
@@ -1063,7 +1744,7 @@ impl App {
         };
         let mut x = area.x + 1;
         let changes_x = x;
-        put(buf, &mut x, y, lim, "Changes", tab(self.view == View::Changes));
+        put(buf, &mut x, y, lim, if self.comparison.is_some() { "Review" } else if self.all_files { "All files" } else { "Changes" }, tab(self.view == View::Changes));
         x += 1;
         let n = s.files.len();
         let pill = format!(" {n} {} ", if n == 1 { "file" } else { "files" });
@@ -1074,7 +1755,7 @@ impl App {
         put(buf, &mut x, y, lim, "Branches", tab(matches!(self.view, View::Branches | View::History)));
         let branches_end = x;
         put(buf, &mut x, y, lim, &format!("   ⎇ {}", s.branch), Style::new().fg(p.muted));
-        if self.view == View::Changes && n > 0 {
+        if self.view == View::Changes && self.comparison.is_none() && n > 0 {
             let done = s.files.iter().filter(|f| f.staged == Staged::Fully).count();
             let st = Style::new().fg(if done == n { p.green } else { p.muted });
             put(buf, &mut x, y, lim, &format!("   ✓ {done}/{n} staged"), st);
@@ -1317,7 +1998,7 @@ impl App {
                         Staged::Partly => ("◐", p.yellow),
                         Staged::No => ("○", p.faint),
                     };
-                    put(buf, &mut x, y, lim, mark, base.fg(mark_fg).add_modifier(Modifier::BOLD));
+                    put(buf, &mut x, y, lim, if self.comparison.is_some() { " " } else { mark }, base.fg(mark_fg).add_modifier(Modifier::BOLD));
                     x += 1;
                     put(buf, &mut x, y, lim, &f.status.to_string(), base.fg(sc).add_modifier(Modifier::BOLD));
                     x += 1;
@@ -1342,6 +2023,7 @@ impl App {
 
     fn draw_splitter(&self, buf: &mut Buffer, area: Rect) {
         let p = &self.pal;
+        if self.areas.title.height == 0 { return; }
         let color = if self.dragging { p.blue } else { p.rule };
         if self.areas.side {
             // A vertical line between the tree and the diff.
@@ -1357,6 +2039,9 @@ impl App {
         // File title: path on the left, position in the diff on the right.
         let t = self.areas.title;
         let y = t.y;
+        if self.file_focus {
+            buf.set_style(t, Style::new().bg(p.sel_bg));
+        }
         let right = t.x + t.width - 1;
         let mut lim = right;
         // Only once the active file's diff is wrapped (a new one may still be loading).
@@ -1385,6 +2070,8 @@ impl App {
                 None => (String::new(), path.as_str()),
             };
             let mut x = t.x + 1;
+            let count = self.notes.iter().filter(|n| &n.path == path && n.line.is_none()).count();
+            if count > 0 { put(buf, &mut x, y, lim, &format!("●{count} "), Style::new().fg(p.blue)); }
             put(buf, &mut x, y, lim, &dir, Style::new().fg(p.muted));
             put(buf, &mut x, y, lim, name, Style::new().add_modifier(Modifier::BOLD));
         }
@@ -1393,6 +2080,7 @@ impl App {
     fn draw_diff(&self, buf: &mut Buffer) {
         let p = &self.pal;
         let a = self.areas.diff;
+        if a.is_empty() { return; }
         let Some(d) = self.diff.as_ref().filter(|d| Some(&d.path) == self.active.as_ref()) else {
             center(buf, a, "Loading…", p.faint);
             return;
@@ -1410,6 +2098,9 @@ impl App {
             let (r, sub) = self.wrap.locate(v);
             let row = &d.rows[r];
             let y = a.y + line as u16;
+            if self.notes.iter().any(|n| n.path == d.path && n.revision == self.document_revision && n.locations.contains(&(row.old,row.new)) && (row.old.is_some() || row.new.is_some())) {
+                buf.set_string(a.x, y, "●", Style::new().fg(p.blue));
+            }
             let (row_bg, gutter_bg, emph_bg, sign, sign_fg) = match row.kind {
                 RowKind::Add => (Some(p.add_bg), Some(p.add_gutter), Some(p.add_emph), "+", p.green),
                 RowKind::Del => (Some(p.del_bg), Some(p.del_gutter), Some(p.del_emph), "−", p.red),
@@ -1478,6 +2169,33 @@ impl App {
                     }
                 }
             }
+            if self.file_focus || !self.search_hits.is_empty() {
+                if self.file_focus && r == self.file_cursor.row {
+                    buf.set_string(a.x, y, "▸", Style::new().fg(p.blue));
+                }
+                let w = wrap_row(row, g.text_w as usize);
+                let from = w.starts[sub];
+                let to = w.starts.get(sub + 1).copied().unwrap_or(usize::MAX);
+                let mut x = text_x + if sub > 0 { w.indent as u16 } else { 0 };
+                for (col, c) in annotations::text(row).chars().enumerate().skip(from).take(to.saturating_sub(from)) {
+                    let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16;
+                    let pos = Position { row: r, col };
+                    let selected = self.selection.as_ref().is_some_and(|s| s.contains(self.file_cursor, pos));
+                    let matched = self.search_hits.iter().any(|(p,len)| p.row == r && (p.col..p.col+len).contains(&col));
+                    if selected || matched || (self.file_focus && pos == self.file_cursor) {
+                        let style = if selected {
+                            Style::new().fg(p.selection_fg).bg(p.blue).add_modifier(Modifier::BOLD)
+                        } else if matched { Style::new().fg(p.search_fg).bg(p.yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED) } else {
+                            Style::new().add_modifier(Modifier::REVERSED)
+                        };
+                        buf.set_style(Rect::new(x, y, width.min(right.saturating_sub(x)), 1), style);
+                    }
+                    x += width;
+                    if x >= right {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -1488,9 +2206,115 @@ impl App {
         let y = area.y + area.height - 1;
         let mut x = area.x + 1;
         let right = area.x + area.width;
+        if let Some(picker) = &self.picker {
+            use ratatui::widgets::{Block, Clear, Widget, Paragraph};
+            let popup = Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(3));
+            Clear.render(popup, buf);
+            let items = picker.matches();
+            let text: Vec<ratatui::text::Line> = items.iter().enumerate().skip(picker.cursor.saturating_sub(2)).take(popup.height.saturating_sub(2) as usize)
+                .map(|(i,p)| { let mut line = picker.highlighted(p); line.spans.insert(0, ratatui::text::Span::raw(if i == picker.cursor { "▸ " } else { "  " })); line }).collect();
+            Paragraph::new(text).block(Block::bordered().title(format!(" Open file · {}{} ", picker.query, if picker.scanning { " · scanning…" } else { "" }))).render(popup, buf);
+            return None;
+        }
+        if let Some(command) = &self.command {
+            put(buf, &mut x, y, right, command, Style::new().fg(p.fg));
+            return Some((x.min(right.saturating_sub(1)), y));
+        }
 
+        if let Some((_, msg)) = &self.note_box {
+            use ratatui::widgets::{Block, Clear, Widget};
+            let height = area.height.min(8);
+            let popup = Rect::new(area.x, area.bottom().saturating_sub(height), area.width, height);
+            Clear.render(popup, buf);
+            let block = Block::bordered().title(" Note · Enter save · Shift+Enter newline · Esc cancel ");
+            let inner = block.inner(popup);
+            block.render(popup, buf);
+            if inner.is_empty() { return None; }
+            let row = msg[..self.note_cursor].bytes().filter(|b| *b == b'\n').count();
+            let start = msg[..self.note_cursor].rfind('\n').map_or(0, |i| i + 1);
+            let mut offset = start;
+            while msg[offset..self.note_cursor].width() >= inner.width as usize {
+                offset += msg[offset..].chars().next().unwrap().len_utf8();
+            }
+            let skip = msg[start..offset].chars().count();
+            let first = row.saturating_sub(inner.height as usize - 1);
+            for (i, line) in msg.split('\n').enumerate().skip(first).take(inner.height as usize) {
+                let shown: String = line.chars().skip(skip).collect();
+                let mut x = inner.x;
+                put(buf, &mut x, inner.y + (i - first) as u16, inner.right(), &shown, Style::new().fg(p.fg));
+            }
+            return Some((inner.x + msg[offset..self.note_cursor].width() as u16, inner.y + (row - first) as u16));
+        }
+        if let Some(i) = self.note_list {
+            use ratatui::widgets::{Block, Clear, Widget, Paragraph};
+            let height = (area.height / 2).clamp(3,12);
+            let popup = Rect::new(area.x, y.saturating_sub(height), area.width, height);
+            Clear.render(popup, buf);
+            let text = if self.notes.is_empty() { "No pending annotations".into() } else {
+                let mut text = self.notes.iter().enumerate().skip(i.saturating_sub(2)).take(popup.height.saturating_sub(6).max(1) as usize)
+                    .map(|(n,s)| format!("{} {}{}:{} · {}", if n == i { "▸" } else { " " }, if !s.historical && annotations::revision(&self.root, &s.path) != s.revision { "[stale] " } else { "" }, s.path, s.line.map(|n|n.to_string()).unwrap_or_else(|| "file".into()), s.comment)).collect::<Vec<_>>().join("\n");
+                if let Some(note) = self.notes.get(i) {
+                    text.push_str("\n\nCaptured selection:\n");
+                    if note.line.is_none() { text.push_str("Whole file"); }
+                }
+                text
+            };
+            let mut text = ratatui::text::Text::from(text);
+            if let Some(note) = self.notes.get(i) {
+                for row in &note.preview {
+                    let (prefix, bg) = match row.kind {
+                        RowKind::Add => ("+", p.add_bg),
+                        RowKind::Del => ("-", p.del_bg),
+                        _ => (" ", Color::Reset),
+                    };
+                    let mut spans = vec![ratatui::text::Span::raw(format!("{prefix} {} | ", row.new.or(row.old).unwrap_or(0)))];
+                    spans.extend(row.segs.iter().map(|seg| {
+                        let mut style = Style::new().fg(seg.fg.map_or(p.fg, Color::Indexed));
+                        if seg.bold || seg.emph { style = style.add_modifier(Modifier::BOLD); }
+                        ratatui::text::Span::styled(seg.text.clone(), style)
+                    }));
+                    text.lines.push(ratatui::text::Line::from(spans).style(Style::new().bg(bg)));
+                }
+            }
+            Paragraph::new(text).block(Block::bordered().title(" Annotations · Enter edit · d delete · Esc close ")).render(popup, buf);
+            return None;
+        }
+        if let Some((agents, cursor)) = &self.agent_picker {
+            use ratatui::widgets::{Block, Clear, Widget};
+            let height = (agents.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3);
+            let width = area.width.min(80);
+            let popup = Rect::new(area.x + (area.width - width) / 2, y.saturating_sub(height), width, height);
+            Clear.render(popup, buf);
+            Block::bordered().title(" Send annotations to agent ").render(popup, buf);
+            let visible = height.saturating_sub(2) as usize;
+            let offset = cursor.saturating_sub(visible.saturating_sub(1));
+            for (i, agent) in agents.iter().enumerate().skip(offset).take(visible) {
+                let mut x = popup.x + 1;
+                put(
+                    buf,
+                    &mut x,
+                    popup.y + 1 + (i - offset) as u16,
+                    popup.right() - 1,
+                    &format!("{} {}", if i == *cursor { "▸" } else { " " }, agent.label),
+                    if i == *cursor { Style::new().bg(p.sel_bg) } else { Style::new() },
+                );
+            }
+            put(buf, &mut x, y, right, "↑↓ choose agent · Enter paste · Esc cancel", Style::new().fg(p.blue));
+            return None;
+        }
+        if self.annotation_rx.is_some() {
+            put(
+                buf,
+                &mut x,
+                y,
+                right,
+                "Contacting Rex… annotations kept until delivery succeeds",
+                Style::new().fg(p.blue),
+            );
+            return None;
+        }
         if let Some(msg) = &self.commit_box {
-            return Some(self.draw_commit_box(buf, area, y, msg));
+            return Some(self.draw_input_box(buf, area, y, msg, "Commit", "commit"));
         }
         if let Some(c) = &self.confirm {
             let red = Style::new().fg(p.red);
@@ -1515,8 +2339,33 @@ impl App {
             put(buf, &mut x, y, right, &f.text, Style::new().fg(if f.ok { p.green } else { p.red }));
             return None;
         }
+        if !self.notes.is_empty() {
+            put(buf, &mut x, y, right, &format!("{} notes · ", self.notes.len()), Style::new().fg(p.blue));
+        }
         let hints: &[(&str, &str)] = match self.view {
+            View::Changes if self.comparison.as_ref().is_some_and(|c| !c.is_commit) => &[
+                ("Esc", "working tree"), ("W", "working tree"), ("B", "base"),
+                ("Tab", "focus"), ("x", "whole file"), ("a", "annotate"), ("L", "notes"), ("s", "send"),
+            ],
+            View::Changes if self.comparison.is_some() => &[
+                ("W", "working tree"), ("Esc", "commits"), ("D", "branch diff"), ("B", "base"),
+                ("Tab", "focus"), ("x", "whole file"), ("a", "annotate"), ("L", "notes"), ("s", "send"),
+            ],
+            View::Changes if self.file_focus => &[
+                ("H", "commits"), ("D", "branch diff"), ("Ctrl+p", "open"), ("L", "notes"), ("/", "search"),
+                ("Tab", "tree"),
+                ("↑↓←→", "move"),
+                ("v/V", "select/lines"),
+                ("a", "annotate"),
+                ("s", "send notes"),
+                ("Esc", "clear"),
+                ("q", "quit"),
+            ],
             View::Changes => &[
+                ("H", "commits"), ("D", "branch diff"), ("t", "all/changed"), ("Ctrl+p", "open"), ("L", "notes"),
+                ("Tab", "file"),
+                ("a", "annotate file"),
+                ("s", "send notes"),
                 ("↑↓", "navigate"),
                 ("←→", "folders"),
                 ("space", "stage/fold"),
@@ -1526,7 +2375,7 @@ impl App {
                 ("2", "branches"),
                 ("q", "quit"),
             ],
-            View::History => &[("↑↓", "move"), ("esc", "back"), ("1", "changes"), ("q", "quit")],
+            View::History => &[("↑↓", "move"), ("Enter", "diff"), ("D", "branch diff"), ("B", "base"), ("W", "working tree"), ("esc", "back"), ("q", "quit")],
             View::Branches => &[
                 ("↑↓", "move"),
                 ("space", "checkout"),
@@ -1547,16 +2396,14 @@ impl App {
         None
     }
 
-    fn draw_commit_box(&self, buf: &mut Buffer, area: Rect, y: u16, msg: &str) -> (u16, u16) {
+    fn draw_input_box(&self, buf: &mut Buffer, area: Rect, y: u16, msg: &str, label: &str, action: &str) -> (u16, u16) {
         let p = &self.pal;
         let right = area.x + area.width - 1;
 
         // Hints on the right, shortened when the pane is narrow.
-        let hints: &[(&str, &str)] = &[("⏎", "commit"), ("esc", "cancel")];
-        let hints_w: u16 = hints
-            .iter()
-            .map(|(k, w)| (k.width() + if w.is_empty() { 0 } else { w.width() + 1 } + 2) as u16)
-            .sum();
+        let hints: &[(&str, &str)] = &[("⏎", action), ("esc", "cancel")];
+        let hints_w: u16 =
+            hints.iter().map(|(k, w)| (k.width() + if w.is_empty() { 0 } else { w.width() + 1 } + 2) as u16).sum();
         let mut x = right.saturating_sub(hints_w);
         let field_end = x.saturating_sub(1);
         for (key, what) in hints {
@@ -1568,7 +2415,7 @@ impl App {
         }
 
         let mut x = area.x + 1;
-        put(buf, &mut x, y, field_end, "Commit ", Style::new().add_modifier(Modifier::BOLD));
+        put(buf, &mut x, y, field_end, &format!("{label} "), Style::new().add_modifier(Modifier::BOLD));
         let field_start = x;
         let field_w = field_end.saturating_sub(field_start);
         buf.set_style(Rect::new(field_start, y, field_w, 1), Style::new().bg(p.pill_bg));
@@ -1576,7 +2423,7 @@ impl App {
         let inner = field_w.saturating_sub(2) as usize;
         let mut tx = field_start + 1;
         if msg.is_empty() {
-            put(buf, &mut tx, y, field_end, "Commit message", Style::new().fg(p.faint).bg(p.pill_bg));
+            put(buf, &mut tx, y, field_end, &format!("{label} message"), Style::new().fg(p.faint).bg(p.pill_bg));
             return (field_start + 1, y);
         }
         // Show the end of the message when it doesn't fit.
@@ -1658,6 +2505,13 @@ fn delete_word(s: &mut String) {
     }
 }
 
+fn same_rows(a: &FileDiff, b: &FileDiff) -> bool {
+    a.rows.len() == b.rows.len()
+        && a.rows.iter().zip(&b.rows).all(|(a, b)| {
+            a.kind == b.kind && a.old == b.old && a.new == b.new && annotations::text(a) == annotations::text(b)
+        })
+}
+
 /// Diff columns: line number, sign, and text.
 struct Geom {
     num_w: u16,
@@ -1719,5 +2573,298 @@ fn split_hunk(h: &str) -> (&str, &str) {
     match h.get(2..).and_then(|r| r.find("@@")) {
         Some(i) => h.split_at(i + 4),
         None => (h, ""),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::{DRow, Seg};
+
+    #[test]
+    fn search_and_selection_override_diff_and_syntax_colors() {
+        for bg in [(24,24,27), (255,255,255)] {
+            for kind in [RowKind::Add, RowKind::Del, RowKind::Ctx] {
+                let (jobs, _) = mpsc::channel();
+                let mut app = App::new(jobs, PathBuf::from("/tmp/rexdiff-test"), Some(theme::Detected { bg: Some(bg), ..Default::default() }));
+                app.sidebar = false;
+                app.file_focus = true;
+                app.active = Some("test.rs".into());
+                app.diff = Some(FileDiff {
+                    revision: 0, path: "test.rs".into(), context: 3, max_lineno: 1,
+                    rows: vec![DRow { kind, old: Some(1), new: Some(1), segs: vec![Seg { text: "ratatui x".into(), fg: Some(5), bold: false, emph: true }] }],
+                });
+                app.file_cursor = Position { row: 0, col: 6 };
+                app.search_hits = vec![(Position::default(), 7)];
+                let area = Rect::new(0,0,80,24);
+                app.layout(area);
+                let x = app.areas.diff.x + Geom::new(app.diff.as_ref().unwrap(), app.areas.diff).text_off;
+                let y = app.areas.diff.y;
+                for selected in [false, true] {
+                    app.selection = selected.then_some(Selection { anchor: Position::default(), lines: false });
+                    let mut buf = Buffer::empty(area);
+                    app.draw_diff(&mut buf);
+                    for col in 0..7 {
+                        let cell = &buf[(x + col, y)];
+                        assert_eq!(cell.bg, if selected { app.pal.blue } else { app.pal.yellow });
+                        assert_eq!(cell.fg, if selected { app.pal.selection_fg } else { app.pal.search_fg });
+                        assert!(cell.modifier.contains(Modifier::BOLD));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn focus_select_annotate_and_cancel_picker() {
+        let (jobs, _) = mpsc::channel();
+        let mut app = App::new(jobs, PathBuf::from("/tmp/rexdiff-test"), None);
+        app.active = Some("test.rs".into());
+        app.diff = Some(FileDiff {
+            revision: 0,
+            path: "test.rs".into(),
+            context: 3,
+            max_lineno: 3,
+            rows: (1..=3)
+                .map(|n| DRow {
+                    kind: RowKind::Add,
+                    old: None,
+                    new: Some(n),
+                    segs: vec![Seg { text: format!("line {n}"), fg: None, bold: false, emph: false }],
+                })
+                .collect(),
+        });
+        app.diff_gen = 1;
+        app.layout(Rect::new(0, 0, 80, 24));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_key(key(KeyCode::Tab));
+        assert!(app.file_focus);
+        app.on_key(key(KeyCode::Char('V')));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.file_cursor.row, 1);
+        assert_eq!(app.cursor, 0);
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.quit);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.notes.len(), 1);
+        assert!(app.notes[0].format().contains("new:1 | line 1\n  new:2 | line 2"));
+        assert!(app.notes[0].format().ends_with("Comment: q"));
+        app.on_key(key(KeyCode::Tab));
+        assert!(!app.file_focus);
+        app.open_note();
+        assert!(app.note_box.as_ref().unwrap().0.ends_with("(whole file)"));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.notes.len(), 1);
+        app.agent_picker = Some((
+            vec![Agent { id: "one".into(), label: "one".into() }, Agent { id: "two".into(), label: "two".into() }],
+            0,
+        ));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.agent_picker.as_ref().unwrap().1, 1);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 24));
+        app.draw_footer(&mut buf, Rect::new(0, 0, 80, 24));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.agent_picker.is_none());
+        assert_eq!(app.notes.len(), 1);
+        app.on_key(key(KeyCode::Char('L')));
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Char('z')));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.notes[0].comment, "z");
+        app.on_key(key(KeyCode::Char('d')));
+        assert!(app.notes.is_empty());
+        assert!(app.note_list.is_none());
+    }
+
+    #[test]
+    fn annotation_cursor_and_multiline_editing() {
+        let (jobs, _) = mpsc::channel();
+        let mut app = App::new(jobs, PathBuf::from("/tmp/rexdiff-test"), None);
+        app.note_box = Some((String::new(), String::new()));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for c in "aé中z".chars() { app.on_note_key(key(KeyCode::Char(c))); }
+        app.on_note_key(key(KeyCode::Left));
+        app.on_note_key(key(KeyCode::Backspace));
+        app.on_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.note_box.as_ref().unwrap().1, "aé\nz");
+        assert!(app.notes.is_empty());
+        app.on_note_key(key(KeyCode::Up));
+        assert_eq!(app.note_cursor, 0);
+        app.on_note_key(key(KeyCode::Right));
+        app.on_note_key(key(KeyCode::Right));
+        assert_eq!(app.note_cursor, "aé".len());
+        app.on_note_key(key(KeyCode::Down));
+        assert_eq!(app.note_cursor, "aé\nz".len());
+        app.on_note_key(key(KeyCode::Home));
+        app.on_note_key(key(KeyCode::Delete));
+        app.on_note_key(key(KeyCode::Char('中')));
+        assert_eq!(app.note_box.as_ref().unwrap().1, "aé\n中");
+        app.on_note_key(key(KeyCode::Up));
+        app.on_note_key(key(KeyCode::End));
+        assert_eq!(app.note_cursor, "aé".len());
+        for width in [3, 10, 80] {
+            let area = Rect::new(0, 0, width, 10);
+            let mut buf = Buffer::empty(area);
+            let (x, y) = app.draw_footer(&mut buf, area).unwrap();
+            assert!(x < width && y < area.height);
+        }
+        app.on_note_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.note_box.as_ref().unwrap().1, "\n中");
+        assert_eq!(app.note_cursor, 0);
+    }
+
+    #[test]
+    fn review_footer_and_escape_match_the_comparison_kind() {
+        for is_commit in [false, true] {
+            let (jobs, rx) = mpsc::channel();
+            let mut app = App::new(jobs, std::env::current_dir().unwrap(), None);
+            app.comparison = Some(git::Comparison {
+                is_commit, base: None, tip: git2::Oid::from_bytes(&[1;20]).unwrap(), label: "fixture".into(),
+            });
+            let area = Rect::new(0, 0, 180, 24);
+            let mut buffer = Buffer::empty(area);
+            app.draw_footer(&mut buffer, area);
+            let footer: String = (0..area.width).map(|x| buffer[(x, area.bottom()-1)].symbol()).collect();
+            assert_eq!(footer.contains("D branch diff"), is_commit);
+            assert!(footer.contains(if is_commit { "Esc commits" } else { "Esc working tree" }));
+            app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            if is_commit {
+                assert!(app.view == View::History && app.comparison.is_some());
+                assert!(matches!(rx.recv().unwrap(), Job::History { .. }));
+            } else {
+                assert!(app.view == View::Changes && app.comparison.is_none());
+                assert!(matches!(rx.recv().unwrap(), Job::Refresh));
+            }
+        }
+    }
+
+    #[test]
+    fn review_navigation_rejects_stale_results_and_worktree_writes() {
+        let (jobs, rx) = mpsc::channel();
+        let mut app = App::new(jobs, PathBuf::from("/tmp/rexdiff-test"), None);
+        let comparison = git::Comparison { is_commit: true, base: None, tip: git2::Oid::from_bytes(&[1;20]).unwrap(), label: "commit fixture".into() };
+        app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
+        assert!(matches!(rx.recv().unwrap(), Job::History { branch } if branch == "HEAD"));
+        app.history = Some(Ok(vec![CommitInfo { oid: comparison.tip.to_string(), short: "0101010".into(), subject: "fixture".into(), author: "test".into(), time: 0, unpushed: false, merge: false, refs: vec![] }]));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Job::Review { request, commit, .. } = rx.recv().unwrap() else { panic!() };
+        assert_eq!(commit, Some(comparison.tip.to_string()));
+        let snap = || Snapshot { branch: "commit fixture".into(), files: vec![git::FileEntry { path: "deleted.rs".into(), status: 'D', adds: 0, dels: 1, binary: false, staged: Staged::No }] };
+        app.on_msg(Msg::Review { request, result: Ok((comparison.clone(), snap())) });
+        assert!(matches!(rx.recv().unwrap(), Job::ReviewDiff { path, .. } if path == "deleted.rs"));
+        app.on_msg(Msg::Snapshot(Ok(Snapshot { branch: "wrong".into(), files: vec![] })));
+        assert_eq!(app.files().len(), 1);
+        app.toggle_stage(0);
+        app.ask_discard();
+        app.open_commit_box();
+        assert!(rx.try_recv().is_err());
+        assert!(app.confirm.is_none() && app.commit_box.is_none());
+        let rows = vec![DRow { kind: RowKind::Del, old: Some(1), new: None, segs: vec![Seg { text: "original".into(), fg: None, bold: false, emph: false }] }];
+        app.on_msg(Msg::Diff(FileDiff { revision: comparison.revision(), path: "deleted.rs".into(), context: 3, max_lineno: 1, rows }));
+        app.open_note();
+        assert!(app.note_box.as_ref().unwrap().0.contains(&comparison.tip.to_string()));
+        app.on_note_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::NONE));
+        assert!(matches!(rx.recv().unwrap(), Job::Refresh));
+        app.on_msg(Msg::Review { request, result: Ok((comparison, snap())) });
+        assert!(app.comparison.is_none() && app.snapshot.is_none());
+    }
+
+    #[test]
+    fn tree_wheel_scroll_survives_redraw_and_resize_uses_outer_bounds() {
+        let (jobs, _) = mpsc::channel();
+        let mut app = App::new(jobs, std::env::current_dir().unwrap(), None);
+        app.all_files = true;
+        app.catalog = (0..100).map(|i| git::FileEntry {
+            path: format!("file_{i:03}.rs"), status: ' ', adds: 0, dels: 0,
+            binary: false, staged: Staged::No,
+        }).collect();
+        app.rebuild(None);
+        for width in [80, 180] {
+            let area = Rect::new(0, 0, width, 30);
+            app.cursor = 0;
+            app.tree_off = 0;
+            app.tree_scrolling = false;
+            app.layout(area);
+            let wheel = |kind, frame: Rect| MouseEvent { kind, column: frame.x, row: frame.y + 1, modifiers: KeyModifiers::NONE };
+            for _ in 0..20 {
+                app.on_mouse(wheel(MouseEventKind::ScrollDown, app.areas.tree_frame));
+                app.layout(area);
+            }
+            assert_eq!(app.tree_off, 20);
+            assert_eq!(app.cursor, 0);
+            app.rebuild(None);
+            app.layout(area);
+            assert_eq!(app.tree_off, 20);
+            app.on_mouse(wheel(MouseEventKind::ScrollUp, app.areas.tree_frame));
+            app.layout(area);
+            assert_eq!(app.tree_off, 19);
+            for _ in 0..150 { app.on_mouse(wheel(MouseEventKind::ScrollDown, app.areas.tree_frame)); }
+            app.layout(area);
+            assert_eq!(app.tree_off, app.rows.len() - app.areas.tree.height as usize);
+            app.move_row(1);
+            app.layout(area);
+            assert_eq!(app.tree_off, 1);
+            let before = app.areas.tree_frame;
+            app.on_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+            app.layout(area);
+            if width >= SIDE_MIN_WIDTH {
+                assert!(app.areas.tree.width >= 28);
+                assert_eq!(app.areas.tree_frame.width, before.width + 2);
+            } else {
+                assert_eq!(app.areas.tree_frame.height, before.height + 1);
+            }
+            app.on_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+            app.layout(area);
+            assert_eq!(app.areas.tree_frame, before);
+        }
+    }
+
+    #[test]
+    fn layouts_and_read_only_catalog() {
+        let (jobs, rx) = mpsc::channel();
+        let mut app = App::new(jobs, std::env::current_dir().unwrap(), None);
+        app.catalog.push(git::FileEntry {path:"Cargo.toml".into(),status:' ',adds:0,dels:0,binary:false,staged:Staged::No});
+        app.all_files = true;
+        app.rebuild(None);
+        app.toggle_stage(0);
+        app.ask_discard();
+        assert!(app.confirm.is_none());
+        assert!(rx.try_recv().is_err());
+        app.layout(Rect::new(0,0,160,24));
+        assert!(app.areas.side);
+        assert!(app.areas.tree.x < app.areas.diff.x);
+        app.file_focus = false;
+        app.layout(Rect::new(0,0,40,20));
+        assert_eq!(app.areas.tree_frame.width,40);
+        assert_eq!(app.areas.tree.width,38);
+        assert!(app.areas.diff.height > 0);
+        assert!(app.areas.tree.y < app.areas.diff.y);
+        assert!(!app.areas.side);
+        app.file_focus = true;
+        app.layout(Rect::new(0,0,40,20));
+        assert!(app.areas.tree.height > 0);
+        assert!(app.areas.diff.height > 0);
+        app.layout(Rect::new(0,0,80,24));
+        let tree = app.areas.tree_frame;
+        let file = app.areas.file_frame;
+        for file_focus in [false, true] {
+            app.file_focus = file_focus;
+            let mut buffer = Buffer::empty(Rect::new(0,0,80,24));
+            app.draw_pane_borders(&mut buffer);
+            assert_eq!(buffer[(tree.x, tree.y)].fg, if file_focus { app.pal.rule } else { app.pal.blue });
+            assert_eq!(buffer[(file.x, file.y)].fg, if file_focus { app.pal.blue } else { app.pal.rule });
+            assert_eq!(buffer[(file.x, file.y)].symbol(), if file_focus { "┏" } else { "┌" });
+        }
+        for width in [10,20,40,48,80,160] {
+            app.layout(Rect::new(0,0,width,6));
+            let mut buffer = Buffer::empty(Rect::new(0,0,width,6));
+            app.draw_tree(&mut buffer);
+            app.draw_splitter(&mut buffer,Rect::new(0,0,width,6));
+            app.draw_diff(&mut buffer);
+            app.draw_pane_borders(&mut buffer);
+        }
     }
 }
