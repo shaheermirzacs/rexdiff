@@ -80,6 +80,7 @@ struct App {
     next_note: u64,
     pending_line: Option<u32>,
     pending_exact: bool,
+    pending_old_side: bool,
     document_revision: u64,
     cached: Vec<(u64, FileDiff)>,
     note_box: Option<(String, String)>,
@@ -191,7 +192,8 @@ impl App {
                     }).collect();
                 reader.notes(marked)?;
                 if self.note_preview_pending {
-                    reader.reveal(self.file_cursor,d)?;
+                    let old_side = self.note_list.and_then(|i| self.notes.get(i)).is_some_and(|n| n.old_side);
+                    reader.reveal(self.file_cursor,d,old_side)?;
                     self.note_preview_pending = false;
                 }
             }
@@ -226,9 +228,10 @@ impl App {
                             let Some(row) = selected["row"].as_u64().and_then(|i| diff.rows.get(i as usize)) else { continue };
                             if matches!(row.kind, RowKind::Hunk | RowKind::Meta) { continue; }
                             let text = selected["text"].as_str().unwrap_or("");
-                            let (side, number) = if row.kind == RowKind::Del { ("old",row.old) } else { ("new",row.new) };
+                            let old_side = row.kind == RowKind::Del || action["old_side"].as_bool() == Some(true);
+                            let (side, number) = if old_side { ("old",row.old) } else { ("new",row.new) };
                             draft.target.push_str(&format!("\n  {side}:{} | {text}",number.unwrap_or(0)));
-                            if draft.locations.is_empty() { draft.line = number; draft.old_side = row.kind == RowKind::Del; }
+                            if draft.locations.is_empty() { draft.line = number; draft.old_side = old_side; }
                             draft.locations.push((row.old,row.new));
                             if draft.preview.len() < 3 {
                                 let mut preview = row.clone();
@@ -250,11 +253,19 @@ impl App {
             }
             "open" => self.open_path(action["argument"].as_str().unwrap_or("")),
             "source" => {
-                if let Ok(line) = action["argument"].as_str().unwrap_or("").parse() { self.goto_line(line); }
+                if let Ok(line) = action["argument"].as_str().unwrap_or("").parse() { self.goto_line(line,action["old_side"].as_bool().unwrap_or(false)); }
             }
             "context" => self.toggle_context(),
+            "layout" => self.toggle_diff_layout(),
             "quit" => self.quit = true,
             _ => {}
+        }
+    }
+
+    fn toggle_diff_layout(&mut self) {
+        if let Some(reader) = &mut self.reader {
+            reader.split = !reader.split;
+            reader.generation = None;
         }
     }
 
@@ -289,6 +300,7 @@ impl App {
             next_note: 1,
             pending_line: None,
             pending_exact: true,
+            pending_old_side: false,
             document_revision: 0,
             cached: Vec::new(),
             note_box: None,
@@ -617,7 +629,7 @@ impl App {
                     self.diff_gen += 1;
                     if let Some(path) = &self.active { self.document_revision = self.revision(path); }
                     if let Some(line) = self.pending_line.take() {
-                        if self.pending_exact { self.goto_line(line); } else { self.nearest_line(line); }
+                        if self.pending_exact { self.goto_line(line,self.pending_old_side); } else { self.nearest_line(line); }
                     }
                     if self.note_list.is_some() { self.preview_note(); }
                 }
@@ -939,14 +951,16 @@ impl App {
         });
     }
 
-    fn goto_line(&mut self, line: u32) {
+    fn goto_line(&mut self, line: u32, old_side: bool) {
         if let Some(d) = &self.diff {
-            if let Some(row) = d.rows.iter().position(|r| r.new == Some(line)).or_else(|| d.rows.iter().position(|r| r.old == Some(line))) {
+            if let Some(row) = d.rows.iter().position(|r| if old_side { r.old == Some(line) } else { r.new == Some(line) })
+                .or_else(|| if self.reader.as_ref().is_some_and(|r| r.split) { None } else { d.rows.iter().position(|r| r.old == Some(line)) }) {
                 self.file_cursor = Position { row, col: 0 };
                 self.keep_file_cursor_visible();
             } else if !self.full_context {
                 self.pending_line = Some(line);
                 self.pending_exact = true;
+                self.pending_old_side = old_side;
                 self.full_context = true;
                 self.request_diff();
             } else { self.flash = Some(Flash::new(format!("Line {line} does not exist or exceeds the preview limit"), false)); }
@@ -1014,7 +1028,7 @@ impl App {
                     } else if let Some(path) = command.strip_prefix(":e ") {
                         self.open_path(path);
                     } else if let Ok(line) = command.trim_start_matches(':').parse::<u32>() {
-                        self.goto_line(line);
+                        self.goto_line(line,false);
                     }
                     return;
                 }
@@ -1161,6 +1175,7 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => { self.file_cursor = Position::default(); self.keep_file_cursor_visible(); }
             KeyCode::Char('G') | KeyCode::End => self.scroll_diff(isize::MAX / 2),
             KeyCode::Char('x') => self.toggle_context(),
+            KeyCode::Char('S') => self.toggle_diff_layout(),
             KeyCode::Char('+') | KeyCode::Char('=') if self.areas.side => {
                 self.tree_pref_w = Some(self.areas.tree_frame.width + 2);
             }
@@ -2041,7 +2056,8 @@ impl App {
         let right = t.x + t.width - 1;
         let mut lim = right;
         if let Some(d) = self.diff.as_ref().filter(|d| Some(&d.path) == self.active.as_ref()) {
-            let mut info = format!("Neovim · {} rows", d.rows.len());
+            let layout = if self.reader.as_ref().is_some_and(|r| r.split) { "split" } else { "stacked" };
+            let mut info = format!("{layout} · {} rows", d.rows.len());
             if self.full_context {
                 info = format!("whole file · {info}");
             }
@@ -2153,14 +2169,32 @@ impl App {
         }
 
         if let Some((_, msg)) = &self.note_box {
-            use ratatui::widgets::{Block, Clear, Widget};
-            let height = area.height.min(8);
-            let popup = Rect::new(area.x, area.bottom().saturating_sub(height), area.width, height);
+            use ratatui::widgets::{Block, BorderType, Clear, Padding, Widget};
+            let height = area.height.min((msg.lines().count() as u16 + 5).clamp(6,10));
+            let width = if area.width < 8 { area.width } else { area.width.saturating_sub(2).min(96) };
+            let popup = Rect::new(area.x+(area.width-width)/2, area.bottom().saturating_sub(height), width, height);
             Clear.render(popup, buf);
-            let block = Block::bordered().title(" Note · Enter save · Shift+Enter newline · Esc cancel ");
-            let inner = block.inner(popup);
+            let block = Block::bordered().border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(p.annotation)).style(Style::new().bg(p.sel_bg))
+                .padding(Padding::horizontal(if width < 8 {0} else {1}))
+                .title(if self.editing_note.is_some() {" Edit annotation "} else {" New annotation "})
+                .title_bottom(" Enter save · Shift+Enter newline · Esc cancel ");
+            let mut inner = block.inner(popup);
             block.render(popup, buf);
             if inner.is_empty() { return None; }
+            let note = self.editing_note.and_then(|i|self.notes.get(i)).or(self.draft_note.as_ref());
+            if let Some(note) = note {
+                let mut x = inner.x;
+                put(buf,&mut x,inner.y,inner.right(),&format!("{} · {}",note.path,note.range_label()),Style::new().fg(p.muted));
+            }
+            let heading = if inner.height >= 4 {2} else {0};
+            inner.y += heading;
+            inner.height -= heading;
+            if inner.is_empty() { return None; }
+            if msg.is_empty() {
+                let mut x = inner.x;
+                put(buf,&mut x,inner.y,inner.right(),"Write a review note…",Style::new().fg(p.faint));
+            }
             let row = msg[..self.note_cursor].bytes().filter(|b| *b == b'\n').count();
             let start = msg[..self.note_cursor].rfind('\n').map_or(0, |i| i + 1);
             let mut offset = start;
@@ -2246,7 +2280,7 @@ impl App {
         let hints: &[(&str, &str)] = match self.view {
             View::Changes if self.file_focus => &[
                 ("Space+a", "annotate"), ("Space+s", "send"), ("Space+l", "notes"),
-                ("Space+x", "whole file"), ("Space+p", "open"), ("/", "search"),
+                ("Space+d", "stacked/split"), ("Space+x", "whole file"), ("Space+p", "open"), ("/", "search"),
                 ("Tab", "tree"), (":q", "quit"),
             ],
             View::Changes if self.comparison.as_ref().is_some_and(|c| !c.is_commit) => &[
@@ -2514,6 +2548,26 @@ mod tests {
     }
 
     #[test]
+    fn source_jump_preserves_old_side_when_expanding_context() {
+        let (jobs,rx)=mpsc::channel();
+        let mut app=App::new(jobs,PathBuf::from("/tmp/rexdiff-test"),None);
+        let revision=app.revision("x.rs");
+        app.active=Some("x.rs".into());
+        app.diff=Some(FileDiff {revision,path:"x.rs".into(),context:CONTEXT,max_lineno:176,rows:Vec::new()});
+        app.goto_line(21,true);
+        assert!(app.full_context);
+        assert_eq!(app.pending_line,Some(21));
+        assert!(matches!(rx.try_recv(),Ok(Job::Diff {context:FULL_CONTEXT,..})));
+        let row=|old,new| DRow {kind:RowKind::Ctx,old:Some(old),new:Some(new),
+            segs:vec![Seg{text:"context".into(),fg:None,bold:false,emph:false}]};
+        app.on_msg(Msg::Diff(FileDiff {revision,path:"x.rs".into(),context:FULL_CONTEXT,max_lineno:176,
+            rows:vec![row(18,21),row(21,24)]}));
+        assert_eq!(app.file_cursor.row,1);
+        app.goto_line(21,false);
+        assert_eq!(app.file_cursor.row,0);
+    }
+
+    #[test]
     fn native_selection_keeps_deleted_unicode_and_snapshot_coordinates() {
         let (jobs, _) = mpsc::channel();
         let mut app = App::new(jobs, PathBuf::from("/tmp/rexdiff-test"), None);
@@ -2532,6 +2586,15 @@ mod tests {
         assert!(note.old_side);
         assert_eq!(note.revision,42);
         assert_eq!(annotations::text(&note.preview[0]),"é中");
+        let row = &mut app.diff.as_mut().unwrap().rows[0];
+        row.kind = RowKind::Ctx;
+        row.new = Some(12);
+        app.reader_action(serde_json::json!({"action":"annotate","generation":7,"row":0,"byte":1,"old_side":true,
+            "selection":[{"row":0,"text":"é中"}]}));
+        let note = app.draft_note.as_ref().unwrap();
+        assert!(note.target.ends_with("\n  old:9 | é中"));
+        assert_eq!(note.range_label(),"old 9");
+        assert_eq!(note.locations,vec![(Some(9),Some(12))]);
         app.note_box = None;
         app.open_note();
         assert!(app.draft_note.as_ref().unwrap().target.ends_with("(whole file)"));

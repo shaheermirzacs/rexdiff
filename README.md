@@ -138,8 +138,16 @@ The file reader embeds a clean Neovim instance (without your personal config or
 plugins). Motions, counts, regex search, text objects, registers, and character,
 line, or block selections are native Neovim. The buffer contains displayed diff
 rows; source line numbers and diff signs live in the gutter, outside selectable
-text. `:42` and `42G` address buffer rows; `:Source 42` jumps to source line 42,
-opening whole-file mode when necessary. Search covers the displayed content.
+text. `:42`, `42G`, and `:Source 42` jump to the displayed source line 42,
+opening whole-file mode when necessary. In split view, jumps use the focused
+side's line numbers. Search covers the displayed content.
+
+`Space+d` toggles stacked and side-by-side split views (`S` in the tree).
+Split view shows old code on the left and new code on the right, with aligned
+changes and synchronized scrolling. Long lines scroll horizontally (`zh` / `zl`)
+to keep the two sides aligned. Use native `Ctrl+w h` / `Ctrl+w l` or click
+to switch sides. Search and selections operate in the focused side; annotations
+keep their source ranges. The layout choice lasts for the current session.
 
 Review actions in the reader use a Space prefix: `Space+a` annotates,
 `Space+s` sends notes, `Space+l` lists notes, `Space+x` toggles whole-file mode,
@@ -168,13 +176,14 @@ are nonmodifiable scratch buffers; source files are not opened for editing.
 | `s` in the tree / `Space+s` in the reader | Paste queued annotations into an agent's input in this tab; `↑↓` and `Enter` pick when multiple agents are available |
 | `Ctrl+f/b`, `Ctrl+d/u`, `PgDn` / `PgUp` | Full/half-page movement |
 | `Ctrl+e` / `Ctrl+y` in the reader | Scroll one line |
-| `gg` / `G`, `42G`, `:42` | First/last/buffer row; `:Source 42` jumps by source line and opens whole-file mode if needed |
+| `gg` / `G`, `42G`, `:42` | First/last row; numeric jumps use source lines and open whole-file mode if needed |
 | `0` / `^` / `$`, `w` / `b` / `e` | Line and word motions; counts such as `10j` repeat motions |
 | `/` / `?`, `n` / `N` | Native regex smart-case search forward/backward; repeat/reverse with wraparound |
 | `L` in the tree / `Space+l` in the reader | List pending annotations; j/k previews, Enter edits, d deletes, Esc/q closes |
 | `c` in the tree | Commit what's staged (see below) |
 | `d` in the tree | Discard the changes of the file or folder under the cursor (see below) |
 | `x` in the tree / `Space+x` in the reader | Toggle between changed hunks only and the whole file |
+| `S` in the tree / `Space+d` in the reader | Toggle stacked / split diff layout |
 | `+` / `-` in the tree | Make the tree bigger / smaller |
 | `1` / `2` in the tree | Changes / Branches screen (or click the tabs in the header). In the file, digits form motion counts |
 | `r` in the tree | Reload the repository |
@@ -185,7 +194,10 @@ Annotations are queued for the panel session. Add as many as needed, then press
 in the panel's tab are offered. Failed delivery keeps the notes for retry; closing
 the panel discards unsent notes. Selected diff text includes old/new line numbers,
 so deleted lines remain identifiable. Use `Space+x` in the reader to select beyond the changed hunks.
-Amber gutter rails mark annotated lines, with comment callouts above the selection.
+Theme-aware violet backgrounds mark annotated line numbers and join them to
+padded, tinted note cards above the selection. Cards wrap to at most 64 columns and three-quarters
+of the pane's text area. The note editor shows the file and source range,
+with save and newline shortcuts along its lower edge.
 The annotation list highlights the selected entry and shows its old/new source-line
 ranges. It reserves space below the reader so jumping between notes keeps the code
 visible; wide panes also show the captured snippet beside the list. In narrow panes,

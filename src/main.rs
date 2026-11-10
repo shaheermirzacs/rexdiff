@@ -40,11 +40,13 @@ In the panel:
   t               toggle changed files / all project files (including ignored files)
   Ctrl+p          in the tree: fuzzy file picker (Space+p in the file); :e PATH opens a project file
   \\               hide/show the left sidebar
-  gg / G / :N     first / last / buffer row N; :Source N jumps to a source line
+  gg / G / :N     first / last / source line N; NG and :Source N also use source lines
   0 ^ $ w b e     line and word motions in the file
   / ? n N         native regex smart-case search forward/backward, repeat/reverse
   Ctrl+f/b/d/u    full/half-page movement; Ctrl+e/y scroll one line
   x               in the tree: toggle whole file (Space+x in the file)
+  S               in the tree: toggle stacked/split diff (Space+d in the file)
+  Ctrl+w h/l      in split view: focus the old/new side
   :q              quit from the file reader (q from the tree)
   Neovim 0.10+ is required; the reader uses a clean config and read-only scratch buffers.
   c               commit what's staged: type the message, Enter commits, Esc cancels

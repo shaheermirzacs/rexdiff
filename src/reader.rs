@@ -36,6 +36,7 @@ pub struct Reader {
     size: (u16, u16),
     pub generation: Option<u64>,
     pub seek: bool,
+    pub split: bool,
     notes: Vec<Json>,
     _directory: tempfile::TempDir,
 }
@@ -125,6 +126,7 @@ impl Reader {
             size: (24, 80),
             generation: None,
             seek: false,
+            split: false,
             notes: Vec::new(),
             _directory: directory,
         };
@@ -203,6 +205,7 @@ impl Reader {
     ) -> io::Result<()> {
         let mut document = document(diff, generation, cursor, palette);
         document["seek"] = json!(self.seek);
+        document["split"] = json!(self.split);
         self.call("nvim_exec_lua", json!(["RexDiffLoad(...)", [document]]))?;
         self.generation = Some(generation);
         self.seek = false;
@@ -219,6 +222,16 @@ impl Reader {
     }
 
     pub fn goto(&mut self, cursor: Position, diff: &FileDiff) -> io::Result<()> {
+        self.move_to(cursor, diff, false, None)
+    }
+
+    fn move_to(
+        &mut self,
+        cursor: Position,
+        diff: &FileDiff,
+        center: bool,
+        old_side: Option<bool>,
+    ) -> io::Result<()> {
         let byte = diff
             .rows
             .get(cursor.row)
@@ -230,12 +243,15 @@ impl Reader {
                     .sum::<usize>()
             })
             .unwrap_or(0);
-        self.notify("nvim_win_set_cursor", json!([0, [cursor.row + 1, byte]]))
+        self.call(
+            "nvim_exec_lua",
+            json!(["RexDiffGoto(...)", [cursor.row, byte, center, old_side]]),
+        )
+        .map(|_| ())
     }
 
-    pub fn reveal(&mut self, cursor: Position, diff: &FileDiff) -> io::Result<()> {
-        self.goto(cursor, diff)?;
-        self.notify("nvim_exec_lua", json!(["vim.cmd('normal! zz')", []]))
+    pub fn reveal(&mut self, cursor: Position, diff: &FileDiff, old_side: bool) -> io::Result<()> {
+        self.move_to(cursor, diff, true, Some(old_side))
     }
 
     pub fn key(&mut self, key: KeyEvent) -> io::Result<()> {
@@ -394,9 +410,35 @@ fn document(diff: &FileDiff, generation: u64, cursor: Position, p: &Palette) -> 
         );
     }
     highlights.insert("Normal".into(), json!({"fg":"NONE","bg":"NONE"}));
+    for name in ["DiffAdd", "DiffChange", "DiffDelete", "DiffText"] {
+        highlights.insert(name.into(), json!({"fg":"NONE","bg":"NONE"}));
+    }
+    highlights.insert(
+        "DiffDelete".into(),
+        json!({"fg":color(p.faint),"bg":color(p.sel_bg)}),
+    );
+    for name in ["WinBar", "WinBarNC"] {
+        highlights.insert(
+            name.into(),
+            json!({"fg":color(p.muted),"bg":"NONE","bold":true}),
+        );
+    }
+    highlights.insert(
+        "WinSeparator".into(),
+        json!({"fg":color(p.faint),"bg":"NONE"}),
+    );
     highlights.insert(
         "RxAnnotation".into(),
         json!({"fg":color(p.annotation),"bg":"NONE","bold":true}),
+    );
+    highlights.insert(
+        "RxNoteLabel".into(),
+        json!({"fg":color(p.annotation),"bg":color(p.annotation_bg),"bold":true}),
+    );
+    highlights.insert("RxNoteJoin".into(), json!({"fg":color(p.annotation_fg),"bg":color(p.annotation),"bold":true}));
+    highlights.insert(
+        "RxNoteText".into(),
+        json!({"fg":color(p.fg),"bg":color(p.annotation_bg)}),
     );
     let rows:Vec<_>=diff.rows.iter().map(|row| {
         let (kind,sign,number)=match row.kind {
@@ -440,6 +482,160 @@ fn document(diff: &FileDiff, generation: u64, cursor: Position, p: &Palette) -> 
 mod tests {
     use super::*;
     use crate::git::{DRow, Seg};
+
+    #[test]
+    #[ignore = "requires installed Neovim 0.10+ and permission for PTYs/local sockets"]
+    fn split_reader_preserves_source_rows_and_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = Reader::start(dir.path()).unwrap();
+        let diff = fixture();
+        let palette = Palette::from(None);
+        reader
+            .load(&diff, 1, Position { row: 2, col: 0 }, &palette)
+            .unwrap();
+        reader.split = true;
+        reader
+            .load(&diff, 1, Position::default(), &palette)
+            .unwrap();
+        let inspect = |r: &mut Reader| -> Json {
+            let result = r
+                .call(
+                    "nvim_exec_lua",
+                    json!([
+                        r#"
+              local result = {}
+              for _,win in ipairs(vim.api.nvim_list_wins()) do
+                result[vim.wo[win].winbar:match('%w+')] = {
+                  lines=vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win),0,-1,false),
+                  diff=vim.wo[win].diff, scrollbind=vim.wo[win].scrollbind, wrap=vim.wo[win].wrap,
+                  modifiable=vim.bo[vim.api.nvim_win_get_buf(win)].modifiable,
+                  gutter=vim.api.nvim_eval_statusline(vim.wo[win].statuscolumn,
+                    {winid=win,use_statuscol_lnum=math.min(2,vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(win)))}).str
+                }
+              end
+              return result
+            "#,
+                        []
+                    ]),
+                )
+                .unwrap();
+            rmpv::ext::from_value(result).unwrap()
+        };
+        let state = inspect(&mut reader);
+        assert_eq!(state["Old"]["lines"][1], "é old value");
+        assert_eq!(state["New"]["lines"][1], "é new value");
+        assert!(state["Old"]["gutter"].as_str().unwrap().contains('−'));
+        assert!(state["New"]["gutter"].as_str().unwrap().contains('+'));
+        for side in ["Old", "New"] {
+            assert_eq!(state[side]["lines"].as_array().unwrap().len(), 3);
+            assert_eq!(state[side]["diff"], true);
+            assert_eq!(state[side]["scrollbind"], true);
+            assert_eq!(state[side]["wrap"], false);
+            assert_eq!(state[side]["modifiable"], false);
+        }
+        for width in [140, 60, 80] {
+            reader.resize(Rect::new(0, 0, width, 24)).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            let widths = reader.call("nvim_exec_lua",json!(["local w=vim.api.nvim_list_wins(); return {vim.api.nvim_win_get_width(w[1]),vim.api.nvim_win_get_width(w[2])}",[]])).unwrap();
+            let widths = widths.as_array().unwrap();
+            assert!(
+                widths[0]
+                    .as_i64()
+                    .unwrap()
+                    .abs_diff(widths[1].as_i64().unwrap())
+                    <= 1,
+                "{widths:?}"
+            );
+        }
+        reader
+            .notes(vec![
+                json!({"rows":[1],"comment":"old note"}),
+                json!({"rows":[2],"comment":"new note"}),
+            ])
+            .unwrap();
+        for (source, text) in [(1, "é old value"), (2, "é new value")] {
+            reader
+                .reveal(
+                    Position {
+                        row: source,
+                        col: 0,
+                    },
+                    &diff,
+                    source == 1,
+                )
+                .unwrap();
+            assert_eq!(
+                reader
+                    .call("nvim_eval", json!(["&winbar"]))
+                    .unwrap()
+                    .as_str(),
+                Some(if source == 1 { " Old" } else { " New" })
+            );
+            reader.call("nvim_input", json!(["V a"])).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            let (_, actions) = reader.poll().unwrap();
+            let action = actions.iter().find(|a| a["action"] == "annotate").unwrap();
+            assert_eq!(action["selection"][0]["row"], source);
+            assert_eq!(action["selection"][0]["text"], text);
+            for keys in ["G:40<CR>", "G40G"] {
+                reader.call("nvim_input", json!([keys])).unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+                assert_eq!(
+                    reader
+                        .call("nvim_eval", json!(["line('.')"]))
+                        .unwrap()
+                        .as_u64(),
+                    Some(2)
+                );
+            }
+        }
+        let text = reader.screen.lock().unwrap().screen().contents();
+        assert!(
+            text.contains("old note") && text.contains("new note"),
+            "{text}"
+        );
+        reader.split = false;
+        reader
+            .load(&diff, 1, Position::default(), &palette)
+            .unwrap();
+        assert_eq!(
+            reader
+                .call("nvim_eval", json!(["winnr('$')"]))
+                .unwrap()
+                .as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            reader
+                .call("nvim_eval", json!(["line('.')"]))
+                .unwrap()
+                .as_u64(),
+            Some(3)
+        );
+        assert_eq!(
+            reader.call("nvim_eval", json!(["&diff"])).unwrap().as_u64(),
+            Some(0)
+        );
+        reader.split = true;
+        let mut added = diff.clone();
+        added.path = "added.rs".into();
+        added.rows.retain(|r| r.kind == RowKind::Add);
+        reader
+            .load(&added, 2, Position::default(), &palette)
+            .unwrap();
+        let state = inspect(&mut reader);
+        assert_eq!(state["Old"]["lines"], json!([""]));
+        assert_eq!(state["New"]["lines"], json!(["é new value"]));
+        let mut deleted = diff.clone();
+        deleted.path = "deleted.rs".into();
+        deleted.rows.retain(|r| r.kind == RowKind::Del);
+        reader
+            .load(&deleted, 3, Position::default(), &palette)
+            .unwrap();
+        let state = inspect(&mut reader);
+        assert_eq!(state["New"]["lines"], json!([""]));
+        assert_eq!(state["Old"]["lines"], json!(["é old value"]));
+    }
 
     fn fixture() -> FileDiff {
         FileDiff {
@@ -552,15 +748,18 @@ mod tests {
             .notes(vec![json!({"rows":[1,2],"comment":"hi\nsecond line"})])
             .unwrap();
         let (buffer, text) = rendered(&mut reader);
-        assert!(text.contains("╭─ 💬 hi"), "{text}");
-        assert!(text.contains("│  second line"));
-        let rails: Vec<_> = buffer
+        assert!(text.contains("╭─ NOTE "), "{text}");
+        assert!(text.contains("│  hi"));
+        assert!(!text.contains("╭──────┴"), "{text}");
+        assert!(text.contains("second line"));
+        assert!(!text.contains('💬'));
+        let joined: Vec<_> = buffer
             .content
             .iter()
-            .filter(|c| c.symbol() == "▌")
+            .filter(|c| c.bg == Palette::from(None).annotation)
             .collect();
-        assert_eq!(rails.len(), 2);
-        assert!(rails.iter().all(|c| c.fg == Palette::from(None).annotation));
+        assert!(joined.len() > 30);
+        assert!(joined.iter().any(|c| c.symbol()=="4" && c.fg==Palette::from(None).annotation_fg));
         assert_eq!(
             reader
                 .call("nvim_eval", json!(["search('second line', 'nw')"]))
@@ -572,8 +771,40 @@ mod tests {
             .notes(vec![json!({"rows":[1,2],"comment":"edited"})])
             .unwrap();
         let (_, text) = rendered(&mut reader);
-        assert!(text.contains("💬 edited"));
+        assert!(text.contains("│  edited"));
         assert!(!text.contains("second line"));
+        reader.notes(vec![json!({"rows":[1],"comment":"Check the source ranges and Unicode é中 carefully. ".repeat(4)})]).unwrap();
+        let card_widths = |reader: &mut Reader| -> Vec<usize> {
+            let result = reader
+                .call(
+                    "nvim_exec_lua",
+                    json!([
+                        r#"
+              local ns=vim.api.nvim_get_namespaces()['rexdiff-notes']
+              local card=vim.api.nvim_buf_get_extmarks(0,ns,0,-1,{details=true})[1][4].virt_lines
+              local widths={}
+              for _,line in ipairs(card) do
+                local text=''
+                for _,chunk in ipairs(line) do text=text..chunk[1] end
+                widths[#widths+1]=vim.fn.strdisplaywidth(text)-6
+              end
+              return widths
+            "#,
+                        []
+                    ]),
+                )
+                .unwrap();
+            rmpv::ext::from_value(result).unwrap()
+        };
+        let wide = card_widths(&mut reader);
+        assert!(wide.len() >= 7);
+        assert!(wide.iter().all(|w| *w == wide[0] && *w <= 56));
+        reader.resize(Rect::new(0, 0, 48, 24)).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let narrow = card_widths(&mut reader);
+        assert!(narrow.len() > wide.len());
+        assert!(narrow.iter().all(|w| *w == narrow[0] && *w <= 32));
+        reader.resize(Rect::new(0, 0, 80, 24)).unwrap();
         reader.notes(Vec::new()).unwrap();
         let (_, text) = rendered(&mut reader);
         assert!(!text.contains('▌') && !text.contains("edited"));
@@ -601,7 +832,7 @@ mod tests {
             r.call("nvim_input", json!([keys])).unwrap();
             std::thread::sleep(Duration::from_millis(500));
         };
-        input(&mut reader, "2G0vl a");
+        input(&mut reader, "ggj0vl a");
         let (_, actions) = reader.poll().unwrap();
         let selection = actions
             .iter()
@@ -626,7 +857,7 @@ mod tests {
                 .as_u64(),
             Some(4)
         );
-        input(&mut reader, "<Esc>2G0<C-v>jl a");
+        input(&mut reader, "<Esc>ggj0<C-v>jl a");
         let (_, actions) = reader.poll().unwrap();
         let selection = actions
             .iter()
@@ -634,7 +865,7 @@ mod tests {
             .expect("block selection callback");
         assert_eq!(selection["selection"].as_array().unwrap().len(), 2);
         assert_eq!(selection["selection"][1]["text"], "é ");
-        input(&mut reader, "2G0vaw");
+        input(&mut reader, "ggj0vaw");
         assert_eq!(
             reader
                 .call("nvim_eval", json!(["mode()"]))
@@ -713,7 +944,9 @@ mod tests {
         reader
             .load(&tall, 10, Position::default(), &Palette::from(None))
             .unwrap();
-        reader.reveal(Position { row: 89, col: 0 }, &tall).unwrap();
+        reader
+            .reveal(Position { row: 89, col: 0 }, &tall, false)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         assert!(
             reader

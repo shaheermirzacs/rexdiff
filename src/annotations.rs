@@ -18,8 +18,9 @@ pub struct Note {
 }
 impl Note {
     pub fn range_label(&self) -> String {
-        let old = ranges(self.locations.iter().filter_map(|&(old,new)| if new.is_none() { old } else { None }));
-        let new = ranges(self.locations.iter().filter_map(|&(_,new)| new));
+        let old_side = self.old_side && self.locations.iter().all(|(old,_)| old.is_some());
+        let old = ranges(self.locations.iter().filter_map(|&(old,new)| if new.is_none() || old_side { old } else { None }));
+        let new = ranges(self.locations.iter().filter_map(|&(old,new)| if old.is_none() || !old_side { new } else { None }));
         match (old.is_empty(), new.is_empty()) {
             (false,false) => format!("old {old} · new {new}"),
             (false,true) => format!("old {old}"),
@@ -171,6 +172,9 @@ mod tests {
             locations:vec![(Some(44),None),(Some(45),None),(Some(46),None),(Some(47),None)],
             revision:0,target:String::new(),preview:Vec::new(),historical:false,comment:"why?".into()};
         assert_eq!(note.range_label(),"old 44–47");
+        note.locations.push((Some(48),Some(46)));
+        assert_eq!(note.range_label(),"old 44–48");
+        note.locations.pop();
         note.locations.extend([(None,Some(45)),(Some(49),Some(46)),(None,Some(49))]);
         assert_eq!(note.range_label(),"old 44–47 · new 45–46, 49");
         note.locations=vec![(None,Some(45))];
