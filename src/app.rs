@@ -231,7 +231,7 @@ impl App {
                             let Some(row) = selected["row"].as_u64().and_then(|i| diff.rows.get(i as usize)) else { continue };
                             if matches!(row.kind, RowKind::Hunk | RowKind::Meta) { continue; }
                             let text = selected["text"].as_str().unwrap_or("");
-                            let old_side = row.kind == RowKind::Del || action["old_side"].as_bool() == Some(true);
+                            let old_side = row.old.is_some() && (row.kind == RowKind::Del || action["old_side"].as_bool() == Some(true));
                             let (side, number) = if old_side { ("old",row.old) } else { ("new",row.new) };
                             draft.target.push_str(&format!("\n  {side}:{} | {text}",number.unwrap_or(0)));
                             if draft.locations.is_empty() { draft.line = number; draft.old_side = old_side; }
@@ -2615,6 +2615,15 @@ mod tests {
         assert!(note.target.ends_with("\n  old:9 | é中"));
         assert_eq!(note.range_label(),"old 9");
         assert_eq!(note.locations,vec![(Some(9),Some(12))]);
+        app.diff.as_mut().unwrap().rows[0].old = None;
+        app.reader_action(serde_json::json!({"action":"annotate","generation":7,"row":0,"byte":1,"old_side":true,
+            "selection":[{"row":0,"text":"é中"}]}));
+        let note = app.draft_note.as_ref().unwrap();
+        assert!(note.target.ends_with("\n  new:12 | é中"));
+        assert_eq!(note.line,Some(12));
+        assert!(!note.old_side);
+        assert_eq!(note.range_label(),"new 12");
+        assert_eq!(note.locations,vec![(None,Some(12))]);
         app.note_box = None;
         app.open_note();
         assert!(app.draft_note.as_ref().unwrap().target.ends_with("(whole file)"));
