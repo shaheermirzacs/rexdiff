@@ -485,6 +485,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires installed Neovim 0.10+ and permission for PTYs/local sockets"]
+    fn empty_reader_emits_navigation_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = Reader::start(dir.path()).unwrap();
+        for (keys, action) in [("<Tab>","focus"),(" p","picker"),(":q<CR>","quit")] {
+            reader.call("nvim_input",json!([keys])).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            let (_,actions)=reader.poll().unwrap();
+            assert!(actions.iter().any(|a|a["action"]==action),"missing {action}: {actions:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Neovim 0.10+ and permission for PTYs/local sockets"]
     fn split_reader_preserves_source_rows_and_annotations() {
         let dir = tempfile::tempdir().unwrap();
         let mut reader = Reader::start(dir.path()).unwrap();

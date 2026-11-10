@@ -204,13 +204,16 @@ impl App {
 
     fn reader_action(&mut self, action: serde_json::Value) {
         // A queued selection must never attach to a newly refreshed snapshot.
-        if action["generation"].as_u64() != Some(self.diff_gen)
-            || !self.diff.as_ref().is_some_and(|d| Some(&d.path) == self.active.as_ref()) { return; }
+        let current = action["generation"].as_u64() == Some(self.diff_gen)
+            && self.diff.as_ref().is_some_and(|d| Some(&d.path) == self.active.as_ref());
+        if !current && matches!(action["action"].as_str(),Some("annotate"|"source"|"context")) { return; }
+        if current {
         self.file_cursor.row = action["row"].as_u64().unwrap_or(0) as usize;
         self.file_cursor.col = self.diff.as_ref().and_then(|d| d.rows.get(self.file_cursor.row)).map(|r| {
             let text = annotations::text(r);
             text.char_indices().take_while(|(byte,_)| *byte < action["byte"].as_u64().unwrap_or(0) as usize).count()
         }).unwrap_or(0);
+        }
         match action["action"].as_str().unwrap_or("") {
             "annotate" => {
                 if self.annotation_rx.is_some() { return; }
@@ -2545,6 +2548,23 @@ mod tests {
         app.notes[0].revision=revision.wrapping_add(1);
         app.preview_note();
         assert!(!app.note_preview_pending);
+    }
+
+    #[test]
+    fn empty_reader_navigation_does_not_require_a_snapshot() {
+        let (jobs,_)=mpsc::channel();
+        let dir=tempfile::tempdir().unwrap();
+        let mut app=App::new(jobs,dir.path().into(),None);
+        app.file_focus=true;
+        app.reader_action(serde_json::json!({"action":"annotate","generation":0}));
+        assert!(app.note_box.is_none());
+        app.reader_action(serde_json::json!({"action":"focus","generation":999}));
+        assert!(!app.file_focus);
+        assert!(app.sidebar);
+        app.reader_action(serde_json::json!({"action":"picker","generation":999}));
+        assert!(app.picker.is_some());
+        app.reader_action(serde_json::json!({"action":"quit","generation":999}));
+        assert!(app.quit);
     }
 
     #[test]

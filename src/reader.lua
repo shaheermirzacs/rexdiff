@@ -36,10 +36,11 @@ vim.bo.modifiable = false
 
 local function emit(action, argument)
   local rows = views[api.nvim_get_current_buf()]
-  if not rows then
+  if not rows and (action == 'annotate' or action == 'source' or action == 'context') then
     vim.notify('Return to the rexdiff buffer before using review actions',vim.log.levels.WARN)
     return
   end
+  rows = rows or {}
   local cursor = api.nvim_win_get_cursor(0)
   local mode = vim.fn.mode()
   local capture = {}
@@ -85,7 +86,8 @@ api.nvim_create_user_command('Source', function(args)
 end, {nargs=1})
 vim.keymap.set('c','<CR>',function()
   local line = vim.fn.getcmdline():match('^%s*(%d+)%s*$')
-  return vim.fn.getcmdtype()==':' and line and '<C-u>Source '..line..'<CR>' or '<CR>'
+  if vim.fn.getcmdtype() ~= ':' then return '<CR>' end
+  return line and '<C-u>Source '..line..'<CR>' or '<C-]><CR>'
 end,{expr=true})
 vim.keymap.set('n','G',function()
   if vim.v.count > 0 then source_line(vim.v.count) else vim.cmd('normal! G') end
