@@ -1,7 +1,7 @@
 //! Review notes and delivery through the same Rex CLI used to open the panel.
 use serde_json::Value;
 
-use crate::git::{DRow, FileDiff, RowKind};
+use crate::git::DRow;
 
 #[derive(Clone)]
 pub struct Note {
@@ -17,9 +17,37 @@ pub struct Note {
     pub comment: String,
 }
 impl Note {
+    pub fn range_label(&self) -> String {
+        let old_side = self.old_side && self.locations.iter().all(|(old,_)| old.is_some());
+        let old = ranges(self.locations.iter().filter_map(|&(old,new)| if new.is_none() || old_side { old } else { None }));
+        let new = ranges(self.locations.iter().filter_map(|&(old,new)| if old.is_none() || !old_side { new } else { None }));
+        match (old.is_empty(), new.is_empty()) {
+            (false,false) => format!("old {old} · new {new}"),
+            (false,true) => format!("old {old}"),
+            (true,false) => format!("new {new}"),
+            (true,true) => "whole file".into(),
+        }
+    }
+
     pub fn format(&self) -> String {
         format!("{}\nComment: {}", self.target, self.comment)
     }
+}
+
+fn ranges(lines: impl Iterator<Item=u32>) -> String {
+    let mut lines: Vec<_> = lines.collect();
+    lines.sort_unstable();
+    lines.dedup();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let start = lines[i];
+        let mut end = start;
+        i += 1;
+        while i < lines.len() && end.checked_add(1) == Some(lines[i]) { end = lines[i]; i += 1; }
+        spans.push(if start == end { start.to_string() } else { format!("{start}–{end}") });
+    }
+    spans.join(", ")
 }
 pub fn revision(root: &std::path::Path, path: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -41,67 +69,11 @@ pub struct Position {
     pub col: usize,
 }
 
-pub struct Selection {
-    pub anchor: Position,
-    pub lines: bool,
-}
-
-impl Selection {
-    pub fn contains(&self, cursor: Position, pos: Position) -> bool {
-        let (lo, hi) = (self.anchor.min(cursor), self.anchor.max(cursor));
-        if self.lines { (lo.row..=hi.row).contains(&pos.row) } else { (lo..=hi).contains(&pos) }
-    }
-}
 
 pub fn text(row: &DRow) -> String {
     row.segs.iter().map(|s| s.text.as_str()).collect()
 }
 
-pub fn preview(diff: &FileDiff, selection: Option<&Selection>, cursor: Position) -> Vec<DRow> {
-    let Some(selection) = selection else { return Vec::new() };
-    diff.rows.iter().enumerate().filter_map(|(i, row)| {
-        if matches!(row.kind, RowKind::Hunk | RowKind::Meta)
-            || !(selection.anchor.row.min(cursor.row)..=selection.anchor.row.max(cursor.row)).contains(&i) {
-            return None;
-        }
-        let mut row = row.clone();
-        let mut col = 0;
-        for seg in &mut row.segs {
-            seg.text = seg.text.chars().filter(|_| {
-                let selected = selection.contains(cursor, Position { row: i, col });
-                col += 1;
-                selected
-            }).collect();
-        }
-        Some(row)
-    }).take(3).collect()
-}
-
-pub fn target(path: &str, diff: &FileDiff, selection: Option<&Selection>, cursor: Position) -> String {
-    let Some(selection) = selection else {
-        return format!("{path} (whole file)");
-    };
-    let mut out = path.to_string();
-    for (r, row) in diff.rows.iter().enumerate() {
-        if matches!(row.kind, RowKind::Hunk | RowKind::Meta) {
-            continue;
-        }
-        let content = text(row);
-        let selected: String = content
-            .chars()
-            .enumerate()
-            .filter(|(col, _)| selection.contains(cursor, Position { row: r, col: *col }))
-            .map(|(_, c)| c)
-            .collect();
-        if !selected.is_empty()
-            || (content.is_empty() && selection.contains(cursor, Position { row: r, col: 0 }))
-        {
-            let (side, number) = if row.kind == RowKind::Del { ("old", row.old) } else { ("new", row.new) };
-            out.push_str(&format!("\n  {side}:{} | {selected}", number.unwrap_or(0)));
-        }
-    }
-    out
-}
 
 pub struct Agent {
     pub id: String,
@@ -193,33 +165,22 @@ pub fn send(agent: &Agent, notes: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::Seg;
 
     #[test]
-    fn reversed_unicode_selection_and_deleted_line_coordinates() {
-        let diff = FileDiff {
-            revision: 0,
-            path: "x".into(),
-            context: 3,
-            max_lineno: 9,
-            rows: vec![DRow {
-                kind: RowKind::Del,
-                old: Some(9),
-                new: None,
-                segs: vec![Seg { text: "aé中z".into(), fg: None, bold: false, emph: false }],
-            }],
-        };
-        let sel = Selection { anchor: Position { row: 0, col: 2 }, lines: false };
-        let captured = preview(&diff, Some(&sel), Position { row: 0, col: 1 });
-        assert_eq!(text(&captured[0]), "é中");
-        assert!(captured[0].kind == RowKind::Del);
-        assert_eq!(captured[0].segs[0].fg, diff.rows[0].segs[0].fg);
-        assert_eq!(
-            target("/repo/x", &diff, Some(&sel), Position { row: 0, col: 1 }),
-            "/repo/x\n  old:9 | é中"
-        );
-        assert_eq!(target("/repo/x", &diff, None, Position::default()), "/repo/x (whole file)");
-        let sel = Selection { lines: true, ..sel };
-        assert_eq!(target("/repo/x", &diff, Some(&sel), Position::default()), "/repo/x\n  old:9 | aé中z");
+    fn ranges_distinguish_diff_sides_and_gaps() {
+        let mut note=Note {id:1,path:"x.rs".into(),line:Some(44),old_side:true,
+            locations:vec![(Some(44),None),(Some(45),None),(Some(46),None),(Some(47),None)],
+            revision:0,target:String::new(),preview:Vec::new(),historical:false,comment:"why?".into()};
+        assert_eq!(note.range_label(),"old 44–47");
+        note.locations.push((Some(48),Some(46)));
+        assert_eq!(note.range_label(),"old 44–48");
+        note.locations.pop();
+        note.locations.extend([(None,Some(45)),(Some(49),Some(46)),(None,Some(49))]);
+        assert_eq!(note.range_label(),"old 44–47 · new 45–46, 49");
+        note.locations=vec![(None,Some(45))];
+        assert_eq!(note.range_label(),"new 45");
+        note.locations.clear();
+        assert_eq!(note.range_label(),"whole file");
+        assert_eq!(ranges([3,2,2,1,7].into_iter()),"1–3, 7");
     }
 }

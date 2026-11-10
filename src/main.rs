@@ -1,12 +1,11 @@
 mod app;
 mod annotations;
 mod project;
-mod navigation;
+mod reader;
 mod git;
 mod highlight;
 mod theme;
 mod tree;
-mod wrap;
 
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -28,23 +27,28 @@ In the panel:
   space           stage/unstage a changed file; on a folder: open/close
   Enter           focus the selected file
   Tab / Shift-Tab switch focus between the tree and file
-  v / V           in the file: select text / whole lines; arrows or h j k l extend; Esc clears
-  a               annotate selection, or the whole file without a selection; Enter adds
+  v / V / Ctrl+v  in the file: native character / line / block selection; Esc clears
+  Space+a         in the file: annotate selection, or the whole file; Enter adds
                   in notes: arrows move the cursor; Shift+Enter inserts a newline
-  s               paste queued annotations to an agent in this tab (picker if multiple)
-  L (Shift+l)     list annotations: Enter edits, d deletes, Esc closes
+  Space+s         in the file: paste queued annotations to an agent in this tab
+  Space+l         in the file: list annotations: Enter edits, d deletes, Esc closes
+  a / s / L       in the tree: annotate file / send notes / list annotations
   H (Shift+h)     browse checked-out branch commits; Enter opens a commit diff
   D (Shift+d)     in Changes/History: combined branch diff from the merge base
   B (Shift+b)     in Changes/History: choose the branch comparison base
   W (Shift+w)     return to working-tree changes
   t               toggle changed files / all project files (including ignored files)
-  Ctrl+p          fuzzy file picker; :e PATH opens a project file directly
+  Ctrl+p          in the tree: fuzzy file picker (Space+p in the file); :e PATH opens a project file
   \\               hide/show the left sidebar
-  gg / G / :N     first / last / source line N; counts repeat motions (10j, 42G)
+  gg / G / :N     first / last / source line N; NG and :Source N also use source lines
   0 ^ $ w b e     line and word motions in the file
-  / ? n N         literal smart-case search forward/backward, repeat/reverse
-  Ctrl+f/b/d/u    full/half-page movement; J K scroll one visual line
-  x               toggle between changed hunks only and the whole file
+  / ? n N         native regex smart-case search forward/backward, repeat/reverse
+  Ctrl+f/b/d/u    full/half-page movement; Ctrl+e/y scroll one line
+  x               in the tree: toggle whole file (Space+x in the file)
+  S               in the tree: toggle stacked/split diff (Space+d in the file)
+  Ctrl+w h/l      in split view: focus the old/new side
+  :q              quit from the file reader (q from the tree)
+  Neovim 0.10+ is required; the reader uses a clean config and read-only scratch buffers.
   c               commit what's staged: type the message, Enter commits, Esc cancels
   d               discard the changes of the file or folder under the cursor (y confirms)
   1 / 2           Changes / Branches screen

@@ -9,14 +9,13 @@ use ratatui::style::Color;
 
 pub type Rgb = (u8, u8, u8);
 
-const ANSI_QUERIED: [u8; 4] = [1, 2, 3, 4];
+const ANSI_QUERIED: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 #[derive(Clone, Copy, PartialEq, Default)]
 pub struct Detected {
     pub fg: Option<Rgb>,
     pub bg: Option<Rgb>,
-    /// The palette's red, green, yellow, and blue, in that order.
-    pub ansi: [Option<Rgb>; 4],
+    pub ansi: [Option<Rgb>; 16],
 }
 
 /// Asks the terminal for its colors. Needs raw mode on, and must not run while
@@ -101,6 +100,7 @@ fn parse_rgb(s: &str) -> Option<Rgb> {
 
 /// Every color the panel uses.
 pub struct Palette {
+    pub ansi: [Rgb; 16],
     pub fg: Color,
     pub muted: Color,
     pub faint: Color,
@@ -111,6 +111,9 @@ pub struct Palette {
     pub red: Color,
     pub yellow: Color,
     pub blue: Color,
+    pub annotation: Color,
+    pub annotation_bg: Color,
+    pub annotation_fg: Color,
     pub selection_fg: Color,
     pub search_fg: Color,
     pub add_bg: Color,
@@ -153,14 +156,17 @@ impl Palette {
             false => (d.bg.unwrap_or((255, 255, 255)), d.fg.unwrap_or((36, 41, 47))),
         };
         let pick = |i: usize, dark_c: Rgb, light_c: Rgb| d.ansi[i].unwrap_or(if dark { dark_c } else { light_c });
-        let red = pick(0, (248, 81, 73), (207, 34, 46));
-        let green = pick(1, (63, 185, 80), (26, 127, 55));
-        let yellow = pick(2, (210, 153, 34), (154, 103, 0));
-        let blue = pick(3, (88, 166, 255), (9, 105, 218));
+        let red = pick(1, (248, 81, 73), (207, 34, 46));
+        let green = pick(2, (63, 185, 80), (26, 127, 55));
+        let yellow = pick(3, (210, 153, 34), (154, 103, 0));
+        let blue = pick(4, (88, 166, 255), (9, 105, 218));
+        let fallback = [bg, red, green, yellow, blue, (188,140,255), (57,197,207), fg,
+            mix(fg,bg,0.62), red, green, yellow, blue, (188,140,255), (57,197,207), fg];
 
         // Dark backgrounds need a bit more color for the tint to show.
         let (row, gutter, emph) = if dark { (0.17, 0.27, 0.40) } else { (0.11, 0.20, 0.30) };
         Self {
+            ansi: std::array::from_fn(|i| d.ansi[i].unwrap_or(fallback[i])),
             fg: Color::Reset,
             muted: rgb(mix(fg, bg, 0.40)),
             faint: rgb(mix(fg, bg, 0.62)),
@@ -171,6 +177,9 @@ impl Palette {
             red: rgb(red),
             yellow: rgb(yellow),
             blue: rgb(blue),
+            annotation: rgb(pick(5, (188,140,255), (111,66,193))),
+            annotation_fg: contrast_text(pick(5, (188,140,255), (111,66,193))),
+            annotation_bg: rgb(mix(bg,pick(5, (188,140,255), (111,66,193)),if dark {0.22} else {0.12})),
             selection_fg: contrast_text(blue),
             search_fg: contrast_text(yellow),
             add_bg: rgb(mix(bg, green, row)),

@@ -1197,11 +1197,8 @@ mod tests {
         eprintln!("full extraction: {:?}",raw_start.elapsed());
         let hl = Highlighter::new();
         let color_start = Instant::now();
-        let rows = colorize(raw,&hl,"sample.rs",&mut || true,&mut |_| {});
+        let _rows = colorize(raw,&hl,"sample.rs",&mut || true,&mut |_| {});
         eprintln!("full highlighting: {:?}",color_start.elapsed());
-        let start = Instant::now();
-        let mut wrap = crate::wrap::WrapCache::default(); wrap.rebuild(&rows,60,1);
-        eprintln!("full wrapping: {:?}",start.elapsed());
         let (tx,rx) = std::sync::mpsc::channel();
         let (result,msgs) = std::sync::mpsc::channel();
         let cwd = dir.clone();
