@@ -2531,7 +2531,8 @@ impl App {
         if let Some(f) = &self.flash
             && Instant::now() < f.until
         {
-            let w = (f.text.width() as u16).min(area.width.saturating_sub(2));
+            // Capped at half the row, so a long error can't erase every hint.
+            let w = (f.text.width() as u16).min(area.width / 2);
             let mut fx = right.saturating_sub(w + 1);
             put(buf, &mut fx, y, right, &f.text, Style::new().fg(if f.ok { p.green } else { p.red }));
             right = right.saturating_sub(w + 3);
@@ -2541,19 +2542,20 @@ impl App {
         }
         let back = match &self.comparison {
             Some(c) if c.is_commit => [("Esc", "commits")].as_slice(),
-            Some(_) => [("Esc", "working tree"), ("B", "base")].as_slice(),
+            Some(_) => [("B", "base")].as_slice(),
             None => &[],
         };
+        // The tree offers the other view: the branch diff from the working tree, and back.
+        let switch = if self.comparison.is_none() { ("D", "branch diff") } else { ("W", "working tree") };
+        let tree = [("Enter", "open"), switch, ("z", "stage/fold"), ("a", "annotate"), ("c", "commit"), ("d", "discard"),
+            ("L", "notes"), ("{ }", "files"), ("2", "branches"), ("?", "help"), (":", "command")];
         let hints: &[(&str, &str)] = match (self.view, self.focus) {
             (View::Changes, Focus::Reader) => &[
                 ("v/V", "select"), ("a", "annotate"), ("[ ]", "hunks"), ("{ }", "files"), ("/", "search"),
                 ("S", "split"), ("Space e", "sidebar"), ("Tab", "pane"), ("?", "help"),
             ],
             (View::Changes, Focus::Notes) => &[("j/k", "preview"), ("Enter", "edit"), ("d", "delete"), ("Esc", "close"), ("?", "help")],
-            (View::Changes, Focus::Tree) => &[
-                ("Enter", "open"), ("W", "working tree"), ("D", "branch diff"), ("z", "stage/fold"), ("a", "annotate"), ("c", "commit"), ("d", "discard"),
-                ("L", "notes"), ("{ }", "files"), ("2", "branches"), ("?", "help"), (":", "command"),
-            ],
+            (View::Changes, Focus::Tree) => &tree,
             (View::History, _) => &[("↑↓", "move"), ("Enter", "diff"), ("D", "branch diff"), ("B", "base"), ("W", "working tree"), ("Esc", "back"), ("?", "help")],
             (View::Branches, _) => &[
                 ("↑↓", "move"),
@@ -2569,7 +2571,9 @@ impl App {
             ],
         };
         let back = if self.view == View::Changes { back } else { &[] };
+        // Whole hints only: one that doesn't fit ends the row.
         for (key, what) in back.iter().chain(hints) {
+            if x + (key.width() + 1 + what.width()) as u16 > right { break; }
             put(buf, &mut x, y, right, key, Style::new().fg(p.muted));
             put(buf, &mut x, y, right, &format!(" {what}   "), Style::new().fg(p.faint));
         }
