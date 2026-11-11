@@ -1483,6 +1483,7 @@ dependencies = [
  "similar",
  "syntect",
  "tempfile",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

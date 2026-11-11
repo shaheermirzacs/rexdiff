@@ -10,6 +10,7 @@ use std::hash::{Hash, Hasher};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::annotations::{self, Note, Position, Selection};
@@ -751,6 +752,11 @@ impl Reader {
             }
             self.settle(&mut v, cursor);
         }
+        self.pan_to_cursor();
+    }
+
+    /// Split view doesn't wrap: pans sideways to keep the cursor's column visible.
+    fn pan_to_cursor(&mut self) {
         if self.split_active() {
             let text = &self.doc.texts[self.cursor.row];
             let x: usize = text
@@ -767,6 +773,54 @@ impl Reader {
         }
     }
 
+    /// The selectable position shown on visual line `line`, or the nearest
+    /// one after it (`forward`) or before it. Wrapped rows give the start of
+    /// that visual line, keeping the cursor's column when it's already there.
+    fn position_at(
+        &self,
+        v: &View,
+        line: usize,
+        forward: bool,
+        rows: &[usize],
+    ) -> Option<Position> {
+        let split = self.split_active();
+        let mut line = line.min(v.lines.total().checked_sub(1)?);
+        loop {
+            let (unit, sub) = v.lines.locate(line);
+            let row = if split {
+                let s = self.doc.split[unit];
+                if self.old_side { s.old } else { s.new }
+            } else {
+                Some(unit)
+            };
+            if let (Some(row), Some(sub)) = (row, sub.checked_sub(v.cards_height(unit)))
+                && rows.binary_search(&row).is_ok()
+            {
+                let col = match v.wraps.get(unit).filter(|_| !split) {
+                    Some(w) => {
+                        let (start, end) = (
+                            w.starts[sub],
+                            w.starts.get(sub + 1).copied().unwrap_or(usize::MAX),
+                        );
+                        let col = self.clamped().col;
+                        if row == self.cursor.row && (start..end).contains(&col) {
+                            col
+                        } else {
+                            start
+                        }
+                    }
+                    None => self.cursor.col,
+                };
+                return Some(Position { row, col });
+            }
+            line = if forward {
+                Some(line + 1).filter(|&l| l < v.lines.total())?
+            } else {
+                line.checked_sub(1)?
+            };
+        }
+    }
+
     fn scroll_lines(&mut self, diff: &FileDiff, delta: isize) {
         let (top, bottom) = {
             let mut v = self.view(diff, None);
@@ -775,21 +829,22 @@ impl Reader {
             v.scroll = v.scroll.saturating_add_signed(delta).min(max);
             (v.scroll, v.scroll + h - 1)
         };
-        // Keep the cursor on screen, like Vim's Ctrl+e / Ctrl+y.
-        let line_of = |r: &Reader, row: usize| {
-            let v = r.view.borrow();
-            v.lines.first.get(r.unit_of(row)).copied().unwrap_or(0) + v.cards_height(r.unit_of(row))
-        };
-        let current = line_of(self, self.cursor.row);
-        let rows = self.side_rows().to_vec();
-        if current < top {
-            if let Some(&r) = rows.iter().find(|&&r| line_of(self, r) >= top) {
-                self.cursor.row = r;
+        // Keep the cursor on screen, like Vim's Ctrl+e / Ctrl+y, down to the
+        // visual line of a wrapped row.
+        let target = {
+            let v = self.view.borrow();
+            let current = self.cursor_line(&v);
+            let rows = self.side_rows();
+            if current < top {
+                self.position_at(&v, top, true, &rows)
+            } else if current > bottom {
+                self.position_at(&v, bottom, false, &rows)
+            } else {
+                None
             }
-        } else if current > bottom
-            && let Some(&r) = rows.iter().rev().find(|&&r| line_of(self, r) <= bottom)
-        {
-            self.cursor.row = r;
+        };
+        if let Some(pos) = target {
+            self.cursor = pos;
         }
         let mut v = self.view(diff, None);
         let cursor = self.cursor_line(&v);
@@ -857,14 +912,22 @@ impl Reader {
                 } else {
                     delta
                 };
-                {
+                // Move by visual lines, so wrapped rows and note cards count.
+                let target = {
                     let mut v = self.view(diff, None);
+                    let current = self.cursor_line(&v);
                     v.scroll = v
                         .scroll
                         .saturating_add_signed(delta)
                         .min(v.lines.total().saturating_sub(h));
+                    let line = current.saturating_add_signed(delta);
+                    let rows = self.side_rows();
+                    self.position_at(&v, line, delta > 0, &rows)
+                        .or_else(|| self.position_at(&v, line, delta < 0, &rows))
+                };
+                if let Some(pos) = target {
+                    self.cursor = pos;
                 }
-                self.step(delta);
             }
             Motion::ScrollDown => return self.scroll_lines(diff, 1),
             Motion::ScrollUp => return self.scroll_lines(diff, -1),
@@ -931,6 +994,7 @@ impl Reader {
         };
         self.old_side = target.old_side;
         self.snap_to_side();
+        self.pan_to_cursor();
         let h = self.height();
         let mut v = self.view(diff, None);
         let cursor = self.cursor_line(&v);
@@ -964,6 +1028,7 @@ impl Reader {
         self.reveal(row);
         self.cursor = Position { row, col: pos.col };
         self.normalize_side();
+        self.pan_to_cursor();
         let h = self.height();
         let mut v = self.view(diff, None);
         let cursor = self.cursor_line(&v);
@@ -1172,8 +1237,12 @@ impl Reader {
         }
         let mut cell = x.saturating_sub(pane + g.text_off) as usize;
         let mut col = 0;
+        // Only this visual line's characters: blank space after a wrapped
+        // line maps to its last character, not into the continuation.
+        let mut end = usize::MAX;
         if let Some(w) = v.wraps.get(unit).filter(|_| !self.split_active()) {
             col = w.starts[sub];
+            end = w.starts.get(sub + 1).copied().unwrap_or(usize::MAX);
             if sub > 0 {
                 cell = cell.saturating_sub(w.indent);
             }
@@ -1182,7 +1251,7 @@ impl Reader {
         }
         for c in self.doc.texts[row].chars().skip(col) {
             let w = c.width().unwrap_or(0);
-            if cell < w {
+            if cell < w || col + 1 >= end {
                 break;
             }
             cell -= w;
@@ -1504,41 +1573,49 @@ impl Reader {
             {
                 style = style.bg(bg);
             }
-            for ch in seg.text.chars() {
+            // Whole grapheme clusters, so combining marks and joined emoji
+            // render as in the file; columns still count characters.
+            for g in seg.text.graphemes(true) {
+                let n = g.chars().count();
                 if col >= to {
                     break 'segments;
                 }
                 if col >= from {
-                    let w = ch.width().unwrap_or(0);
+                    let w = g.width();
                     if skip > 0 {
                         skip = skip.saturating_sub(w);
-                        col += 1;
+                        col += n;
                         continue;
                     }
                     if cx + w as u16 > right {
                         break 'segments;
                     }
+                    let span = col..col + n;
                     let pos = Position { row: r, col };
                     let cell = if selection.is_some_and(|s| s.contains(c.cursor, pos)) {
                         Style::new()
                             .fg(p.selection_fg)
                             .bg(p.blue)
                             .add_modifier(Modifier::BOLD)
-                    } else if hits.iter().any(|h| h.start <= col && col < h.end) {
+                    } else if hits
+                        .iter()
+                        .any(|h| h.start < span.end && span.start < h.end)
+                    {
                         Style::new()
                             .fg(p.search_fg)
                             .bg(p.yellow)
                             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                    } else if cursor_here && col == c.cursor.col {
+                    } else if cursor_here && span.contains(&c.cursor.col) {
                         style.add_modifier(Modifier::REVERSED)
                     } else {
                         style
                     };
-                    let mut bytes = [0; 4];
-                    buf.set_stringn(cx, y, ch.encode_utf8(&mut bytes), w, cell);
+                    if w > 0 {
+                        buf.set_stringn(cx, y, g, w, cell);
+                    }
                     cx += w as u16;
                 }
-                col += 1;
+                col += n;
             }
         }
         if cursor_here && sub == 0 && self.len(r) == 0 && side.is_none_or(|_| self.hscroll == 0) {
@@ -1858,7 +1935,10 @@ mod tests {
         r.motion(&d, Motion::Top);
         assert_eq!(r.cursor().row, 1);
         // Split view doesn't wrap: moving along a long line pans to keep the cursor visible.
-        let long = diff(vec![row(Ctx, Some(1), Some(1), &"x".repeat(200))]);
+        let long = diff(vec![
+            row(Hunk, None, None, "@@ -1 +1 @@"),
+            row(Add, None, Some(1), &"x".repeat(200)),
+        ]);
         let mut r = reader(&long, 160);
         r.toggle_split();
         r.motion(&long, Motion::LineEnd);
@@ -1867,8 +1947,47 @@ mod tests {
             200 - r.geom().text_w as usize,
             "the line end sits at the right edge"
         );
+        r.first_hunk(&long);
+        assert_eq!(r.hscroll, 0, "a hunk jump brings column 0 back into view");
+        r.motion(&long, Motion::LineEnd);
         r.motion(&long, Motion::LineStart);
         assert_eq!(r.hscroll, 0);
+    }
+
+    #[test]
+    fn wrapped_rows_page_scroll_click_and_graphemes() {
+        use RowKind::*;
+        // A 10-column text area (width 17): the first row wraps into 30 lines.
+        let d = diff(vec![
+            row(Ctx, Some(1), Some(1), &"aaaa ".repeat(60)),
+            row(Ctx, Some(2), Some(2), "tail"),
+        ]);
+        let mut r = reader(&d, 17);
+        assert_eq!(r.geom().text_w, 10);
+        r.motion(&d, Motion::HalfDown);
+        assert_eq!(
+            r.cursor(),
+            Position { row: 0, col: 60 },
+            "half a page of visual lines, not rows"
+        );
+        r.motion(&d, Motion::Top);
+        r.motion(&d, Motion::ScrollDown);
+        assert_eq!(
+            r.cursor(),
+            Position { row: 0, col: 10 },
+            "scrolling keeps the cursor on a visible line"
+        );
+        // Clicking past a wrapped line's end stays on that line.
+        let d = diff(vec![row(Ctx, Some(1), Some(1), "abc defghij")]);
+        let mut r = reader(&d, 17);
+        assert!(r.click(&d, 6 + 8, 0));
+        assert_eq!(r.cursor().col, 3);
+        // Combining marks render with their base character.
+        let d = diff(vec![row(Ctx, Some(1), Some(1), "e\u{301}x")]);
+        let r = reader(&d, 40);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 12));
+        r.draw(buf.area, &d, &[], &Palette::from(None), false, &mut buf);
+        assert!(buf.content.iter().any(|c| c.symbol() == "e\u{301}"));
     }
 
     #[test]

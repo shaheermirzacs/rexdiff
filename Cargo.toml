@@ -17,6 +17,7 @@ regex = "1"
 serde_json = "1.0.154"
 similar = "3.2.1"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+unicode-segmentation = "1"
 unicode-width = "0.2.3"
 
 [dev-dependencies]
