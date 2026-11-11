@@ -1,6 +1,7 @@
 //! Wraps diff lines to the pane width.
 
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::git::{DRow, RowKind};
 
@@ -9,6 +10,14 @@ use crate::git::{DRow, RowKind};
 pub struct Wrapped {
     pub starts: Vec<usize>,
     pub indent: usize,
+}
+
+/// Grapheme clusters of `text`, with their length in chars and width in
+/// cells. Wrapping, painting, panning, and clicks all measure with this, so
+/// combining marks and joined emoji take the cells the terminal gives them.
+pub fn clusters(text: &str) -> impl Iterator<Item = (&str, usize, usize)> {
+    text.graphemes(true)
+        .map(|g| (g, g.chars().count(), g.width()))
 }
 
 /// Breaks after a space when it can; a word longer than the line is cut
@@ -32,8 +41,7 @@ pub fn wrap_row(row: &DRow, width: usize) -> Wrapped {
     let mut col = 0; // column in the current visual line
     let mut i = 0; // char index
     let mut brk: Option<(usize, usize)> = None; // (index, column) right after the last space
-    for c in row.segs.iter().flat_map(|s| s.text.chars()) {
-        let w = c.width().unwrap_or(0);
+    for (g, n, w) in row.segs.iter().flat_map(|s| clusters(&s.text)) {
         if col + w > width && col > 0 {
             let line_start = *starts.last().expect("starts is never empty");
             let (at, at_col) = match brk {
@@ -45,8 +53,8 @@ pub fn wrap_row(row: &DRow, width: usize) -> Wrapped {
             brk = None;
         }
         col += w;
-        i += 1;
-        if c == ' ' && i > leading {
+        i += n;
+        if g == " " && i > leading {
             brk = Some((i, col));
         }
     }

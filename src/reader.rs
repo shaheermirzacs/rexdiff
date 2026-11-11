@@ -10,14 +10,13 @@ use std::hash::{Hash, Hasher};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::annotations::{self, Note, Position, Selection};
 use crate::git::{FileDiff, RowKind};
 use crate::navigation::{self, Hit, Search};
 use crate::theme::Palette;
-use crate::wrap::{WrapCache, Wrapped, wrap_row};
+use crate::wrap::{WrapCache, Wrapped, clusters, wrap_row};
 
 /// Narrowest text column of each split pane; below it the reader stacks.
 const MIN_SPLIT_TEXT: u16 = 16;
@@ -531,6 +530,17 @@ impl Reader {
         self.doc.texts.get(row).map_or(0, |t| t.chars().count())
     }
 
+    /// Char offsets where the grapheme clusters of `row` start.
+    fn cluster_starts(&self, row: usize) -> Vec<usize> {
+        let mut at = 0;
+        clusters(&self.doc.texts[row])
+            .map(|(_, n, _)| {
+                at += n;
+                at - n
+            })
+            .collect()
+    }
+
     fn clamped(&self) -> Position {
         Position {
             row: self.cursor.row,
@@ -758,11 +768,14 @@ impl Reader {
     /// Split view doesn't wrap: pans sideways to keep the cursor's column visible.
     fn pan_to_cursor(&mut self) {
         if self.split_active() {
-            let text = &self.doc.texts[self.cursor.row];
-            let x: usize = text
-                .chars()
-                .take(self.clamped().col)
-                .map(|c| c.width().unwrap_or(0))
+            let col = self.clamped().col;
+            let mut at = 0;
+            let x: usize = clusters(&self.doc.texts[self.cursor.row])
+                .take_while(|&(_, n, _)| {
+                    at += n;
+                    at <= col
+                })
+                .map(|(_, _, w)| w)
                 .sum();
             let w = self.geom().text_w as usize;
             if x < self.hscroll {
@@ -869,8 +882,21 @@ impl Reader {
         let h = self.height();
         let at = self.clamped();
         match motion {
-            Motion::Left => self.cursor.col = at.col.saturating_sub(1),
-            Motion::Right => self.cursor.col = (at.col + 1).min(self.len(at.row).saturating_sub(1)),
+            // Whole grapheme clusters, so `h` / `l` never stop inside one.
+            Motion::Left => {
+                let starts = self.cluster_starts(at.row);
+                self.cursor.col = starts
+                    .iter()
+                    .rev()
+                    .find(|&&s| s < at.col)
+                    .copied()
+                    .unwrap_or(0);
+            }
+            Motion::Right => {
+                let starts = self.cluster_starts(at.row);
+                let next = starts.iter().find(|&&s| s > at.col).or(starts.last());
+                self.cursor.col = next.copied().unwrap_or(0);
+            }
             Motion::Up => self.step(-1),
             Motion::Down => self.step(1),
             Motion::WordNext | Motion::WordBack | Motion::WordEnd => {
@@ -888,7 +914,9 @@ impl Reader {
                     .take_while(|c| c.is_whitespace())
                     .count();
             }
-            Motion::LineEnd => self.cursor.col = self.len(at.row).saturating_sub(1),
+            Motion::LineEnd => {
+                self.cursor.col = self.cluster_starts(at.row).last().copied().unwrap_or(0)
+            }
             Motion::Top | Motion::Bottom => {
                 let rows = self.side_rows();
                 let row = if motion == Motion::Top {
@@ -1249,14 +1277,19 @@ impl Reader {
         } else {
             cell += self.hscroll;
         }
-        for c in self.doc.texts[row].chars().skip(col) {
-            let w = c.width().unwrap_or(0);
-            if cell < w || col + 1 >= end {
+        let mut at = 0;
+        for (_, n, w) in clusters(&self.doc.texts[row]) {
+            if at < col {
+                at += n;
+                continue;
+            }
+            if cell < w || at + n >= end {
                 break;
             }
             cell -= w;
-            col += 1;
+            at += n;
         }
+        let col = at;
         Some((
             Position {
                 row,
@@ -1575,13 +1608,11 @@ impl Reader {
             }
             // Whole grapheme clusters, so combining marks and joined emoji
             // render as in the file; columns still count characters.
-            for g in seg.text.graphemes(true) {
-                let n = g.chars().count();
+            for (g, n, w) in clusters(&seg.text) {
                 if col >= to {
                     break 'segments;
                 }
                 if col >= from {
-                    let w = g.width();
                     if skip > 0 {
                         skip = skip.saturating_sub(w);
                         col += n;
@@ -1982,12 +2013,35 @@ mod tests {
         let mut r = reader(&d, 17);
         assert!(r.click(&d, 6 + 8, 0));
         assert_eq!(r.cursor().col, 3);
-        // Combining marks render with their base character.
-        let d = diff(vec![row(Ctx, Some(1), Some(1), "e\u{301}x")]);
-        let r = reader(&d, 40);
+        // Combining marks and joined emoji are one cell group each: painted
+        // whole, stepped over by h/l, clicked and wrapped by their width.
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let d = diff(vec![row(
+            Ctx,
+            Some(1),
+            Some(1),
+            &format!("e\u{301}{family}x"),
+        )]);
+        let mut r = reader(&d, 40);
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 12));
         r.draw(buf.area, &d, &[], &Palette::from(None), false, &mut buf);
-        assert!(buf.content.iter().any(|c| c.symbol() == "e\u{301}"));
+        assert_eq!(buf[(6, 0)].symbol(), "e\u{301}");
+        assert_eq!(buf[(7, 0)].symbol(), family);
+        assert_eq!(buf[(9, 0)].symbol(), "x");
+        r.motion(&d, Motion::Right);
+        assert_eq!(r.cursor().col, 2);
+        r.motion(&d, Motion::Right);
+        assert_eq!(r.cursor().col, 7);
+        r.motion(&d, Motion::Left);
+        assert_eq!(r.cursor().col, 2);
+        assert!(r.click(&d, 9, 0));
+        assert_eq!(r.cursor().col, 7);
+        let emoji = row(Ctx, Some(1), Some(1), &family.repeat(10));
+        assert_eq!(
+            wrap_row(&emoji, 10).starts,
+            vec![0, 25],
+            "five 2-cell emoji per line"
+        );
     }
 
     #[test]
