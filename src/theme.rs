@@ -38,7 +38,11 @@ pub fn query(timeout: Duration) -> Option<Detected> {
         if left.is_zero() {
             break;
         }
-        let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let n = unsafe { libc::poll(&mut pfd, 1, left.as_millis().max(1) as i32) };
         if n <= 0 {
             break;
@@ -72,8 +76,12 @@ fn parse(s: &str) -> Detected {
     for part in s.split("\x1b]").skip(1) {
         let end = part.find(['\x07', '\x1b']).unwrap_or(part.len());
         let body = &part[..end];
-        let Some((head, color)) = body.split_once(";rgb:") else { continue };
-        let Some(rgb) = parse_rgb(color) else { continue };
+        let Some((head, color)) = body.split_once(";rgb:") else {
+            continue;
+        };
+        let Some(rgb) = parse_rgb(color) else {
+            continue;
+        };
         match head {
             "10" => d.fg = Some(rgb),
             "11" => d.bg = Some(rgb),
@@ -141,10 +149,18 @@ fn rgb(c: Rgb) -> Color {
 fn contrast_text((r, g, b): Rgb) -> Color {
     let linear = |c: u8| {
         let c = c as f32 / 255.0;
-        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
     };
     let luminance = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
-    if luminance > 0.179 { Color::Rgb(0, 0, 0) } else { Color::Rgb(255, 255, 255) }
+    if luminance > 0.179 {
+        Color::Rgb(0, 0, 0)
+    } else {
+        Color::Rgb(255, 255, 255)
+    }
 }
 
 impl Palette {
@@ -152,19 +168,47 @@ impl Palette {
         let d = d.unwrap_or_default();
         let dark = d.bg.map(|b| luma(b) < 0.5).unwrap_or(true);
         let (bg, fg) = match dark {
-            true => (d.bg.unwrap_or((24, 24, 27)), d.fg.unwrap_or((228, 228, 231))),
-            false => (d.bg.unwrap_or((255, 255, 255)), d.fg.unwrap_or((36, 41, 47))),
+            true => (
+                d.bg.unwrap_or((24, 24, 27)),
+                d.fg.unwrap_or((228, 228, 231)),
+            ),
+            false => (
+                d.bg.unwrap_or((255, 255, 255)),
+                d.fg.unwrap_or((36, 41, 47)),
+            ),
         };
-        let pick = |i: usize, dark_c: Rgb, light_c: Rgb| d.ansi[i].unwrap_or(if dark { dark_c } else { light_c });
+        let pick = |i: usize, dark_c: Rgb, light_c: Rgb| {
+            d.ansi[i].unwrap_or(if dark { dark_c } else { light_c })
+        };
         let red = pick(1, (248, 81, 73), (207, 34, 46));
         let green = pick(2, (63, 185, 80), (26, 127, 55));
         let yellow = pick(3, (210, 153, 34), (154, 103, 0));
         let blue = pick(4, (88, 166, 255), (9, 105, 218));
-        let fallback = [bg, red, green, yellow, blue, (188,140,255), (57,197,207), fg,
-            mix(fg,bg,0.62), red, green, yellow, blue, (188,140,255), (57,197,207), fg];
+        let fallback = [
+            bg,
+            red,
+            green,
+            yellow,
+            blue,
+            (188, 140, 255),
+            (57, 197, 207),
+            fg,
+            mix(fg, bg, 0.62),
+            red,
+            green,
+            yellow,
+            blue,
+            (188, 140, 255),
+            (57, 197, 207),
+            fg,
+        ];
 
         // Dark backgrounds need a bit more color for the tint to show.
-        let (row, gutter, emph) = if dark { (0.17, 0.27, 0.40) } else { (0.11, 0.20, 0.30) };
+        let (row, gutter, emph) = if dark {
+            (0.17, 0.27, 0.40)
+        } else {
+            (0.11, 0.20, 0.30)
+        };
         Self {
             ansi: std::array::from_fn(|i| d.ansi[i].unwrap_or(fallback[i])),
             fg: Color::Reset,
@@ -177,9 +221,13 @@ impl Palette {
             red: rgb(red),
             yellow: rgb(yellow),
             blue: rgb(blue),
-            annotation: rgb(pick(5, (188,140,255), (111,66,193))),
-            annotation_fg: contrast_text(pick(5, (188,140,255), (111,66,193))),
-            annotation_bg: rgb(mix(bg,pick(5, (188,140,255), (111,66,193)),if dark {0.22} else {0.12})),
+            annotation: rgb(pick(5, (188, 140, 255), (111, 66, 193))),
+            annotation_fg: contrast_text(pick(5, (188, 140, 255), (111, 66, 193))),
+            annotation_bg: rgb(mix(
+                bg,
+                pick(5, (188, 140, 255), (111, 66, 193)),
+                if dark { 0.22 } else { 0.12 },
+            )),
             selection_fg: contrast_text(blue),
             search_fg: contrast_text(yellow),
             add_bg: rgb(mix(bg, green, row)),

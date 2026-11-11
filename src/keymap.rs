@@ -82,8 +82,23 @@ impl Action {
         use Action::*;
         matches!(
             self,
-            PrevHunk | NextHunk | PrevFile | NextFile | Up | Down | PageUp | PageDown | HalfUp | HalfDown
-                | Left | Right | ScrollUp | ScrollDown | Move(_) | SearchNext | SearchPrev
+            PrevHunk
+                | NextHunk
+                | PrevFile
+                | NextFile
+                | Up
+                | Down
+                | PageUp
+                | PageDown
+                | HalfUp
+                | HalfDown
+                | Left
+                | Right
+                | ScrollUp
+                | ScrollDown
+                | Move(_)
+                | SearchNext
+                | SearchPrev
         )
     }
 }
@@ -176,7 +191,12 @@ pub struct Binding {
 }
 
 const fn b(scope: Scope, key: Key, action: Action, help: &'static str) -> Binding {
-    Binding { scope, key, action, help }
+    Binding {
+        scope,
+        key,
+        action,
+        help,
+    }
 }
 const fn ch(c: char) -> Key {
     Key::Press(KeyCode::Char(c), KeyModifiers::NONE)
@@ -206,20 +226,45 @@ pub static BINDINGS: &[Binding] = &[
     b(Changes, ch('k'), A::Up, "Up"),
     b(Changes, code(KeyCode::Up), A::Up, "Up"),
     b(Changes, ch('g'), A::Top, "Top of the focused list or file"),
-    b(Changes, code(KeyCode::Home), A::Top, "Top of the focused list or file"),
-    b(Changes, ch('G'), A::Bottom, "Bottom of the focused list or file (NG: source line N)"),
-    b(Changes, code(KeyCode::End), A::Bottom, "Bottom of the focused list or file (NG: source line N)"),
+    b(
+        Changes,
+        code(KeyCode::Home),
+        A::Top,
+        "Top of the focused list or file",
+    ),
+    b(
+        Changes,
+        ch('G'),
+        A::Bottom,
+        "Bottom of the focused list or file (NG: source line N)",
+    ),
+    b(
+        Changes,
+        code(KeyCode::End),
+        A::Bottom,
+        "Bottom of the focused list or file (NG: source line N)",
+    ),
     b(Changes, ctrl('d'), A::HalfDown, "Half page down"),
     b(Changes, ctrl('u'), A::HalfUp, "Half page up"),
     b(Changes, ctrl('f'), A::PageDown, "Page down"),
     b(Changes, code(KeyCode::PageDown), A::PageDown, "Page down"),
     b(Changes, ctrl('b'), A::PageUp, "Page up"),
     b(Changes, code(KeyCode::PageUp), A::PageUp, "Page up"),
-    b(Changes, ch('a'), A::Annotate, "Annotate line or selection (file in the tree)"),
+    b(
+        Changes,
+        ch('a'),
+        A::Annotate,
+        "Annotate line or selection (file in the tree)",
+    ),
     b(Changes, ch('A'), A::AnnotateFile, "Annotate the whole file"),
     b(Changes, ch('c'), A::Commit, "Commit staged changes"),
     b(Changes, ch('s'), A::Send, "Send notes to an agent"),
-    b(Changes, ch('L'), A::Notes, "Show / focus notes; again hides"),
+    b(
+        Changes,
+        ch('L'),
+        A::Notes,
+        "Show / focus notes; again hides",
+    ),
     b(Changes, ch('x'), A::Context, "Whole-file context"),
     b(Changes, ch('S'), A::Layout, "Split / stacked layout"),
     b(Changes, ctrl('p'), A::Picker, "Project file picker"),
@@ -227,25 +272,75 @@ pub static BINDINGS: &[Binding] = &[
     b(Changes, ch(']'), A::NextHunk, "Next hunk"),
     b(Changes, ch('{'), A::PrevFile, "Previous file"),
     b(Changes, ch('}'), A::NextFile, "Next file"),
-    b(Changes, code(KeyCode::Tab), A::FocusNext, "Next pane (opens the file in the tree)"),
-    b(Changes, code(KeyCode::BackTab), A::FocusPrev, "Previous pane"),
+    b(
+        Changes,
+        code(KeyCode::Tab),
+        A::FocusNext,
+        "Next pane (opens the file in the tree)",
+    ),
+    b(
+        Changes,
+        code(KeyCode::BackTab),
+        A::FocusPrev,
+        "Previous pane",
+    ),
     b(Changes, ch(' '), A::Leader, "Leader prefix"),
-    b(Changes, Key::Leader('e'), A::Sidebar, "Hide / show the file tree"),
-    b(Changes, Key::Leader('h'), A::OldSide, "Old side of a split diff"),
-    b(Changes, Key::Leader('l'), A::NewSide, "New side of a split diff"),
+    b(
+        Changes,
+        Key::Leader('e'),
+        A::Sidebar,
+        "Hide / show the file tree",
+    ),
+    b(
+        Changes,
+        Key::Leader('h'),
+        A::OldSide,
+        "Old side of a split diff",
+    ),
+    b(
+        Changes,
+        Key::Leader('l'),
+        A::NewSide,
+        "New side of a split diff",
+    ),
     b(Changes, code(KeyCode::Esc), A::Back, "Back"),
     // The file tree.
     b(Tree, ch('h'), A::Left, "Collapse / parent folder"),
-    b(Tree, code(KeyCode::Left), A::Left, "Collapse / parent folder"),
+    b(
+        Tree,
+        code(KeyCode::Left),
+        A::Left,
+        "Collapse / parent folder",
+    ),
     b(Tree, ch('l'), A::Right, "Expand / enter folder"),
-    b(Tree, code(KeyCode::Right), A::Right, "Expand / enter folder"),
-    b(Tree, code(KeyCode::Enter), A::Activate, "Open file / fold folder"),
+    b(
+        Tree,
+        code(KeyCode::Right),
+        A::Right,
+        "Expand / enter folder",
+    ),
+    b(
+        Tree,
+        code(KeyCode::Enter),
+        A::Activate,
+        "Open file / fold folder",
+    ),
     b(Tree, ch('z'), A::Stage, "Stage / unstage file; fold folder"),
     b(Tree, ch('d'), A::Discard, "Discard changes (y confirms)"),
     b(Tree, ch('J'), A::ScrollDown, "Scroll the file down"),
     b(Tree, ch('K'), A::ScrollUp, "Scroll the file up"),
-    b(Tree, ch('H'), A::History, "Commits of the checked-out branch"),
-    b(Tree, ch('D'), A::BranchDiff, "Branch diff from the merge base"),
+    b(
+        Tree,
+        ch('H'),
+        A::History,
+        "Commits of the checked-out branch",
+    ),
+    b(
+        Tree,
+        ch('D'),
+        A::BranchDiff,
+        "Branch diff from the merge base",
+    ),
     b(Tree, ch('B'), A::Base, "Comparison base"),
     b(Tree, ch('t'), A::AllFiles, "Changed / all project files"),
     b(Tree, ch('r'), A::Reload, "Reload the repository"),
@@ -256,21 +351,66 @@ pub static BINDINGS: &[Binding] = &[
     b(Reader, ch('h'), A::Move(Motion::Left), "Left"),
     b(Reader, code(KeyCode::Left), A::Move(Motion::Left), "Left"),
     b(Reader, ch('l'), A::Move(Motion::Right), "Right"),
-    b(Reader, code(KeyCode::Right), A::Move(Motion::Right), "Right"),
+    b(
+        Reader,
+        code(KeyCode::Right),
+        A::Move(Motion::Right),
+        "Right",
+    ),
     b(Reader, ch('w'), A::Move(Motion::WordNext), "Next word"),
     b(Reader, ch('b'), A::Move(Motion::WordBack), "Previous word"),
     b(Reader, ch('e'), A::Move(Motion::WordEnd), "End of word"),
     b(Reader, ch('0'), A::Move(Motion::LineStart), "Line start"),
-    b(Reader, ch('^'), A::Move(Motion::FirstNonBlank), "First non-blank"),
+    b(
+        Reader,
+        ch('^'),
+        A::Move(Motion::FirstNonBlank),
+        "First non-blank",
+    ),
     b(Reader, ch('$'), A::Move(Motion::LineEnd), "Line end"),
-    b(Reader, ctrl('e'), A::Move(Motion::ScrollDown), "Scroll down a line"),
-    b(Reader, ctrl('y'), A::Move(Motion::ScrollUp), "Scroll up a line"),
+    b(
+        Reader,
+        ctrl('e'),
+        A::Move(Motion::ScrollDown),
+        "Scroll down a line",
+    ),
+    b(
+        Reader,
+        ctrl('y'),
+        A::Move(Motion::ScrollUp),
+        "Scroll up a line",
+    ),
     b(Reader, ch('z'), A::MotionPrefix, "Scroll prefix"),
-    b(Reader, Key::Z('t'), A::Move(Motion::PlaceTop), "Cursor line to the top"),
-    b(Reader, Key::Z('z'), A::Move(Motion::PlaceCenter), "Cursor line to the middle"),
-    b(Reader, Key::Z('b'), A::Move(Motion::PlaceBottom), "Cursor line to the bottom"),
-    b(Reader, Key::Z('h'), A::Move(Motion::ScrollLeft), "Scroll left (split)"),
-    b(Reader, Key::Z('l'), A::Move(Motion::ScrollRight), "Scroll right (split)"),
+    b(
+        Reader,
+        Key::Z('t'),
+        A::Move(Motion::PlaceTop),
+        "Cursor line to the top",
+    ),
+    b(
+        Reader,
+        Key::Z('z'),
+        A::Move(Motion::PlaceCenter),
+        "Cursor line to the middle",
+    ),
+    b(
+        Reader,
+        Key::Z('b'),
+        A::Move(Motion::PlaceBottom),
+        "Cursor line to the bottom",
+    ),
+    b(
+        Reader,
+        Key::Z('h'),
+        A::Move(Motion::ScrollLeft),
+        "Scroll left (split)",
+    ),
+    b(
+        Reader,
+        Key::Z('l'),
+        A::Move(Motion::ScrollRight),
+        "Scroll right (split)",
+    ),
     b(Reader, ch('v'), A::VisualChar, "Select characters"),
     b(Reader, ch('V'), A::VisualLine, "Select lines"),
     b(Reader, ch('/'), A::Search, "Regex search (smart case)"),
@@ -285,7 +425,12 @@ pub static BINDINGS: &[Binding] = &[
     b(Reader, ch('7'), A::Count(7), "Count prefix"),
     b(Reader, ch('8'), A::Count(8), "Count prefix"),
     b(Reader, ch('9'), A::Count(9), "Count prefix"),
-    b(Reader, code(KeyCode::Esc), A::Back, "Clear selection, then search, then back"),
+    b(
+        Reader,
+        code(KeyCode::Esc),
+        A::Back,
+        "Clear selection, then search, then back",
+    ),
     // The notes list.
     b(Notes, code(KeyCode::Enter), A::EditNote, "Edit the note"),
     b(Notes, ch('d'), A::DeleteNote, "Delete the note"),
@@ -300,13 +445,33 @@ pub static BINDINGS: &[Binding] = &[
     b(Branches, code(KeyCode::Home), A::Top, "First branch"),
     b(Branches, ch('G'), A::Bottom, "Last branch"),
     b(Branches, code(KeyCode::End), A::Bottom, "Last branch"),
-    b(Branches, ch(' '), A::Checkout, "Check out (remote: tracking branch)"),
-    b(Branches, code(KeyCode::Enter), A::OpenHistory, "Commit history"),
+    b(
+        Branches,
+        ch(' '),
+        A::Checkout,
+        "Check out (remote: tracking branch)",
+    ),
+    b(
+        Branches,
+        code(KeyCode::Enter),
+        A::OpenHistory,
+        "Commit history",
+    ),
     b(Branches, ch('p'), A::Pull, "Pull"),
     b(Branches, ch('P'), A::Push, "Push"),
     b(Branches, ch('m'), A::Merge, "Merge into the current branch"),
-    b(Branches, ch('d'), A::DeleteBranch, "Delete (y/Enter confirms)"),
-    b(Branches, ch('D'), A::ForceDeleteBranch, "Force-delete (y/Enter confirms)"),
+    b(
+        Branches,
+        ch('d'),
+        A::DeleteBranch,
+        "Delete (y/Enter confirms)",
+    ),
+    b(
+        Branches,
+        ch('D'),
+        A::ForceDeleteBranch,
+        "Force-delete (y/Enter confirms)",
+    ),
     b(Branches, ch('f'), A::Fetch, "Fetch all remotes"),
     b(Branches, ch('r'), A::Reload, "Reload branches"),
     b(Branches, code(KeyCode::Esc), A::Back, "Back to Changes"),
@@ -324,17 +489,30 @@ pub static BINDINGS: &[Binding] = &[
     b(History, ch('G'), A::Bottom, "Oldest commit"),
     b(History, code(KeyCode::End), A::Bottom, "Oldest commit"),
     b(History, code(KeyCode::Enter), A::OpenCommit, "Commit diff"),
-    b(History, ch('D'), A::BranchDiff, "Branch diff from the merge base"),
+    b(
+        History,
+        ch('D'),
+        A::BranchDiff,
+        "Branch diff from the merge base",
+    ),
     b(History, ch('B'), A::Base, "Comparison base"),
     b(History, code(KeyCode::Esc), A::Back, "Back to Branches"),
-    b(History, code(KeyCode::Backspace), A::Back, "Back to Branches"),
+    b(
+        History,
+        code(KeyCode::Backspace),
+        A::Back,
+        "Back to Branches",
+    ),
     b(History, ch('h'), A::Back, "Back to Branches"),
     b(History, code(KeyCode::Left), A::Back, "Back to Branches"),
 ];
 
 /// The binding a key resolves to in `scope`.
 pub fn lookup(scope: Scope, key: Key) -> Option<&'static Binding> {
-    scope.layers().into_iter().find_map(|layer| BINDINGS.iter().find(|b| b.scope == layer && b.key == key))
+    scope
+        .layers()
+        .into_iter()
+        .find_map(|layer| BINDINGS.iter().find(|b| b.scope == layer && b.key == key))
 }
 
 /// The keys of `scope` with what they do, grouped by action, without keys
@@ -351,7 +529,10 @@ pub fn help(scope: Scope) -> Vec<(Vec<Key>, &'static str, Action)> {
             if lookup(scope, binding.key).is_none_or(|winner| !std::ptr::eq(winner, binding)) {
                 continue;
             }
-            match out.iter_mut().find(|(_, help, action)| *help == binding.help && *action == binding.action) {
+            match out
+                .iter_mut()
+                .find(|(_, help, action)| *help == binding.help && *action == binding.action)
+            {
                 Some((keys, _, _)) => keys.push(binding.key),
                 None => out.push((vec![binding.key], binding.help, binding.action)),
             }
@@ -391,12 +572,17 @@ pub const COMMANDS: &[(&str, Option<Action>)] = &[
 /// Parses what follows `:`.
 pub fn parse(input: &str) -> Result<Command, String> {
     let input = input.trim();
-    let (name, argument) = input.split_once(char::is_whitespace).map_or((input, ""), |(n, a)| (n, a.trim()));
+    let (name, argument) = input
+        .split_once(char::is_whitespace)
+        .map_or((input, ""), |(n, a)| (n, a.trim()));
     if let Ok(line) = name.parse::<u32>() {
         return Ok(Command::Source(line));
     }
     match name {
-        "Source" => argument.parse().map(Command::Source).map_err(|_| "Usage: :Source N".into()),
+        "Source" => argument
+            .parse()
+            .map(Command::Source)
+            .map_err(|_| "Usage: :Source N".into()),
         "e" | "edit" if !argument.is_empty() => Ok(Command::Edit(argument.into())),
         "e" | "edit" => Err("Usage: :e PATH".into()),
         // An empty base means the automatic default.
@@ -410,5 +596,9 @@ pub fn parse(input: &str) -> Result<Command, String> {
 
 /// Command names starting with `prefix`, in table order.
 pub fn completions(prefix: &str) -> Vec<&'static str> {
-    COMMANDS.iter().map(|(name, _)| *name).filter(|name| name.starts_with(prefix)).collect()
+    COMMANDS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| name.starts_with(prefix))
+        .collect()
 }

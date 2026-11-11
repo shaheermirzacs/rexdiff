@@ -18,14 +18,24 @@ pub struct Note {
 }
 impl Note {
     pub fn range_label(&self) -> String {
-        let old_side = self.old_side && self.locations.iter().all(|(old,_)| old.is_some());
-        let old = ranges(self.locations.iter().filter_map(|&(old,new)| if new.is_none() || old_side { old } else { None }));
-        let new = ranges(self.locations.iter().filter_map(|&(old,new)| if old.is_none() || !old_side { new } else { None }));
+        let old_side = self.old_side && self.locations.iter().all(|(old, _)| old.is_some());
+        let old = ranges(
+            self.locations
+                .iter()
+                .filter_map(|&(old, new)| if new.is_none() || old_side { old } else { None }),
+        );
+        let new = ranges(self.locations.iter().filter_map(|&(old, new)| {
+            if old.is_none() || !old_side {
+                new
+            } else {
+                None
+            }
+        }));
         match (old.is_empty(), new.is_empty()) {
-            (false,false) => format!("old {old} · new {new}"),
-            (false,true) => format!("old {old}"),
-            (true,false) => format!("new {new}"),
-            (true,true) => "whole file".into(),
+            (false, false) => format!("old {old} · new {new}"),
+            (false, true) => format!("old {old}"),
+            (true, false) => format!("new {new}"),
+            (true, true) => "whole file".into(),
         }
     }
 
@@ -34,7 +44,7 @@ impl Note {
     }
 }
 
-fn ranges(lines: impl Iterator<Item=u32>) -> String {
+fn ranges(lines: impl Iterator<Item = u32>) -> String {
     let mut lines: Vec<_> = lines.collect();
     lines.sort_unstable();
     lines.dedup();
@@ -44,8 +54,15 @@ fn ranges(lines: impl Iterator<Item=u32>) -> String {
         let start = lines[i];
         let mut end = start;
         i += 1;
-        while i < lines.len() && end.checked_add(1) == Some(lines[i]) { end = lines[i]; i += 1; }
-        spans.push(if start == end { start.to_string() } else { format!("{start}–{end}") });
+        while i < lines.len() && end.checked_add(1) == Some(lines[i]) {
+            end = lines[i];
+            i += 1;
+        }
+        spans.push(if start == end {
+            start.to_string()
+        } else {
+            format!("{start}–{end}")
+        });
     }
     spans.join(", ")
 }
@@ -82,15 +99,17 @@ pub struct Selection {
 impl Selection {
     pub fn contains(&self, cursor: Position, pos: Position) -> bool {
         let (lo, hi) = (self.anchor.min(cursor), self.anchor.max(cursor));
-        if self.lines { (lo.row..=hi.row).contains(&pos.row) } else { (lo..=hi).contains(&pos) }
+        if self.lines {
+            (lo.row..=hi.row).contains(&pos.row)
+        } else {
+            (lo..=hi).contains(&pos)
+        }
     }
 }
-
 
 pub fn text(row: &DRow) -> String {
     row.segs.iter().map(|s| s.text.as_str()).collect()
 }
-
 
 pub struct Agent {
     pub id: String,
@@ -98,7 +117,11 @@ pub struct Agent {
 }
 
 fn call(args: &[&str]) -> Result<Value, String> {
-    let out = crate::rex().args(["--timeout", "3s"]).args(args).output().map_err(|e| e.to_string())?;
+    let out = crate::rex()
+        .args(["--timeout", "3s"])
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -108,14 +131,19 @@ fn call(args: &[&str]) -> Result<Value, String> {
 pub fn agents() -> Result<Vec<Agent>, String> {
     let ctx = crate::rex_ctx()?;
     let data = call(&["block", "ls", "-s", &ctx.session, "--json"])?;
-    let blocks = data["blocks"].as_array().ok_or("Rex did not return blocks")?;
+    let blocks = data["blocks"]
+        .as_array()
+        .ok_or("Rex did not return blocks")?;
     let window = blocks
         .iter()
         .find(|b| b["block_id"] == ctx.block)
         .map(|b| &b["window_id"])
         .ok_or("This pane is no longer in the Rex session")?;
     let mut agents = Vec::new();
-    for block in blocks.iter().filter(|b| &b["window_id"] == window && b["block_id"] != ctx.block) {
+    for block in blocks
+        .iter()
+        .filter(|b| &b["window_id"] == window && b["block_id"] != ctx.block)
+    {
         let Some(id) = block["block_id"].as_str() else {
             continue;
         };
@@ -131,12 +159,20 @@ pub fn agents() -> Result<Vec<Agent>, String> {
             .next()
             .unwrap_or("")
             .trim_start_matches('-');
-        let status =
-            call(&["block", "call", "-s", &ctx.session, "-b", id, "program_status"]).unwrap_or(Value::Null);
+        let status = call(&[
+            "block",
+            "call",
+            "-s",
+            &ctx.session,
+            "-b",
+            id,
+            "program_status",
+        ])
+        .unwrap_or(Value::Null);
         let root = status["records"].as_array().and_then(|records| {
-            records
-                .iter()
-                .find(|r| r["id"].is_null() && (r["owner"].is_null() || r["owner"]["pid"] == fg["pid"]))
+            records.iter().find(|r| {
+                r["id"].is_null() && (r["owner"].is_null() || r["owner"]["pid"] == fg["pid"])
+            })
         });
         let known = [
             "claude",
@@ -153,10 +189,18 @@ pub fn agents() -> Result<Vec<Agent>, String> {
             "vibe",
         ];
         if !fg.is_null() && (known.contains(&name) || root.is_some()) {
-            let kind =
-                root.and_then(|r| r["effective_app"].as_str()).filter(|s| !s.is_empty()).unwrap_or(name);
-            let label = block["label"].as_str().filter(|s| !s.is_empty() && *s != "shell").unwrap_or(kind);
-            agents.push(Agent { id: id.into(), label: format!("{label} · {kind} · {id}") });
+            let kind = root
+                .and_then(|r| r["effective_app"].as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(name);
+            let label = block["label"]
+                .as_str()
+                .filter(|s| !s.is_empty() && *s != "shell")
+                .unwrap_or(kind);
+            agents.push(Agent {
+                id: id.into(),
+                label: format!("{label} · {kind} · {id}"),
+            });
         }
     }
     Ok(agents)
@@ -173,10 +217,23 @@ pub fn send(agent: &Agent, notes: &[String]) -> Result<(), String> {
         notes.join("\n\n").replace('\x1b', "")
     );
     let out = crate::rex()
-        .args(["--timeout", "3s", "send", "-s", &ctx.session, "-b", &agent.id, &payload])
+        .args([
+            "--timeout",
+            "3s",
+            "send",
+            "-s",
+            &ctx.session,
+            "-b",
+            &agent.id,
+            &payload,
+        ])
         .output()
         .map_err(|e| e.to_string())?;
-    if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().into()) }
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().into())
+    }
 }
 
 #[cfg(test)]
@@ -185,19 +242,34 @@ mod tests {
 
     #[test]
     fn ranges_distinguish_diff_sides_and_gaps() {
-        let mut note=Note {id:1,path:"x.rs".into(),line:Some(44),old_side:true,
-            locations:vec![(Some(44),None),(Some(45),None),(Some(46),None),(Some(47),None)],
-            revision:0,target:String::new(),preview:Vec::new(),historical:false,comment:"why?".into()};
-        assert_eq!(note.range_label(),"old 44–47");
-        note.locations.push((Some(48),Some(46)));
-        assert_eq!(note.range_label(),"old 44–48");
+        let mut note = Note {
+            id: 1,
+            path: "x.rs".into(),
+            line: Some(44),
+            old_side: true,
+            locations: vec![
+                (Some(44), None),
+                (Some(45), None),
+                (Some(46), None),
+                (Some(47), None),
+            ],
+            revision: 0,
+            target: String::new(),
+            preview: Vec::new(),
+            historical: false,
+            comment: "why?".into(),
+        };
+        assert_eq!(note.range_label(), "old 44–47");
+        note.locations.push((Some(48), Some(46)));
+        assert_eq!(note.range_label(), "old 44–48");
         note.locations.pop();
-        note.locations.extend([(None,Some(45)),(Some(49),Some(46)),(None,Some(49))]);
-        assert_eq!(note.range_label(),"old 44–47 · new 45–46, 49");
-        note.locations=vec![(None,Some(45))];
-        assert_eq!(note.range_label(),"new 45");
+        note.locations
+            .extend([(None, Some(45)), (Some(49), Some(46)), (None, Some(49))]);
+        assert_eq!(note.range_label(), "old 44–47 · new 45–46, 49");
+        note.locations = vec![(None, Some(45))];
+        assert_eq!(note.range_label(), "new 45");
         note.locations.clear();
-        assert_eq!(note.range_label(),"whole file");
-        assert_eq!(ranges([3,2,2,1,7].into_iter()),"1–3, 7");
+        assert_eq!(note.range_label(), "whole file");
+        assert_eq!(ranges([3, 2, 2, 1, 7].into_iter()), "1–3, 7");
     }
 }

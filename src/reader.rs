@@ -117,11 +117,15 @@ impl Doc {
                 }
             } else {
                 split_of[i] = split.len();
-                split.push(SplitRow { old: Some(i), new: Some(i) });
+                split.push(SplitRow {
+                    old: Some(i),
+                    new: Some(i),
+                });
                 i += 1;
             }
         }
-        let rows = |keep: fn(RowKind) -> bool| (0..n).filter(|&r| keep(keys[r].0)).collect::<Vec<_>>();
+        let rows =
+            |keep: fn(RowKind) -> bool| (0..n).filter(|&r| keep(keys[r].0)).collect::<Vec<_>>();
         Self {
             revision,
             stacked_rows: rows(is_source),
@@ -140,14 +144,25 @@ impl Doc {
 /// whole-file mode, the start of each run of changes.
 fn targets(keys: &[RowKey], whole: bool) -> Vec<Target> {
     let mut out = Vec::new();
-    let deleted_only = |range: std::ops::Range<usize>| !range.into_iter().any(|r| keys[r].0 == RowKind::Add);
+    let deleted_only =
+        |range: std::ops::Range<usize>| !range.into_iter().any(|r| keys[r].0 == RowKind::Add);
     if !whole && keys.iter().any(|k| k.0 == RowKind::Hunk) {
         let mut start = 0;
         while start < keys.len() {
-            let end = (start + 1..keys.len()).find(|&r| keys[r].0 == RowKind::Hunk).unwrap_or(keys.len());
+            let end = (start + 1..keys.len())
+                .find(|&r| keys[r].0 == RowKind::Hunk)
+                .unwrap_or(keys.len());
             if let Some(row) = (start..end).find(|&r| changed(keys[r].0)) {
-                let anchor = if keys[start].0 == RowKind::Hunk { start } else { row };
-                out.push(Target { row, anchor, old_side: deleted_only(start..end) });
+                let anchor = if keys[start].0 == RowKind::Hunk {
+                    start
+                } else {
+                    row
+                };
+                out.push(Target {
+                    row,
+                    anchor,
+                    old_side: deleted_only(start..end),
+                });
             }
             start = end;
         }
@@ -163,7 +178,11 @@ fn targets(keys: &[RowKey], whole: bool) -> Vec<Target> {
                 r += 1;
             }
             let anchor = start.saturating_sub(3).max(previous_end);
-            out.push(Target { row: start, anchor, old_side: deleted_only(start..r) });
+            out.push(Target {
+                row: start,
+                anchor,
+                old_side: deleted_only(start..r),
+            });
             previous_end = r;
         }
     }
@@ -206,7 +225,11 @@ fn card(comment: &str, text_width: usize, old_side: bool) -> Card {
         lines.push(part);
     }
     let widest = lines.iter().map(|l| l.width()).max().unwrap_or(0);
-    Card { width: max.min((widest + 6).max(28)), lines, old_side }
+    Card {
+        width: max.min((widest + 6).max(28)),
+        lines,
+        old_side,
+    }
 }
 
 /// Visual rows for one width: wraps, note cards, and the scroll position.
@@ -227,7 +250,9 @@ struct View {
 
 impl View {
     fn cards_height(&self, unit: usize) -> usize {
-        self.cards.get(&unit).map_or(0, |cards| cards.iter().map(Card::height).sum())
+        self.cards
+            .get(&unit)
+            .map_or(0, |cards| cards.iter().map(Card::height).sum())
     }
 }
 
@@ -248,7 +273,13 @@ impl Geom {
         let text_off = gutter_w + 2;
         // One free column on the right, so text doesn't touch the edge.
         let text_w = width.saturating_sub(text_off + 1).max(1);
-        Self { width, num_w, gutter_w, text_off, text_w }
+        Self {
+            width,
+            num_w,
+            gutter_w,
+            text_off,
+            text_w,
+        }
     }
 }
 
@@ -306,7 +337,11 @@ impl Reader {
 
     /// The side whose line numbers source jumps use.
     pub fn old_side(&self) -> bool {
-        if self.split_active() { self.old_side } else { self.kind(self.cursor.row) == Some(RowKind::Del) }
+        if self.split_active() {
+            self.old_side
+        } else {
+            self.kind(self.cursor.row) == Some(RowKind::Del)
+        }
     }
 
     pub fn resize(&mut self, area: Rect) {
@@ -325,7 +360,11 @@ impl Reader {
             let texts: Vec<String> = diff.rows.iter().map(annotations::text).collect();
             let keys: Vec<RowKey> = diff.rows.iter().map(|r| (r.kind, r.old, r.new)).collect();
             if !same_file || texts != self.doc.texts || keys != self.doc.keys {
-                let previous = if same_file { self.doc.keys.get(self.cursor.row).copied() } else { None };
+                let previous = if same_file {
+                    self.doc.keys.get(self.cursor.row).copied()
+                } else {
+                    None
+                };
                 let whole = diff.context >= crate::app::FULL_CONTEXT;
                 self.doc = Doc::new(texts, keys, whole, self.doc.revision + 1);
                 self.path = diff.path.clone();
@@ -333,7 +372,11 @@ impl Reader {
                 self.selection = None;
                 self.press = None;
                 self.hits = self.search.as_ref().map_or_else(Vec::new, |s| {
-                    navigation::matches(&self.doc.texts, self.doc.stacked_rows.iter().copied(), &s.regex)
+                    navigation::matches(
+                        &self.doc.texts,
+                        self.doc.stacked_rows.iter().copied(),
+                        &s.regex,
+                    )
                 });
                 match previous {
                     Some(key) => {
@@ -357,10 +400,15 @@ impl Reader {
     /// The row with the same line numbers, or the nearest source line.
     fn relocate(&self, (_, old, new): RowKey) -> usize {
         let keys = &self.doc.keys;
-        if let Some(r) = keys.iter().position(|k| is_source(k.0) && k.1 == old && k.2 == new) {
+        if let Some(r) = keys
+            .iter()
+            .position(|k| is_source(k.0) && k.1 == old && k.2 == new)
+        {
             return r;
         }
-        let Some(line) = new.or(old) else { return self.doc.stacked_rows.first().copied().unwrap_or(0) };
+        let Some(line) = new.or(old) else {
+            return self.doc.stacked_rows.first().copied().unwrap_or(0);
+        };
         keys.iter()
             .enumerate()
             .filter(|(_, k)| is_source(k.0))
@@ -374,7 +422,8 @@ impl Reader {
     }
 
     fn split_active(&self) -> bool {
-        self.split && self.area.width > 2 * (Geom::new(self.max_lineno, 0).text_off + MIN_SPLIT_TEXT + 1)
+        self.split
+            && self.area.width > 2 * (Geom::new(self.max_lineno, 0).text_off + MIN_SPLIT_TEXT + 1)
     }
 
     fn on_side(&self, row: usize, old: bool) -> bool {
@@ -395,7 +444,11 @@ impl Reader {
     }
 
     fn unit_of(&self, row: usize) -> usize {
-        if self.split_active() { self.doc.split_of.get(row).copied().unwrap_or(0) } else { row }
+        if self.split_active() {
+            self.doc.split_of.get(row).copied().unwrap_or(0)
+        } else {
+            row
+        }
     }
 
     fn len(&self, row: usize) -> usize {
@@ -403,7 +456,13 @@ impl Reader {
     }
 
     fn clamped(&self) -> Position {
-        Position { row: self.cursor.row, col: self.cursor.col.min(self.len(self.cursor.row).saturating_sub(1)) }
+        Position {
+            row: self.cursor.row,
+            col: self
+                .cursor
+                .col
+                .min(self.len(self.cursor.row).saturating_sub(1)),
+        }
     }
 
     /// Split layout follows the cursor's row: deleted lines are old, added new.
@@ -419,7 +478,10 @@ impl Reader {
 
     /// In split layout, moves the cursor to the nearest row on the focused side.
     fn snap_to_side(&mut self) {
-        if !self.split_active() || self.on_side(self.cursor.row, self.old_side) || self.doc.split.is_empty() {
+        if !self.split_active()
+            || self.on_side(self.cursor.row, self.old_side)
+            || self.doc.split.is_empty()
+        {
             return;
         }
         let old = self.old_side;
@@ -429,7 +491,8 @@ impl Reader {
             let r = if old { s.old } else { s.new }?;
             self.on_side(r, old).then_some(r)
         };
-        let found = (0..self.doc.split.len()).find_map(|d| side_row(unit + d).or_else(|| side_row(unit.checked_sub(d)?)));
+        let found = (0..self.doc.split.len())
+            .find_map(|d| side_row(unit + d).or_else(|| side_row(unit.checked_sub(d)?)));
         if let Some(r) = found {
             self.cursor.row = r;
         }
@@ -437,11 +500,19 @@ impl Reader {
 
     fn body(&self) -> Rect {
         let a = self.area;
-        if self.split_active() { Rect::new(a.x, a.y + 1, a.width, a.height.saturating_sub(1)) } else { a }
+        if self.split_active() {
+            Rect::new(a.x, a.y + 1, a.width, a.height.saturating_sub(1))
+        } else {
+            a
+        }
     }
 
     fn geom(&self) -> Geom {
-        let width = if self.split_active() { self.area.width.saturating_sub(1) / 2 } else { self.area.width };
+        let width = if self.split_active() {
+            self.area.width.saturating_sub(1) / 2
+        } else {
+            self.area.width
+        };
         Geom::new(self.max_lineno, width)
     }
 
@@ -454,7 +525,11 @@ impl Reader {
     fn view(&self, diff: &FileDiff, notes: Option<&[Note]>) -> RefMut<'_, View> {
         let mut v = self.view.borrow_mut();
         if let Some(notes) = notes {
-            let mine = || notes.iter().filter(|n| n.path == diff.path && n.revision == diff.revision && !n.locations.is_empty());
+            let mine = || {
+                notes.iter().filter(|n| {
+                    n.path == diff.path && n.revision == diff.revision && !n.locations.is_empty()
+                })
+            };
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             for note in mine() {
                 (&note.locations, &note.comment).hash(&mut hash);
@@ -462,15 +537,25 @@ impl Reader {
             let key = hash.finish();
             if key != v.notes_key {
                 v.notes_key = key;
-                v.notes = mine().map(|n| (n.locations.clone(), n.comment.clone())).collect();
+                v.notes = mine()
+                    .map(|n| (n.locations.clone(), n.comment.clone()))
+                    .collect();
             }
         }
-        let key = (self.doc.revision, self.area.width, self.area.height, self.split_active(), v.notes_key);
+        let key = (
+            self.doc.revision,
+            self.area.width,
+            self.area.height,
+            self.split_active(),
+            v.notes_key,
+        );
         let previous = v.key;
         if previous != Some(key) {
             v.key = Some(key);
             // Resizes and note changes keep the top row; new content keeps the cursor's place.
-            let top = previous.filter(|k| k.0 == key.0 && k.3 == key.3).map(|_| v.lines.locate(v.scroll).0);
+            let top = previous
+                .filter(|k| k.0 == key.0 && k.3 == key.3)
+                .map(|_| v.lines.locate(v.scroll).0);
             self.rebuild(&mut v, diff, top);
         }
         v
@@ -479,7 +564,12 @@ impl Reader {
     fn rebuild(&self, v: &mut View, diff: &FileDiff, top: Option<usize>) {
         let split = self.split_active();
         let g = self.geom();
-        let View { notes, annotated, cards, .. } = v;
+        let View {
+            notes,
+            annotated,
+            cards,
+            ..
+        } = v;
         *annotated = vec![false; self.doc.keys.len()];
         cards.clear();
         for (locations, comment) in notes.iter() {
@@ -494,12 +584,28 @@ impl Reader {
                 annotated[r] = true;
             }
             let old_side = split && !self.on_side(first, false);
-            cards.entry(self.unit_of(first)).or_default().push(card(comment, g.text_w as usize, old_side));
+            cards.entry(self.unit_of(first)).or_default().push(card(
+                comment,
+                g.text_w as usize,
+                old_side,
+            ));
         }
-        v.wraps = if split { Vec::new() } else { diff.rows.iter().map(|r| wrap_row(r, g.text_w as usize)).collect() };
-        let units = if split { self.doc.split.len() } else { self.doc.keys.len() };
-        let lines: Vec<usize> =
-            (0..units).map(|u| v.cards_height(u) + if split { 1 } else { v.wraps[u].starts.len() }).collect();
+        v.wraps = if split {
+            Vec::new()
+        } else {
+            diff.rows
+                .iter()
+                .map(|r| wrap_row(r, g.text_w as usize))
+                .collect()
+        };
+        let units = if split {
+            self.doc.split.len()
+        } else {
+            self.doc.keys.len()
+        };
+        let lines: Vec<usize> = (0..units)
+            .map(|u| v.cards_height(u) + if split { 1 } else { v.wraps[u].starts.len() })
+            .collect();
         v.lines.rebuild(lines.into_iter());
         let h = self.height();
         let cursor = self.cursor_line(v);
@@ -528,7 +634,10 @@ impl Reader {
         }
         let unit = self.unit_of(self.cursor.row);
         let sub = match v.wraps.get(unit) {
-            Some(w) if !self.split_active() => w.starts.partition_point(|&s| s <= self.clamped().col).saturating_sub(1),
+            Some(w) if !self.split_active() => w
+                .starts
+                .partition_point(|&s| s <= self.clamped().col)
+                .saturating_sub(1),
             _ => 0,
         };
         v.lines.first.get(unit).copied().unwrap_or(0) + v.cards_height(unit) + sub
@@ -541,7 +650,12 @@ impl Reader {
         {
             let mut v = self.view(diff, None);
             let cursor = self.cursor_line(&v);
-            let top = v.lines.first.get(self.unit_of(self.cursor.row)).copied().unwrap_or(cursor);
+            let top = v
+                .lines
+                .first
+                .get(self.unit_of(self.cursor.row))
+                .copied()
+                .unwrap_or(cursor);
             // Moving up onto an annotated row shows its card too.
             if cursor < v.scroll && cursor - top < self.height() {
                 v.scroll = top;
@@ -550,7 +664,11 @@ impl Reader {
         }
         if self.split_active() {
             let text = &self.doc.texts[self.cursor.row];
-            let x: usize = text.chars().take(self.clamped().col).map(|c| c.width().unwrap_or(0)).sum();
+            let x: usize = text
+                .chars()
+                .take(self.clamped().col)
+                .map(|c| c.width().unwrap_or(0))
+                .sum();
             let w = self.geom().text_w as usize;
             if x < self.hscroll {
                 self.hscroll = x;
@@ -594,7 +712,9 @@ impl Reader {
         if rows.is_empty() {
             return;
         }
-        let k = rows.binary_search(&self.cursor.row).unwrap_or_else(|k| k.min(rows.len() - 1));
+        let k = rows
+            .binary_search(&self.cursor.row)
+            .unwrap_or_else(|k| k.min(rows.len() - 1));
         self.cursor.row = rows[k.saturating_add_signed(delta).min(rows.len() - 1)];
     }
 
@@ -620,23 +740,41 @@ impl Reader {
             }
             Motion::LineStart => self.cursor.col = 0,
             Motion::FirstNonBlank => {
-                self.cursor.col = self.doc.texts[at.row].chars().take_while(|c| c.is_whitespace()).count();
+                self.cursor.col = self.doc.texts[at.row]
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .count();
             }
             Motion::LineEnd => self.cursor.col = self.len(at.row).saturating_sub(1),
             Motion::Top | Motion::Bottom => {
                 let rows = self.side_rows();
-                let row = if motion == Motion::Top { rows.first() } else { rows.last() };
+                let row = if motion == Motion::Top {
+                    rows.first()
+                } else {
+                    rows.last()
+                };
                 if let Some(&row) = row {
                     self.cursor = Position { row, col: 0 };
                 }
             }
             Motion::HalfDown | Motion::HalfUp | Motion::PageDown | Motion::PageUp => {
-                let page = if matches!(motion, Motion::HalfDown | Motion::HalfUp) { h / 2 } else { h.saturating_sub(1) };
+                let page = if matches!(motion, Motion::HalfDown | Motion::HalfUp) {
+                    h / 2
+                } else {
+                    h.saturating_sub(1)
+                };
                 let delta = (page.max(1) * n) as isize;
-                let delta = if matches!(motion, Motion::HalfUp | Motion::PageUp) { -delta } else { delta };
+                let delta = if matches!(motion, Motion::HalfUp | Motion::PageUp) {
+                    -delta
+                } else {
+                    delta
+                };
                 {
                     let mut v = self.view(diff, None);
-                    v.scroll = v.scroll.saturating_add_signed(delta).min(v.lines.total().saturating_sub(h));
+                    v.scroll = v
+                        .scroll
+                        .saturating_add_signed(delta)
+                        .min(v.lines.total().saturating_sub(h));
                 }
                 self.step(delta);
             }
@@ -654,7 +792,9 @@ impl Reader {
                 v.offset = cursor - v.scroll;
                 return;
             }
-            Motion::ScrollLeft => return self.hscroll = self.hscroll.saturating_sub(HSCROLL_STEP * n),
+            Motion::ScrollLeft => {
+                return self.hscroll = self.hscroll.saturating_sub(HSCROLL_STEP * n);
+            }
             Motion::ScrollRight => return self.hscroll += HSCROLL_STEP * n,
         }
         self.ensure_visible(diff);
@@ -665,7 +805,10 @@ impl Reader {
         match self.doc.targets.first().copied() {
             Some(target) => self.go_target(diff, target),
             None => {
-                self.cursor = Position { row: self.doc.stacked_rows.first().copied().unwrap_or(0), col: 0 };
+                self.cursor = Position {
+                    row: self.doc.stacked_rows.first().copied().unwrap_or(0),
+                    col: 0,
+                };
                 self.normalize_side();
                 let mut v = self.view(diff, None);
                 v.scroll = 0;
@@ -704,15 +847,27 @@ impl Reader {
     }
 
     fn go_target(&mut self, diff: &FileDiff, target: Target) {
-        self.cursor = Position { row: target.row, col: 0 };
+        self.cursor = Position {
+            row: target.row,
+            col: 0,
+        };
         self.old_side = target.old_side;
         self.snap_to_side();
         let h = self.height();
         let mut v = self.view(diff, None);
         let cursor = self.cursor_line(&v);
-        let anchor = v.lines.first.get(self.unit_of(target.anchor)).copied().unwrap_or(cursor);
+        let anchor = v
+            .lines
+            .first
+            .get(self.unit_of(target.anchor))
+            .copied()
+            .unwrap_or(cursor);
         // Show the hunk header above the change when both fit.
-        v.scroll = if anchor <= cursor && cursor < anchor + h { anchor } else { cursor };
+        v.scroll = if anchor <= cursor && cursor < anchor + h {
+            anchor
+        } else {
+            cursor
+        };
         self.settle(&mut v, cursor);
     }
 
@@ -723,7 +878,11 @@ impl Reader {
         }
         let row = pos.row.min(self.doc.keys.len() - 1);
         let rows = &self.doc.stacked_rows;
-        let row = rows.get(rows.partition_point(|&r| r < row)).or(rows.last()).copied().unwrap_or(row);
+        let row = rows
+            .get(rows.partition_point(|&r| r < row))
+            .or(rows.last())
+            .copied()
+            .unwrap_or(row);
         self.cursor = Position { row, col: pos.col };
         self.normalize_side();
         let h = self.height();
@@ -737,9 +896,21 @@ impl Reader {
     /// layout a new-side miss falls back to deleted lines.
     pub fn source_row(&self, line: u32, old_side: bool) -> Option<usize> {
         let keys = &self.doc.keys;
-        let side = |r: &RowKey| is_source(r.0) && if old_side { r.1 == Some(line) } else { r.2 == Some(line) };
+        let side = |r: &RowKey| {
+            is_source(r.0)
+                && if old_side {
+                    r.1 == Some(line)
+                } else {
+                    r.2 == Some(line)
+                }
+        };
         keys.iter().position(side).or_else(|| {
-            (!self.split_active()).then(|| keys.iter().position(|k| is_source(k.0) && k.1 == Some(line))).flatten()
+            (!self.split_active())
+                .then(|| {
+                    keys.iter()
+                        .position(|k| is_source(k.0) && k.1 == Some(line))
+                })
+                .flatten()
         })
     }
 
@@ -770,7 +941,11 @@ impl Reader {
             Some(s) => self.selection = Some(Selection { lines, ..s }),
             None if self.kind(self.cursor.row).is_some_and(is_source) => {
                 let old_side = self.split_active().then_some(self.old_side);
-                self.selection = Some(Selection { anchor: self.clamped(), lines, old_side });
+                self.selection = Some(Selection {
+                    anchor: self.clamped(),
+                    lines,
+                    old_side,
+                });
             }
             None => {}
         }
@@ -790,7 +965,10 @@ impl Reader {
     }
 
     fn in_selection(&self, s: &Selection, row: usize) -> bool {
-        s.old_side.map_or_else(|| self.kind(row).is_some_and(is_source), |old| self.on_side(row, old))
+        s.old_side.map_or_else(
+            || self.kind(row).is_some_and(is_source),
+            |old| self.on_side(row, old),
+        )
     }
 
     /// The selected text (or the cursor's line) with its rows, and whether
@@ -800,7 +978,12 @@ impl Reader {
         let Some(s) = self.selection else {
             let source = self.kind(cursor.row).is_some_and(is_source);
             let old_side = self.split_active() && self.old_side;
-            return source.then(|| (vec![(cursor.row, self.doc.texts[cursor.row].clone())], old_side));
+            return source.then(|| {
+                (
+                    vec![(cursor.row, self.doc.texts[cursor.row].clone())],
+                    old_side,
+                )
+            });
         };
         let (lo, hi) = (s.anchor.min(cursor), s.anchor.max(cursor));
         let rows = (lo.row..=hi.row)
@@ -810,7 +993,11 @@ impl Reader {
                 let text = if s.lines {
                     text.clone()
                 } else {
-                    text.chars().enumerate().filter(|&(col, _)| s.contains(cursor, Position { row: r, col })).map(|(_, c)| c).collect()
+                    text.chars()
+                        .enumerate()
+                        .filter(|&(col, _)| s.contains(cursor, Position { row: r, col }))
+                        .map(|(_, c)| c)
+                        .collect()
                 };
                 (r, text)
             })
@@ -823,30 +1010,53 @@ impl Reader {
     pub fn search(&mut self, diff: &FileDiff, pattern: &str) -> Result<(), String> {
         if !pattern.is_empty() {
             let search = Search::new(pattern)?;
-            self.hits = navigation::matches(&self.doc.texts, self.doc.stacked_rows.iter().copied(), &search.regex);
+            self.hits = navigation::matches(
+                &self.doc.texts,
+                self.doc.stacked_rows.iter().copied(),
+                &search.regex,
+            );
             self.search = Some(search);
         }
         self.search_next(diff, false, 1)
     }
 
     /// `n` / `N`: the next or previous match on the focused side, wrapping.
-    pub fn search_next(&mut self, diff: &FileDiff, backward: bool, count: usize) -> Result<(), String> {
-        let Some(search) = &self.search else { return Err("No previous search".into()) };
+    pub fn search_next(
+        &mut self,
+        diff: &FileDiff,
+        backward: bool,
+        count: usize,
+    ) -> Result<(), String> {
+        let Some(search) = &self.search else {
+            return Err("No previous search".into());
+        };
         self.highlight = true;
         let eligible = |h: &&Hit| !self.split_active() || self.on_side(h.row, self.old_side);
-        let mut at = (self.cursor.row, self.cursor.col.min(self.len(self.cursor.row)));
+        let mut at = (
+            self.cursor.row,
+            self.cursor.col.min(self.len(self.cursor.row)),
+        );
         for _ in 0..count.max(1) {
             let next = if backward {
                 let mut hits = self.hits.iter().rev().filter(eligible);
-                hits.clone().find(|h| (h.row, h.start) < at).or_else(|| hits.next())
+                hits.clone()
+                    .find(|h| (h.row, h.start) < at)
+                    .or_else(|| hits.next())
             } else {
                 let mut hits = self.hits.iter().filter(eligible);
-                hits.clone().find(|h| (h.row, h.start) > at).or_else(|| hits.next())
+                hits.clone()
+                    .find(|h| (h.row, h.start) > at)
+                    .or_else(|| hits.next())
             };
-            let Some(hit) = next else { return Err(format!("Pattern not found: {}", search.pattern)) };
+            let Some(hit) = next else {
+                return Err(format!("Pattern not found: {}", search.pattern));
+            };
             at = (hit.row, hit.start);
         }
-        self.cursor = Position { row: at.0, col: at.1 };
+        self.cursor = Position {
+            row: at.0,
+            col: at.1,
+        };
         self.ensure_visible(diff);
         Ok(())
     }
@@ -854,7 +1064,12 @@ impl Reader {
     /// The source cell under a mouse position, and its side.
     fn hit_test(&self, diff: &FileDiff, x: u16, y: u16) -> Option<(Position, bool)> {
         let body = self.body();
-        if x < body.x || x >= body.right() || y < body.y || y >= body.bottom() || self.doc.keys.is_empty() {
+        if x < body.x
+            || x >= body.right()
+            || y < body.y
+            || y >= body.bottom()
+            || self.doc.keys.is_empty()
+        {
             return None;
         }
         let v = self.view(diff, None);
@@ -898,12 +1113,20 @@ impl Reader {
             cell -= w;
             col += 1;
         }
-        Some((Position { row, col: col.min(self.len(row).saturating_sub(1)) }, old))
+        Some((
+            Position {
+                row,
+                col: col.min(self.len(row).saturating_sub(1)),
+            },
+            old,
+        ))
     }
 
     /// A click: moves the cursor there. `false` outside source text.
     pub fn click(&mut self, diff: &FileDiff, x: u16, y: u16) -> bool {
-        let Some((pos, old)) = self.hit_test(diff, x, y) else { return false };
+        let Some((pos, old)) = self.hit_test(diff, x, y) else {
+            return false;
+        };
         self.cursor = pos;
         if self.split_active() {
             self.old_side = old;
@@ -916,13 +1139,20 @@ impl Reader {
 
     /// A drag after a click selects characters on the same side.
     pub fn drag(&mut self, diff: &FileDiff, x: u16, y: u16) {
-        let (Some((anchor, side)), Some((pos, old))) = (self.press, self.hit_test(diff, x, y)) else { return };
+        let (Some((anchor, side)), Some((pos, old))) = (self.press, self.hit_test(diff, x, y))
+        else {
+            return;
+        };
         let split = self.split_active();
         if split && old != side {
             return;
         }
         if self.selection.is_none() {
-            self.selection = Some(Selection { anchor, lines: false, old_side: split.then_some(side) });
+            self.selection = Some(Selection {
+                anchor,
+                lines: false,
+                old_side: split.then_some(side),
+            });
         }
         self.cursor = pos;
         self.ensure_visible(diff);
@@ -932,7 +1162,15 @@ impl Reader {
         self.press = None;
     }
 
-    pub fn draw(&self, area: Rect, diff: &FileDiff, notes: &[Note], p: &Palette, focused: bool, buf: &mut Buffer) {
+    pub fn draw(
+        &self,
+        area: Rect,
+        diff: &FileDiff,
+        notes: &[Note],
+        p: &Palette,
+        focused: bool,
+        buf: &mut Buffer,
+    ) {
         if area.is_empty() || self.doc.keys.is_empty() {
             return;
         }
@@ -940,7 +1178,14 @@ impl Reader {
         let split = self.split_active();
         let body = self.body();
         let g = self.geom();
-        let paint = Paint { diff, view: &v, p, g, focused, cursor: self.clamped() };
+        let paint = Paint {
+            diff,
+            view: &v,
+            p,
+            g,
+            focused,
+            cursor: self.clamped(),
+        };
         if split {
             for (x, old) in [(area.x, true), (area.x + g.width + 1, false)] {
                 let style = if self.old_side == old {
@@ -948,7 +1193,13 @@ impl Reader {
                 } else {
                     Style::new().fg(p.faint)
                 };
-                buf.set_stringn(x, area.y, if old { " Old" } else { " New" }, g.width as usize, style);
+                buf.set_stringn(
+                    x,
+                    area.y,
+                    if old { " Old" } else { " New" },
+                    g.width as usize,
+                    style,
+                );
             }
         }
         for line in 0..body.height {
@@ -964,7 +1215,11 @@ impl Reader {
                 let mut k = sub;
                 for card in cards {
                     if k < card.height() {
-                        let pane = if card.old_side || !split { area.x } else { area.x + g.width + 1 };
+                        let pane = if card.old_side || !split {
+                            area.x
+                        } else {
+                            area.x + g.width + 1
+                        };
                         draw_card(buf, pane, y, g, card, k, p);
                         break;
                     }
@@ -974,7 +1229,17 @@ impl Reader {
             }
             let sub = sub - v.cards_height(unit);
             if !split {
-                self.draw_row(buf, &paint, area.x, area.width, y, unit, sub, None, v.wraps.get(unit));
+                self.draw_row(
+                    buf,
+                    &paint,
+                    area.x,
+                    area.width,
+                    y,
+                    unit,
+                    sub,
+                    None,
+                    v.wraps.get(unit),
+                );
                 continue;
             }
             let SplitRow { old, new } = self.doc.split[unit];
@@ -985,7 +1250,9 @@ impl Reader {
             buf.set_string(area.x + g.width, y, "│", Style::new().fg(p.rule));
             for (x, row, old_side) in [(area.x, old, true), (area.x + g.width + 1, new, false)] {
                 match row {
-                    Some(r) => self.draw_row(buf, &paint, x, g.width, y, r, 0, Some(old_side), None),
+                    Some(r) => {
+                        self.draw_row(buf, &paint, x, g.width, y, r, 0, Some(old_side), None)
+                    }
                     None => buf.set_style(Rect::new(x, y, g.width, 1), Style::new().bg(p.sel_bg)),
                 }
             }
@@ -1011,8 +1278,20 @@ impl Reader {
         let (p, g) = (c.p, c.g);
         let row = &c.diff.rows[r];
         let (row_bg, gutter_bg, emph_bg, sign, sign_fg) = match row.kind {
-            RowKind::Add => (Some(p.add_bg), Some(p.add_gutter), Some(p.add_emph), "+", p.green),
-            RowKind::Del => (Some(p.del_bg), Some(p.del_gutter), Some(p.del_emph), "−", p.red),
+            RowKind::Add => (
+                Some(p.add_bg),
+                Some(p.add_gutter),
+                Some(p.add_emph),
+                "+",
+                p.green,
+            ),
+            RowKind::Del => (
+                Some(p.del_bg),
+                Some(p.del_gutter),
+                Some(p.del_emph),
+                "−",
+                p.red,
+            ),
             RowKind::Hunk => (Some(p.hunk_bg), Some(p.hunk_bg), None, " ", p.faint),
             _ => (None, None, None, " ", p.faint),
         };
@@ -1046,9 +1325,20 @@ impl Reader {
             } else {
                 p.faint
             };
-            buf.set_stringn(x + 1, y, &text, gw.min(width.saturating_sub(1) as usize), gutter.fg(fg));
+            buf.set_stringn(
+                x + 1,
+                y,
+                &text,
+                gw.min(width.saturating_sub(1) as usize),
+                gutter.fg(fg),
+            );
             if x + g.gutter_w < right {
-                buf.set_string(x + g.gutter_w, y, sign, base.fg(sign_fg).add_modifier(Modifier::BOLD));
+                buf.set_string(
+                    x + g.gutter_w,
+                    y,
+                    sign,
+                    base.fg(sign_fg).add_modifier(Modifier::BOLD),
+                );
             }
         }
         let text_x = x + g.text_off;
@@ -1058,7 +1348,13 @@ impl Reader {
         match row.kind {
             RowKind::Hunk => {
                 let (header, func) = split_hunk(&row.segs[0].text);
-                let (nx, _) = buf.set_stringn(text_x, y, header, (right - text_x) as usize, base.fg(p.faint));
+                let (nx, _) = buf.set_stringn(
+                    text_x,
+                    y,
+                    header,
+                    (right - text_x) as usize,
+                    base.fg(p.faint),
+                );
                 if nx < right {
                     buf.set_stringn(nx, y, func, (right - nx) as usize, base.fg(p.muted));
                 }
@@ -1066,7 +1362,13 @@ impl Reader {
             }
             RowKind::Meta => {
                 let style = base.fg(p.faint).add_modifier(Modifier::ITALIC);
-                buf.set_stringn(text_x, y, &row.segs[0].text, (right - text_x) as usize, style);
+                buf.set_stringn(
+                    text_x,
+                    y,
+                    &row.segs[0].text,
+                    (right - text_x) as usize,
+                    style,
+                );
                 return;
             }
             _ => {}
@@ -1084,10 +1386,15 @@ impl Reader {
             &[]
         };
         let selection = self.selection.filter(|s| {
-            self.in_selection(s, r) && (side.is_none() || s.old_side.is_none() || s.old_side == side)
+            self.in_selection(s, r)
+                && (side.is_none() || s.old_side.is_none() || s.old_side == side)
         });
         let (from, to, indent) = match wrap {
-            Some(w) => (w.starts[sub], w.starts.get(sub + 1).copied().unwrap_or(usize::MAX), if sub > 0 { w.indent } else { 0 }),
+            Some(w) => (
+                w.starts[sub],
+                w.starts.get(sub + 1).copied().unwrap_or(usize::MAX),
+                if sub > 0 { w.indent } else { 0 },
+            ),
             None => (0, usize::MAX, 0),
         };
         let mut skip = if side.is_some() { self.hscroll } else { 0 };
@@ -1101,7 +1408,9 @@ impl Reader {
             if seg.bold {
                 style = style.add_modifier(Modifier::BOLD);
             }
-            if seg.emph && let Some(bg) = emph_bg {
+            if seg.emph
+                && let Some(bg) = emph_bg
+            {
                 style = style.bg(bg);
             }
             for ch in seg.text.chars() {
@@ -1120,9 +1429,15 @@ impl Reader {
                     }
                     let pos = Position { row: r, col };
                     let cell = if selection.is_some_and(|s| s.contains(c.cursor, pos)) {
-                        Style::new().fg(p.selection_fg).bg(p.blue).add_modifier(Modifier::BOLD)
+                        Style::new()
+                            .fg(p.selection_fg)
+                            .bg(p.blue)
+                            .add_modifier(Modifier::BOLD)
                     } else if hits.iter().any(|h| h.start <= col && col < h.end) {
-                        Style::new().fg(p.search_fg).bg(p.yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                        Style::new()
+                            .fg(p.search_fg)
+                            .bg(p.yellow)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
                     } else if cursor_here && col == c.cursor.col {
                         style.add_modifier(Modifier::REVERSED)
                     } else {
@@ -1136,7 +1451,10 @@ impl Reader {
             }
         }
         if cursor_here && sub == 0 && self.len(r) == 0 && side.is_none_or(|_| self.hscroll == 0) {
-            buf.set_style(Rect::new(text_x, y, 1, 1), base.add_modifier(Modifier::REVERSED));
+            buf.set_style(
+                Rect::new(text_x, y, 1, 1),
+                base.add_modifier(Modifier::REVERSED),
+            );
         }
     }
 }
@@ -1151,16 +1469,32 @@ fn draw_card(buf: &mut Buffer, pane: u16, y: u16, g: Geom, card: &Card, k: usize
     }
     let max = (right - x) as usize;
     let w = card.width;
-    let label = Style::new().fg(p.annotation).bg(p.annotation_bg).add_modifier(Modifier::BOLD);
+    let label = Style::new()
+        .fg(p.annotation)
+        .bg(p.annotation_bg)
+        .add_modifier(Modifier::BOLD);
     let text = Style::new().fg(p.fg).bg(p.annotation_bg);
     let n = card.lines.len();
     if k == 0 {
-        buf.set_stringn(x, y, format!("╭─ NOTE {}╮", "─".repeat(w.saturating_sub(9))), max, label);
+        buf.set_stringn(
+            x,
+            y,
+            format!("╭─ NOTE {}╮", "─".repeat(w.saturating_sub(9))),
+            max,
+            label,
+        );
     } else if k == n + 3 {
         let join = (x - pane) + w as u16;
-        buf.set_style(Rect::new(pane, y, join.min(g.width), 1), Style::new().bg(p.annotation));
+        buf.set_style(
+            Rect::new(pane, y, join.min(g.width), 1),
+            Style::new().bg(p.annotation),
+        );
     } else {
-        let body = if k == 1 || k == n + 2 { "" } else { &card.lines[k - 2] };
+        let body = if k == 1 || k == n + 2 {
+            ""
+        } else {
+            &card.lines[k - 2]
+        };
         let interior = format!("  {body}{}", " ".repeat(w.saturating_sub(4 + body.width())));
         let (nx, _) = buf.set_stringn(x, y, "│", max, label);
         let (nx, _) = buf.set_stringn(nx, y, &interior, (right.saturating_sub(nx)) as usize, text);
@@ -1176,12 +1510,32 @@ mod tests {
     use crate::git::{DRow, Seg};
 
     fn row(kind: RowKind, old: Option<u32>, new: Option<u32>, text: &str) -> DRow {
-        DRow { kind, old, new, segs: vec![Seg { text: text.into(), fg: None, bold: false, emph: false }] }
+        DRow {
+            kind,
+            old,
+            new,
+            segs: vec![Seg {
+                text: text.into(),
+                fg: None,
+                bold: false,
+                emph: false,
+            }],
+        }
     }
 
     fn diff(rows: Vec<DRow>) -> FileDiff {
-        let max_lineno = rows.iter().filter_map(|r| r.old.max(r.new)).max().unwrap_or(1);
-        FileDiff { revision: 1, path: "x.rs".into(), context: 3, rows, max_lineno }
+        let max_lineno = rows
+            .iter()
+            .filter_map(|r| r.old.max(r.new))
+            .max()
+            .unwrap_or(1);
+        FileDiff {
+            revision: 1,
+            path: "x.rs".into(),
+            context: 3,
+            rows,
+            max_lineno,
+        }
     }
 
     fn reader(d: &FileDiff, width: u16) -> Reader {
@@ -1220,10 +1574,17 @@ mod tests {
             // A new file opens on its first change, header above it.
             let first = if r.split() { 3 } else { 2 };
             assert_eq!(r.cursor().row, first);
-            assert!(!r.split() || !r.old_side(), "a hunk with additions opens on the new side");
+            assert!(
+                !r.split() || !r.old_side(),
+                "a hunk with additions opens on the new side"
+            );
             assert_eq!(r.view.borrow().scroll, 0);
             assert_eq!(r.hunk(&d, true, 1), None);
-            assert_eq!((r.cursor().row, r.old_side()), (7, true), "deleted-only hunk lands on the old side");
+            assert_eq!(
+                (r.cursor().row, r.old_side()),
+                (7, true),
+                "deleted-only hunk lands on the old side"
+            );
             assert_eq!(r.hunk(&d, true, 1), Some("Last hunk"));
             assert_eq!(r.cursor().row, 7);
             assert_eq!(r.hunk(&d, false, 5), Some("First hunk"));
@@ -1252,10 +1613,16 @@ mod tests {
         assert_eq!(r.hunk(&whole, true, 1), None);
         assert_eq!((r.cursor().row, r.old_side()), (5, true));
         // No changes: first source row; notices only: nothing to select.
-        let same = diff(vec![row(Ctx, Some(1), Some(1), "x"), row(Ctx, Some(2), Some(2), "y")]);
+        let same = diff(vec![
+            row(Ctx, Some(1), Some(1), "x"),
+            row(Ctx, Some(2), Some(2), "y"),
+        ]);
         let mut r = reader(&same, 60);
         assert_eq!(r.cursor().row, 0);
-        assert_eq!(r.hunk(&same, true, 1), Some("No changed hunks in this file"));
+        assert_eq!(
+            r.hunk(&same, true, 1),
+            Some("No changed hunks in this file")
+        );
         let binary = diff(vec![row(Meta, None, None, "Binary file — no text diff")]);
         let r = reader(&binary, 60);
         assert!(r.capture().is_none());
@@ -1283,9 +1650,27 @@ mod tests {
         // Unequal runs: three deletions pair with one addition, then filler.
         r.toggle_split();
         assert!(r.split());
-        assert_eq!(r.doc.split[1], SplitRow { old: Some(1), new: Some(4) });
-        assert_eq!(r.doc.split[2], SplitRow { old: Some(2), new: None });
-        assert_eq!(r.doc.split[4], SplitRow { old: Some(5), new: Some(5) });
+        assert_eq!(
+            r.doc.split[1],
+            SplitRow {
+                old: Some(1),
+                new: Some(4)
+            }
+        );
+        assert_eq!(
+            r.doc.split[2],
+            SplitRow {
+                old: Some(2),
+                new: None
+            }
+        );
+        assert_eq!(
+            r.doc.split[4],
+            SplitRow {
+                old: Some(5),
+                new: Some(5)
+            }
+        );
         r.set_side(&d, true);
         r.motion(&d, Motion::Top, 1);
         assert_eq!(r.cursor().row, 1);
@@ -1294,8 +1679,14 @@ mod tests {
         assert_eq!(r.cursor().row, 5, "filler rows are not selectable");
         let (rows, old) = r.capture().unwrap();
         assert!(old);
-        assert_eq!(rows.iter().map(|(row, _)| *row).collect::<Vec<_>>(), vec![1, 2, 3, 5]);
-        assert_eq!(rows[3].1, "shared", "gutters, cards and filler stay out of captured text");
+        assert_eq!(
+            rows.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+            vec![1, 2, 3, 5]
+        );
+        assert_eq!(
+            rows[3].1, "shared",
+            "gutters, cards and filler stay out of captured text"
+        );
         let before = r.capture();
         for width in [40, 100, 160] {
             r.resize(Rect::new(0, 0, width, 12));
@@ -1312,17 +1703,40 @@ mod tests {
         assert_eq!(r.cursor().row, 4, "nearest new-side row");
         assert_eq!(r.source_row(10, true), Some(2));
         assert_eq!(r.source_row(10, false), Some(5));
-        assert_eq!(r.source_row(11, false), None, "split jumps stay on the focused side");
+        assert_eq!(
+            r.source_row(11, false),
+            None,
+            "split jumps stay on the focused side"
+        );
         r.split = false;
-        assert_eq!(r.source_row(11, false), Some(3), "stacked falls back to deleted lines");
+        assert_eq!(
+            r.source_row(11, false),
+            Some(3),
+            "stacked falls back to deleted lines"
+        );
         // A note card is a visual row: it never shifts source coordinates.
         r.split = true;
         let note = Note {
-            id: 1, path: "x.rs".into(), line: Some(9), old_side: true, locations: vec![(Some(9), None)],
-            revision: 1, target: String::new(), preview: Vec::new(), historical: false, comment: "why?".into(),
+            id: 1,
+            path: "x.rs".into(),
+            line: Some(9),
+            old_side: true,
+            locations: vec![(Some(9), None)],
+            revision: 1,
+            target: String::new(),
+            preview: Vec::new(),
+            historical: false,
+            comment: "why?".into(),
         };
         let mut buf = Buffer::empty(Rect::new(0, 0, 160, 12));
-        r.draw(buf.area, &d, std::slice::from_ref(&note), &Palette::from(None), true, &mut buf);
+        r.draw(
+            buf.area,
+            &d,
+            std::slice::from_ref(&note),
+            &Palette::from(None),
+            true,
+            &mut buf,
+        );
         let screen: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(screen.contains("NOTE") && screen.contains("why?"));
         r.set_side(&d, true);
@@ -1341,11 +1755,23 @@ mod tests {
         ]);
         let mut r = reader(&d, 60);
         r.search(&d, "foo").unwrap();
-        assert_eq!(r.cursor(), Position { row: 1, col: 4 }, "smart case ignores case for lowercase patterns");
+        assert_eq!(
+            r.cursor(),
+            Position { row: 1, col: 4 },
+            "smart case ignores case for lowercase patterns"
+        );
         r.search_next(&d, false, 1).unwrap();
-        assert_eq!(r.cursor(), Position { row: 2, col: 6 }, "byte offsets map to characters");
+        assert_eq!(
+            r.cursor(),
+            Position { row: 2, col: 6 },
+            "byte offsets map to characters"
+        );
         r.search(&d, "Foo").unwrap();
-        assert_eq!(r.cursor(), Position { row: 1, col: 4 }, "uppercase makes it case-sensitive, wrapping");
+        assert_eq!(
+            r.cursor(),
+            Position { row: 1, col: 4 },
+            "uppercase makes it case-sensitive, wrapping"
+        );
         r.search(&d, "bar|baz").unwrap();
         assert_eq!(r.cursor(), Position { row: 3, col: 0 });
         r.search_next(&d, false, 1).unwrap();
@@ -1354,7 +1780,11 @@ mod tests {
         assert_eq!(r.cursor().col, 6, "N reverses and wraps");
         r.search(&d, r"FOO\s\S").unwrap_err();
         r.search(&d, r"foo\s\S").unwrap();
-        assert_eq!(r.cursor().row, 1, "escapes like \\S don't make the search case-sensitive");
+        assert_eq!(
+            r.cursor().row,
+            1,
+            "escapes like \\S don't make the search case-sensitive"
+        );
         r.search(&d, "bar|baz").unwrap();
         r.search_next(&d, false, 1).unwrap();
         assert!(r.search(&d, "[").is_err());
@@ -1368,10 +1798,19 @@ mod tests {
             rows.push(r.cursor().row);
             r.search_next(&d, false, 1).unwrap();
         }
-        assert_eq!(rows, vec![1, 2, 3, 1], "zero-width matches advance without looping");
+        assert_eq!(
+            rows,
+            vec![1, 2, 3, 1],
+            "zero-width matches advance without looping"
+        );
         let mut buf = Buffer::empty(Rect::new(0, 0, 60, 12));
         r.draw(buf.area, &d, &[], &Palette::from(None), false, &mut buf);
-        assert!(buf.content.iter().all(|c| c.bg != Palette::from(None).yellow), "zero-width hits are not highlighted");
+        assert!(
+            buf.content
+                .iter()
+                .all(|c| c.bg != Palette::from(None).yellow),
+            "zero-width hits are not highlighted"
+        );
         // Split: matches on the other side and in note cards are skipped.
         let mut r = reader(&d, 160);
         r.toggle_split();

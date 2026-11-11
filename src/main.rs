@@ -1,11 +1,11 @@
-mod app;
 mod annotations;
-mod project;
-mod keymap;
-mod navigation;
-mod reader;
+mod app;
 mod git;
 mod highlight;
+mod keymap;
+mod navigation;
+mod project;
+mod reader;
 mod theme;
 mod tree;
 mod wrap;
@@ -72,7 +72,11 @@ On the Branches screen:
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("show");
-    let rest = if args.is_empty() { &args[..] } else { &args[1..] };
+    let rest = if args.is_empty() {
+        &args[..]
+    } else {
+        &args[1..]
+    };
     let result = match cmd {
         "show" => show(rest),
         "hide" => hide().map(|_| ()),
@@ -122,14 +126,19 @@ fn rex_ctx() -> Result<RexCtx, String> {
 
 /// File that records which rexdiff pane belongs to this terminal.
 fn state_file(block: &str) -> PathBuf {
-    let name: String = block.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    let name: String = block
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
     state_dir().join(name)
 }
 
 pub fn state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"))
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
+        })
         .join("rexdiff")
 }
 
@@ -161,20 +170,27 @@ fn alive(ctx: &RexCtx, id: &str) -> bool {
 }
 
 fn open_pane(ctx: &RexCtx) -> Option<String> {
-    let id = std::fs::read_to_string(state_file(&ctx.block)).ok()?.trim().to_string();
+    let id = std::fs::read_to_string(state_file(&ctx.block))
+        .ok()?
+        .trim()
+        .to_string();
     alive(ctx, &id).then_some(id)
 }
 
 /// If the current pane is itself a rexdiff panel, returns its state file.
 fn owner_state_of(block: &str) -> Option<PathBuf> {
-    std::fs::read_dir(state_dir()).ok()?.flatten().map(|e| e.path()).find(|p| {
-        std::fs::read_to_string(p).is_ok_and(|id| id.trim() == block)
-    })
+    std::fs::read_dir(state_dir())
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|id| id.trim() == block))
 }
 
 /// Accepts a path or a `file://host/path` URL (how Rex reports a terminal's folder).
 fn parse_cwd(s: &str) -> PathBuf {
-    let Some(rest) = s.strip_prefix("file://") else { return PathBuf::from(s) };
+    let Some(rest) = s.strip_prefix("file://") else {
+        return PathBuf::from(s);
+    };
     let path = &rest[rest.find('/').unwrap_or(rest.len())..];
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -224,8 +240,22 @@ fn show(args: &[String]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let out = rex()
-        .args(["split", "-s", &ctx.session, "-b", &ctx.block, "--split", dir, "--ratio", &ratio])
-        .arg(if focus { "--focus=true" } else { "--focus=false" })
+        .args([
+            "split",
+            "-s",
+            &ctx.session,
+            "-b",
+            &ctx.block,
+            "--split",
+            dir,
+            "--ratio",
+            &ratio,
+        ])
+        .arg(if focus {
+            "--focus=true"
+        } else {
+            "--focus=false"
+        })
         .args(["--label", "rexdiff", "--json", "-c"])
         .arg(&cwd)
         .arg("--")
@@ -236,9 +266,11 @@ fn show(args: &[String]) -> Result<(), String> {
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("unexpected response from rex: {e}"))?;
-    let id = json["block_ids"][0].as_str().ok_or("rex did not return the pane id")?;
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("unexpected response from rex: {e}"))?;
+    let id = json["block_ids"][0]
+        .as_str()
+        .ok_or("rex did not return the pane id")?;
     let file = state_file(&ctx.block);
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
