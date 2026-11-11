@@ -5,8 +5,18 @@ use std::collections::{BTreeMap, HashSet};
 use crate::git::{FileEntry, Staged};
 
 pub enum Item {
-    Dir { path: String, label: String, collapsed: bool, adds: usize, dels: usize, all_staged: bool },
-    File { idx: usize, name: String },
+    Dir {
+        path: String,
+        label: String,
+        collapsed: bool,
+        adds: usize,
+        dels: usize,
+        all_staged: bool,
+    },
+    File {
+        idx: usize,
+        name: String,
+    },
 }
 
 pub struct TreeRow {
@@ -33,15 +43,18 @@ struct Node {
 
 impl Node {
     fn all_staged(&self, files: &[FileEntry]) -> bool {
-        (!self.files.is_empty() || !self.dirs.is_empty()) && self.files.iter().all(|(_, i)| files[*i].staged == Staged::Fully)
+        (!self.files.is_empty() || !self.dirs.is_empty())
+            && self
+                .files
+                .iter()
+                .all(|(_, i)| files[*i].staged == Staged::Fully)
             && self.dirs.values().all(|n| n.all_staged(files))
     }
 
     fn totals(&self, files: &[FileEntry]) -> (usize, usize) {
-        let mut t = self
-            .files
-            .iter()
-            .fold((0, 0), |(a, d), (_, i)| (a + files[*i].adds, d + files[*i].dels));
+        let mut t = self.files.iter().fold((0, 0), |(a, d), (_, i)| {
+            (a + files[*i].adds, d + files[*i].dels)
+        });
         for n in self.dirs.values() {
             let (a, d) = n.totals(files);
             t.0 += a;
@@ -55,12 +68,18 @@ pub fn build(files: &[FileEntry], collapsed: &HashSet<String>) -> Vec<TreeRow> {
     let mut root = Node::default();
     for (idx, f) in files.iter().enumerate() {
         let mut parts: Vec<&str> = f.path.split('/').collect();
-        let name = if f.status == '\0' { String::new() } else { parts.pop().unwrap_or_default().to_string() };
+        let name = if f.status == '\0' {
+            String::new()
+        } else {
+            parts.pop().unwrap_or_default().to_string()
+        };
         let mut node = &mut root;
         for p in parts {
             node = node.dirs.entry(p.to_string()).or_default();
         }
-        if f.status != '\0' { node.files.push((name, idx)); }
+        if f.status != '\0' {
+            node.files.push((name, idx));
+        }
     }
     let mut out = Vec::new();
     walk(&root, "", "", true, files, collapsed, &mut out);
@@ -96,14 +115,25 @@ fn walk(
             label.push_str(k);
             n = c;
         }
-        let path = if parent.is_empty() { label.clone() } else { format!("{parent}/{label}") };
+        let path = if parent.is_empty() {
+            label.clone()
+        } else {
+            format!("{parent}/{label}")
+        };
         let is_collapsed = collapsed.contains(&path);
         let (adds, dels) = n.totals(files);
         let all_staged = n.all_staged(files);
         let (guide, child_prefix) = guides(prefix, root, last);
         out.push(TreeRow {
             guide,
-            item: Item::Dir { path: path.clone(), label, collapsed: is_collapsed, adds, dels, all_staged },
+            item: Item::Dir {
+                path: path.clone(),
+                label,
+                collapsed: is_collapsed,
+                adds,
+                dels,
+                all_staged,
+            },
         });
         if !is_collapsed {
             walk(n, &path, &child_prefix, false, files, collapsed, out);
@@ -114,7 +144,13 @@ fn walk(
         let mut last = false;
         next(&mut last);
         let (guide, _) = guides(prefix, root, last);
-        out.push(TreeRow { guide, item: Item::File { idx: *idx, name: name.clone() } });
+        out.push(TreeRow {
+            guide,
+            item: Item::File {
+                idx: *idx,
+                name: name.clone(),
+            },
+        });
     }
 }
 

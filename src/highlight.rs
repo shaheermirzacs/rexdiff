@@ -27,7 +27,10 @@ pub struct Highlighter {
 
 impl Highlighter {
     pub fn new() -> Self {
-        Self { ss: SyntaxSet::load_defaults_newlines(), theme: ansi_theme() }
+        Self {
+            ss: SyntaxSet::load_defaults_newlines(),
+            theme: ansi_theme(),
+        }
     }
 
     fn syntax_for(&self, path: &str) -> Option<&SyntaxReference> {
@@ -49,8 +52,17 @@ impl Highlighter {
     }
 
     pub fn for_path(&self, path: &str, rows: usize) -> FileHl<'_> {
-        let syntax = if rows > MAX_HIGHLIGHT_ROWS { None } else { self.syntax_for(path) };
-        let mut f = FileHl { hl: self, syntax, new: None, old: None };
+        let syntax = if rows > MAX_HIGHLIGHT_ROWS {
+            None
+        } else {
+            self.syntax_for(path)
+        };
+        let mut f = FileHl {
+            hl: self,
+            syntax,
+            new: None,
+            old: None,
+        };
         f.reset();
         f
     }
@@ -94,7 +106,9 @@ fn run(h: Option<&mut HighlightLines<'_>>, ss: &SyntaxSet, line: &str) -> Vec<Sp
         return Vec::new();
     }
     let with_nl = format!("{line}\n");
-    let Ok(parts) = h.highlight_line(&with_nl, ss) else { return Vec::new() };
+    let Ok(parts) = h.highlight_line(&with_nl, ss) else {
+        return Vec::new();
+    };
     let mut spans = Vec::with_capacity(parts.len());
     let mut at = 0;
     for (style, text) in parts {
@@ -102,7 +116,11 @@ fn run(h: Option<&mut HighlightLines<'_>>, ss: &SyntaxSet, line: &str) -> Vec<Sp
         if end > at {
             let fg = (style.foreground.a == 0).then_some(style.foreground.r);
             let bold = style.font_style.contains(FontStyle::BOLD);
-            spans.push(Span { range: at..end, fg, bold });
+            spans.push(Span {
+                range: at..end,
+                fg,
+                bold,
+            });
         }
         at += text.len();
     }
@@ -112,8 +130,18 @@ fn run(h: Option<&mut HighlightLines<'_>>, ss: &SyntaxSet, line: &str) -> Vec<Sp
 /// "ANSI" theme: `a == 0` marks a terminal palette color in the `r` channel;
 /// `a == 1` is the default text color.
 fn ansi_theme() -> Theme {
-    const DEFAULT: Color = Color { r: 0, g: 0, b: 0, a: 1 };
-    let ansi = |i: u8| Color { r: i, g: 0, b: 0, a: 0 };
+    const DEFAULT: Color = Color {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 1,
+    };
+    let ansi = |i: u8| Color {
+        r: i,
+        g: 0,
+        b: 0,
+        a: 0,
+    };
     let item = |sel: &str, fg: Color, bold: bool| ThemeItem {
         scope: ScopeSelectors::from_str(sel).expect("valid scope selector"),
         style: StyleModifier {
@@ -126,13 +154,32 @@ fn ansi_theme() -> Theme {
     Theme {
         name: Some("ansi".into()),
         author: None,
-        settings: ThemeSettings { foreground: Some(DEFAULT), ..Default::default() },
+        settings: ThemeSettings {
+            foreground: Some(DEFAULT),
+            ..Default::default()
+        },
         scopes: vec![
             item("comment, punctuation.definition.comment", ansi(8), false),
-            item("string, punctuation.definition.string, markup.inline.raw, markup.raw", ansi(2), false),
-            item("constant.numeric, constant.language, constant.character, constant.other", ansi(3), false),
-            item("string.regexp, constant.character.escape, support.constant", ansi(6), false),
-            item("keyword, storage, keyword.operator.word, keyword.operator.logical.python", ansi(5), false),
+            item(
+                "string, punctuation.definition.string, markup.inline.raw, markup.raw",
+                ansi(2),
+                false,
+            ),
+            item(
+                "constant.numeric, constant.language, constant.character, constant.other",
+                ansi(3),
+                false,
+            ),
+            item(
+                "string.regexp, constant.character.escape, support.constant",
+                ansi(6),
+                false,
+            ),
+            item(
+                "keyword, storage, keyword.operator.word, keyword.operator.logical.python",
+                ansi(5),
+                false,
+            ),
             item("keyword.operator, punctuation", DEFAULT, false),
             item(
                 "entity.name.function, support.function, variable.function, meta.function-call.generic",
@@ -145,9 +192,17 @@ fn ansi_theme() -> Theme {
                 ansi(3),
                 false,
             ),
-            item("variable.language, meta.decorator, entity.name.function.decorator", ansi(6), false),
+            item(
+                "variable.language, meta.decorator, entity.name.function.decorator",
+                ansi(6),
+                false,
+            ),
             item("entity.name.tag", ansi(4), false),
-            item("entity.other.attribute-name, support.type.property-name", ansi(3), false),
+            item(
+                "entity.other.attribute-name, support.type.property-name",
+                ansi(3),
+                false,
+            ),
             item("markup.heading, entity.name.section", ansi(4), true),
             item("markup.bold", DEFAULT, true),
             item("markup.underline.link, markup.link", ansi(6), false),

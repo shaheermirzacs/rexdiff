@@ -1,481 +1,1719 @@
-//! Neovim owns reader interaction; its TUI is rendered into a Ratatui rectangle.
-use std::io::{self, Read};
-use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant};
+//! The native file reader: cursor, selection, search, hunk targets, and the
+//! stacked/split rendering of one diff document. The app owns the document;
+//! the reader keeps everything derived from it, cached per generation.
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use ratatui::crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use ratatui::{buffer::Buffer, layout::Rect, style::Color, widgets::Widget};
-use rmpv::Value;
-use serde_json::{Value as Json, json};
-use tui_term::{vt100, widget::PseudoTerminal};
+use std::borrow::Cow;
+use std::cell::{RefCell, RefMut};
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
-use crate::{
-    annotations::{self, Position},
-    git::{FileDiff, RowKind},
-    theme::Palette,
-};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-fn error(e: impl std::fmt::Display) -> io::Error {
-    io::Error::other(e.to_string())
+use crate::annotations::{self, Note, Position, Selection};
+use crate::git::{FileDiff, RowKind};
+use crate::navigation::{self, Hit, Search};
+use crate::theme::Palette;
+use crate::wrap::{WrapCache, Wrapped, clusters, wrap_row};
+
+/// Narrowest text column of each split pane; below it the reader stacks.
+const MIN_SPLIT_TEXT: u16 = 16;
+
+/// Cursor and viewport movements inside the reader.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Motion {
+    Left,
+    Right,
+    Up,
+    Down,
+    WordNext,
+    WordBack,
+    WordEnd,
+    LineStart,
+    FirstNonBlank,
+    LineEnd,
+    Top,
+    Bottom,
+    HalfDown,
+    HalfUp,
+    PageDown,
+    PageUp,
+    ScrollDown,
+    ScrollUp,
 }
 
+/// One display row of the split layout, as indices into the diff rows;
+/// `None` is filler on the shorter side of a change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SplitRow {
+    pub old: Option<usize>,
+    pub new: Option<usize>,
+}
+
+/// Where `[` / `]` land: the first changed row of a hunk, the row to show
+/// above it, and whether the hunk only deletes lines.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Target {
+    row: usize,
+    anchor: usize,
+    old_side: bool,
+}
+
+type RowKey = (RowKind, Option<u32>, Option<u32>);
+/// A row's old and new line numbers, as notes store them.
+type RowLines = (Option<u32>, Option<u32>);
+
+fn is_source(kind: RowKind) -> bool {
+    !matches!(kind, RowKind::Hunk | RowKind::Meta)
+}
+
+fn changed(kind: RowKind) -> bool {
+    matches!(kind, RowKind::Add | RowKind::Del)
+}
+
+/// Everything derived from the document's text and line numbers.
+#[derive(Default)]
+struct Doc {
+    /// Bumps whenever text or line numbers change (not for highlighting).
+    revision: u64,
+    /// Whole-file mode, which changes the hunk targets.
+    whole: bool,
+    texts: Vec<String>,
+    keys: Vec<RowKey>,
+    split: Vec<SplitRow>,
+    split_of: Vec<usize>,
+    stacked_rows: Vec<usize>,
+    old_rows: Vec<usize>,
+    new_rows: Vec<usize>,
+    targets: Vec<Target>,
+    /// The hunk header above each row (itself, for headers).
+    hunk_of: Vec<Option<usize>>,
+}
+
+impl Doc {
+    fn new(texts: Vec<String>, keys: Vec<RowKey>, whole: bool, revision: u64) -> Self {
+        let n = keys.len();
+        let mut split = Vec::new();
+        let mut split_of = vec![0; n];
+        let mut i = 0;
+        while i < n {
+            if changed(keys[i].0) {
+                let start = i;
+                while i < n && changed(keys[i].0) {
+                    i += 1;
+                }
+                let dels: Vec<usize> = (start..i).filter(|&r| keys[r].0 == RowKind::Del).collect();
+                let adds: Vec<usize> = (start..i).filter(|&r| keys[r].0 == RowKind::Add).collect();
+                for k in 0..dels.len().max(adds.len()) {
+                    let (old, new) = (dels.get(k).copied(), adds.get(k).copied());
+                    for r in old.into_iter().chain(new) {
+                        split_of[r] = split.len();
+                    }
+                    split.push(SplitRow { old, new });
+                }
+            } else {
+                split_of[i] = split.len();
+                split.push(SplitRow {
+                    old: Some(i),
+                    new: Some(i),
+                });
+                i += 1;
+            }
+        }
+        let rows =
+            |keep: fn(RowKind) -> bool| (0..n).filter(|&r| keep(keys[r].0)).collect::<Vec<_>>();
+        let mut header = None;
+        let hunk_of = keys
+            .iter()
+            .enumerate()
+            .map(|(r, k)| {
+                if k.0 == RowKind::Hunk {
+                    header = Some(r);
+                }
+                header
+            })
+            .collect();
+        Self {
+            hunk_of,
+            revision,
+            stacked_rows: rows(is_source),
+            old_rows: rows(|k| matches!(k, RowKind::Del | RowKind::Ctx)),
+            new_rows: rows(|k| matches!(k, RowKind::Add | RowKind::Ctx)),
+            targets: targets(&keys, whole),
+            whole,
+            texts,
+            keys,
+            split,
+            split_of,
+        }
+    }
+}
+
+/// Hunk targets: in hunk mode, the first change after each header; in
+/// whole-file mode, the start of each run of changes.
+fn targets(keys: &[RowKey], whole: bool) -> Vec<Target> {
+    let mut out = Vec::new();
+    let deleted_only =
+        |range: std::ops::Range<usize>| !range.into_iter().any(|r| keys[r].0 == RowKind::Add);
+    if !whole && keys.iter().any(|k| k.0 == RowKind::Hunk) {
+        let mut start = 0;
+        while start < keys.len() {
+            let end = (start + 1..keys.len())
+                .find(|&r| keys[r].0 == RowKind::Hunk)
+                .unwrap_or(keys.len());
+            if let Some(row) = (start..end).find(|&r| changed(keys[r].0)) {
+                let anchor = if keys[start].0 == RowKind::Hunk {
+                    start
+                } else {
+                    row
+                };
+                out.push(Target {
+                    row,
+                    anchor,
+                    old_side: deleted_only(start..end),
+                });
+            }
+            start = end;
+        }
+    } else {
+        let (mut r, mut previous_end) = (0, 0);
+        while r < keys.len() {
+            if !changed(keys[r].0) {
+                r += 1;
+                continue;
+            }
+            let start = r;
+            while r < keys.len() && changed(keys[r].0) {
+                r += 1;
+            }
+            let anchor = start.saturating_sub(3).max(previous_end);
+            out.push(Target {
+                row: start,
+                anchor,
+                old_side: deleted_only(start..r),
+            });
+            previous_end = r;
+        }
+    }
+    out
+}
+
+/// A note card drawn above the first annotated row.
+struct Card {
+    lines: Vec<String>,
+    width: usize,
+    old_side: bool,
+}
+
+impl Card {
+    fn height(&self) -> usize {
+        self.lines.len() + 4
+    }
+}
+
+/// Wraps a comment to at most 64 columns and three quarters of the text area.
+fn card(comment: &str, text_width: usize, old_side: bool) -> Card {
+    let max = (text_width * 3 / 4).clamp(10, 64);
+    let body = max - 6;
+    let mut lines = Vec::new();
+    for line in comment.replace('\t', "    ").split('\n') {
+        let mut part = String::new();
+        for c in line.chars() {
+            if part.width() + c.width().unwrap_or(0) > body && !part.is_empty() {
+                match part.rfind(' ') {
+                    Some(i) if i > 0 => {
+                        let rest = part[i + 1..].to_string();
+                        part.truncate(i);
+                        lines.push(std::mem::replace(&mut part, rest));
+                    }
+                    _ => lines.push(std::mem::take(&mut part)),
+                }
+            }
+            part.push(c);
+        }
+        lines.push(part);
+    }
+    let widest = lines.iter().map(|l| l.width()).max().unwrap_or(0);
+    Card {
+        width: max.min((widest + 6).max(28)),
+        lines,
+        old_side,
+    }
+}
+
+/// Visual rows for one width: wraps, note cards, and the scroll position.
+#[derive(Default)]
+struct View {
+    key: Option<(u64, u16, u16, bool, u64, u64)>,
+    notes_key: u64,
+    /// The file's notes from the last draw: source locations and comment.
+    notes: Vec<(Vec<RowLines>, String)>,
+    annotated: Vec<bool>,
+    cards: HashMap<usize, Vec<Card>>,
+    wraps: Vec<Wrapped>,
+    lines: WrapCache,
+    scroll: usize,
+    /// The cursor's row inside the viewport, kept across rebuilds.
+    offset: usize,
+}
+
+impl View {
+    fn cards_height(&self, unit: usize) -> usize {
+        self.cards
+            .get(&unit)
+            .map_or(0, |cards| cards.iter().map(Card::height).sum())
+    }
+}
+
+/// Diff columns: line number, sign, and text.
+#[derive(Clone, Copy)]
+struct Geom {
+    width: u16,
+    num_w: u16,
+    gutter_w: u16,
+    text_off: u16,
+    text_w: u16,
+}
+
+impl Geom {
+    fn new(max_lineno: u32, width: u16) -> Self {
+        let num_w = max_lineno.max(1).to_string().len().max(2) as u16;
+        let gutter_w = num_w + 2;
+        let text_off = gutter_w + 2;
+        // One free column on the right, so text doesn't touch the edge.
+        let text_w = width.saturating_sub(text_off + 1).max(1);
+        Self {
+            width,
+            num_w,
+            gutter_w,
+            text_off,
+            text_w,
+        }
+    }
+}
+
+/// `@@ -1,3 +1,4 @@ fn foo` → (`@@ -1,3 +1,4 @@`, ` fn foo`).
+fn split_hunk(h: &str) -> (&str, &str) {
+    match h.get(2..).and_then(|r| r.find("@@")) {
+        Some(i) => h.split_at(i + 4),
+        None => (h, ""),
+    }
+}
+
+struct Paint<'a> {
+    diff: &'a FileDiff,
+    view: &'a View,
+    p: &'a Palette,
+    g: Geom,
+    focused: bool,
+    cursor: Position,
+}
+
+#[derive(Default)]
 pub struct Reader {
-    child: Box<dyn Child + Send + Sync>,
-    master: Box<dyn MasterPty + Send>,
-    screen: Arc<Mutex<vt100::Parser>>,
-    updates: mpsc::Receiver<()>,
-    rpc: UnixStream,
-    messages: mpsc::Receiver<Value>,
-    actions: Vec<Json>,
-    serial: u64,
-    size: (u16, u16),
-    pub generation: Option<u64>,
-    pub seek: bool,
-    pub split: bool,
-    notes: Vec<Json>,
-    _directory: tempfile::TempDir,
+    generation: Option<u64>,
+    path: String,
+    max_lineno: u32,
+    doc: Doc,
+    cursor: Position,
+    /// The focused side in split layout.
+    old_side: bool,
+    selection: Option<Selection>,
+    press: Option<(Position, bool)>,
+    split: bool,
+    area: Rect,
+    hscroll: usize,
+    search: Option<Search>,
+    hits: Vec<Hit>,
+    highlight: bool,
+    /// Folded hunks, by header row; cleared when the content changes.
+    folded: HashSet<usize>,
+    /// Bumps on every fold change, so the layout rebuilds.
+    folds: u64,
+    view: RefCell<View>,
 }
 
 impl Reader {
-    pub fn start(root: &Path) -> io::Result<Self> {
-        // /tmp keeps Unix socket paths below macOS's 104-byte limit.
-        let directory = tempfile::Builder::new()
-            .prefix("rexdiff-")
-            .tempdir_in("/tmp")?;
-        let socket = directory.path().join("nvim.sock");
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(error)?;
-        let mut command = CommandBuilder::new("nvim");
-        command.args(["--clean", "-n", "-i", "NONE", "-M", "--listen"]);
-        command.arg(&socket);
-        command.cwd(root);
-        command.env("TERM", "xterm-256color");
-        // The host supplies colors; the nested terminal has no OSC query responder.
-        command.env("NVIM_NOTTYFAST", "1");
-        command.env("NVIM_LOG_FILE", directory.path().join("nvim.log"));
-        let mut output = pair.master.try_clone_reader().map_err(error)?;
-        let mut child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|e| error(format!("Cannot start Neovim (install nvim 0.10+): {e}")))?;
-        drop(pair.slave);
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
-        let (tx, updates) = mpsc::sync_channel(1);
-        let parser = screen.clone();
-        std::thread::spawn(move || {
-            let mut bytes = [0; 16384];
-            while let Ok(n) = output.read(&mut bytes) {
-                if n == 0 {
-                    break;
+    pub fn loaded(&self, generation: u64) -> bool {
+        self.generation == Some(generation)
+    }
+
+    /// Whether the split layout is showing (it stacks in tiny panes).
+    pub fn split(&self) -> bool {
+        self.split_active()
+    }
+
+    #[cfg(test)]
+    pub fn cursor(&self) -> Position {
+        self.clamped()
+    }
+
+    /// The side whose line numbers source jumps use.
+    pub fn old_side(&self) -> bool {
+        if self.split_active() {
+            self.old_side
+        } else {
+            self.kind(self.cursor.row) == Some(RowKind::Del)
+        }
+    }
+
+    pub fn resize(&mut self, area: Rect) {
+        if area != self.area {
+            self.area = area;
+            self.normalize_side();
+        }
+    }
+
+    /// Shows `diff`. A new file starts at its first hunk; a reload of the same
+    /// file keeps the cursor on its source row. `seek` moves the cursor.
+    pub fn load(&mut self, diff: &FileDiff, generation: u64, seek: Option<Position>) {
+        if self.generation != Some(generation) {
+            let same_file = self.generation.is_some() && self.path == diff.path;
+            self.generation = Some(generation);
+            let texts: Vec<String> = diff.rows.iter().map(annotations::text).collect();
+            let keys: Vec<RowKey> = diff.rows.iter().map(|r| (r.kind, r.old, r.new)).collect();
+            let whole = diff.context >= crate::app::FULL_CONTEXT;
+            if !same_file
+                || texts != self.doc.texts
+                || keys != self.doc.keys
+                || whole != self.doc.whole
+            {
+                // A hunk header has no line numbers: follow the source row below it.
+                let rows = &self.doc.stacked_rows;
+                let previous = rows
+                    .get(rows.partition_point(|&r| r < self.cursor.row))
+                    .or(rows.last())
+                    .filter(|_| same_file)
+                    .map(|&r| self.doc.keys[r]);
+                self.doc = Doc::new(texts, keys, whole, self.doc.revision + 1);
+                self.path = diff.path.clone();
+                self.max_lineno = diff.max_lineno;
+                self.selection = None;
+                self.folded.clear();
+                self.press = None;
+                self.hits = self.search.as_ref().map_or_else(Vec::new, |s| {
+                    navigation::matches(
+                        &self.doc.texts,
+                        self.doc.stacked_rows.iter().copied(),
+                        &s.regex,
+                    )
+                });
+                match previous {
+                    Some(key) => {
+                        self.cursor.row = self.relocate(key);
+                        self.normalize_side();
+                    }
+                    None => {
+                        self.hscroll = 0;
+                        if seek.is_none() {
+                            self.first_hunk(diff);
+                        }
+                    }
                 }
-                parser.lock().unwrap().process(&bytes[..n]);
-                let _ = tx.try_send(());
             }
-        });
-        let until = Instant::now() + Duration::from_secs(3);
-        let rpc = loop {
-            match UnixStream::connect(&socket) {
-                Ok(stream) => break stream,
-                Err(e) if Instant::now() >= until => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error(format!("Neovim RPC startup failed: {e}")));
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(10)),
-            }
-        };
-        let mut incoming = match rpc
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .and_then(|_| rpc.try_clone())
+        }
+        if let Some(pos) = seek {
+            self.seek(diff, pos);
+        }
+    }
+
+    /// The row with the same line numbers, or the nearest source line.
+    fn relocate(&self, (_, old, new): RowKey) -> usize {
+        let keys = &self.doc.keys;
+        if let Some(r) = keys
+            .iter()
+            .position(|k| is_source(k.0) && k.1 == old && k.2 == new)
         {
-            Ok(incoming) => incoming,
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(e);
-            }
+            return r;
+        }
+        let Some(line) = new.or(old) else {
+            return self.doc.stacked_rows.first().copied().unwrap_or(0);
         };
-        let (tx, messages) = mpsc::channel();
-        std::thread::spawn(move || {
-            while let Ok(value) = rmpv::decode::read_value(&mut incoming) {
-                if tx.send(value).is_err() {
-                    break;
-                }
-            }
-        });
-        let mut reader = Self {
-            child,
-            master: pair.master,
-            screen,
-            updates,
-            rpc,
-            messages,
-            actions: Vec::new(),
-            serial: 0,
-            size: (24, 80),
-            generation: None,
-            seek: false,
-            split: false,
-            notes: Vec::new(),
-            _directory: directory,
+        keys.iter()
+            .enumerate()
+            .filter(|(_, k)| is_source(k.0))
+            .filter_map(|(r, k)| k.2.or(k.1).map(|n| (r, n.abs_diff(line))))
+            .min_by_key(|(_, distance)| *distance)
+            .map_or(0, |(r, _)| r)
+    }
+
+    fn kind(&self, row: usize) -> Option<RowKind> {
+        self.doc.keys.get(row).map(|k| k.0)
+    }
+
+    fn split_active(&self) -> bool {
+        self.split
+            && self.area.width > 2 * (Geom::new(self.max_lineno, 0).text_off + MIN_SPLIT_TEXT + 1)
+    }
+
+    fn on_side(&self, row: usize, old: bool) -> bool {
+        match self.kind(row) {
+            Some(RowKind::Ctx) => true,
+            Some(RowKind::Del) => old,
+            Some(RowKind::Add) => !old,
+            _ => false,
+        }
+    }
+
+    /// Selectable rows in display order: source rows on the focused side,
+    /// with folded hunks standing in as their headers.
+    fn side_rows(&self) -> Cow<'_, [usize]> {
+        let rows = match (self.split_active(), self.old_side) {
+            (false, _) => &self.doc.stacked_rows,
+            (true, true) => &self.doc.old_rows,
+            (true, false) => &self.doc.new_rows,
         };
-        let info = reader.call("nvim_get_api_info", json!([]))?;
-        let channel = info[0]
-            .as_u64()
-            .ok_or_else(|| error("Invalid Neovim API response"))?;
-        let version = reader.call("nvim_eval", json!(["has('nvim-0.10')"]))?;
-        if version.as_u64() != Some(1) {
-            return Err(error("rexdiff requires Neovim 0.10 or newer"));
+        if self.folded.is_empty() {
+            return Cow::Borrowed(rows);
         }
-        reader.call(
-            "nvim_exec_lua",
-            json!([include_str!("reader.lua"), [channel]]),
-        )?;
-        Ok(reader)
+        let mut out: Vec<usize> = rows.iter().copied().filter(|&r| !self.hidden(r)).collect();
+        out.extend(self.folded.iter().copied());
+        out.sort_unstable();
+        Cow::Owned(out)
     }
 
-    fn send(&mut self, value: Json) -> io::Result<()> {
-        let value = rmpv::ext::to_value(value).map_err(error)?;
-        rmpv::encode::write_value(&mut self.rpc, &value).map_err(error)
+    /// Inside a folded hunk (its header stays visible).
+    fn hidden(&self, row: usize) -> bool {
+        self.kind(row) != Some(RowKind::Hunk)
+            && self
+                .doc
+                .hunk_of
+                .get(row)
+                .copied()
+                .flatten()
+                .is_some_and(|h| self.folded.contains(&h))
     }
 
-    pub fn notify(&mut self, method: &str, args: Json) -> io::Result<()> {
-        self.send(json!([2, method, args]))
-    }
-
-    pub fn call(&mut self, method: &str, args: Json) -> io::Result<Value> {
-        self.serial += 1;
-        self.send(json!([0, self.serial, method, args]))?;
-        let until = Instant::now() + Duration::from_secs(2);
-        loop {
-            let value = self
-                .messages
-                .recv_timeout(until.saturating_duration_since(Instant::now()))
-                .map_err(error)?;
-            if value[0].as_u64() == Some(1) && value[1].as_u64() == Some(self.serial) {
-                if !value[2].is_nil() {
-                    return Err(error(format!("Neovim: {}", value[2])));
-                }
-                return Ok(value[3].clone());
+    /// `z` in the reader: folds the hunk under the cursor, or unfolds it.
+    /// `false` when the cursor isn't in a hunk.
+    pub fn toggle_fold(&mut self, diff: &FileDiff) -> bool {
+        let row = self.cursor.row;
+        if self.folded.remove(&row) {
+            // Back onto the hunk's first source row.
+            let next = self
+                .doc
+                .stacked_rows
+                .get(self.doc.stacked_rows.partition_point(|&r| r <= row));
+            if let Some(&next) = next.filter(|&&r| self.doc.hunk_of[r] == Some(row)) {
+                self.cursor = Position { row: next, col: 0 };
+                self.normalize_side();
+                self.snap_to_side();
             }
-            self.receive(value);
+        } else {
+            let Some(header) = self.doc.hunk_of.get(row).copied().flatten() else {
+                return false;
+            };
+            self.folded.insert(header);
+            self.cursor = Position {
+                row: header,
+                col: 0,
+            };
+            self.selection = None;
+        }
+        self.folds += 1;
+        self.ensure_visible(diff);
+        true
+    }
+
+    /// Unfolds the hunk holding `row`, for jumps that land inside it.
+    fn reveal(&mut self, row: usize) {
+        if self.hidden(row)
+            && let Some(header) = self.doc.hunk_of[row]
+        {
+            self.folded.remove(&header);
+            self.folds += 1;
         }
     }
 
-    fn receive(&mut self, value: Value) {
-        if value[0].as_u64() == Some(2) && value[1].as_str() == Some("rexdiff") {
-            if let Ok(action) = rmpv::ext::from_value(value[2][0].clone()) {
-                self.actions.push(action);
-            }
+    fn unit_of(&self, row: usize) -> usize {
+        if self.split_active() {
+            self.doc.split_of.get(row).copied().unwrap_or(0)
+        } else {
+            row
         }
     }
 
-    pub fn poll(&mut self) -> io::Result<(bool, Vec<Json>)> {
-        if let Some(status) = self.child.try_wait().map_err(error)? {
-            return Err(error(format!(
-                "Neovim exited ({status}); restart rexdiff to reopen the reader"
-            )));
-        }
-        while let Ok(message) = self.messages.try_recv() {
-            self.receive(message);
-        }
-        Ok((
-            self.updates.try_iter().count() > 0,
-            std::mem::take(&mut self.actions),
-        ))
+    fn len(&self, row: usize) -> usize {
+        self.doc.texts.get(row).map_or(0, |t| t.chars().count())
     }
 
-    pub fn load(
-        &mut self,
-        diff: &FileDiff,
-        generation: u64,
-        cursor: Position,
-        palette: &Palette,
-    ) -> io::Result<()> {
-        let mut document = document(diff, generation, cursor, palette);
-        document["seek"] = json!(self.seek);
-        document["split"] = json!(self.split);
-        self.call("nvim_exec_lua", json!(["RexDiffLoad(...)", [document]]))?;
-        self.generation = Some(generation);
-        self.seek = false;
-        self.notes.clear();
-        Ok(())
-    }
-
-    pub fn notes(&mut self, notes: Vec<Json>) -> io::Result<()> {
-        if notes != self.notes {
-            self.notify("nvim_exec_lua", json!(["RexDiffNotes(...)", [notes]]))?;
-            self.notes = notes;
-        }
-        Ok(())
-    }
-
-    pub fn goto(&mut self, cursor: Position, diff: &FileDiff) -> io::Result<()> {
-        self.move_to(cursor, diff, false, None)
-    }
-
-    fn move_to(
-        &mut self,
-        cursor: Position,
-        diff: &FileDiff,
-        center: bool,
-        old_side: Option<bool>,
-    ) -> io::Result<()> {
-        let byte = diff
-            .rows
-            .get(cursor.row)
-            .map(|r| {
-                annotations::text(r)
-                    .chars()
-                    .take(cursor.col)
-                    .map(char::len_utf8)
-                    .sum::<usize>()
+    /// Char offsets where the grapheme clusters of `row` start.
+    fn cluster_starts(&self, row: usize) -> Vec<usize> {
+        let mut at = 0;
+        clusters(self.doc.texts.get(row).map_or("", String::as_str))
+            .map(|(_, n, _)| {
+                at += n;
+                at - n
             })
-            .unwrap_or(0);
-        self.call(
-            "nvim_exec_lua",
-            json!(["RexDiffGoto(...)", [cursor.row, byte, center, old_side]]),
-        )
-        .map(|_| ())
+            .collect()
     }
 
-    pub fn reveal(&mut self, cursor: Position, diff: &FileDiff, old_side: bool) -> io::Result<()> {
-        self.move_to(cursor, diff, true, Some(old_side))
-    }
-
-    pub fn key(&mut self, key: KeyEvent) -> io::Result<()> {
-        if let Some(key) = key_notation(key) {
-            self.notify("nvim_input", json!([key]))?;
+    /// The cursor as shown: on the start of the cluster holding its column,
+    /// or of the row's last cluster.
+    fn clamped(&self) -> Position {
+        let starts = self.cluster_starts(self.cursor.row);
+        Position {
+            row: self.cursor.row,
+            col: starts
+                .into_iter()
+                .take_while(|&s| s <= self.cursor.col)
+                .last()
+                .unwrap_or(0),
         }
-        Ok(())
     }
 
-    pub fn mouse(&mut self, event: MouseEvent, area: Rect) -> io::Result<()> {
-        let button = |b| match b {
-            MouseButton::Left => "left",
-            MouseButton::Right => "right",
-            MouseButton::Middle => "middle",
-        };
-        let (button, action) = match event.kind {
-            MouseEventKind::Down(b) => (button(b), "press"),
-            MouseEventKind::Up(b) => (button(b), "release"),
-            MouseEventKind::Drag(b) => (button(b), "drag"),
-            MouseEventKind::ScrollDown => ("wheel", "down"),
-            MouseEventKind::ScrollUp => ("wheel", "up"),
-            _ => return Ok(()),
-        };
-        self.notify(
-            "nvim_input_mouse",
-            json!([
-                button,
-                action,
-                "",
-                0,
-                event
-                    .row
-                    .saturating_sub(area.y)
-                    .min(area.height.saturating_sub(1)),
-                event
-                    .column
-                    .saturating_sub(area.x)
-                    .min(area.width.saturating_sub(1))
-            ]),
-        )
+    /// Split layout follows the cursor's row: deleted lines are old, added new.
+    fn normalize_side(&mut self) {
+        if self.split_active() {
+            match self.kind(self.cursor.row) {
+                Some(RowKind::Del) => self.old_side = true,
+                Some(RowKind::Add) => self.old_side = false,
+                _ => {}
+            }
+        }
     }
 
-    pub fn resize(&mut self, area: Rect) -> io::Result<()> {
-        let size = (area.height.max(2), area.width.max(12));
-        if size != self.size {
-            self.master
-                .resize(PtySize {
-                    rows: size.0,
-                    cols: size.1,
-                    pixel_width: 0,
-                    pixel_height: 0,
+    /// In split layout, moves the cursor to the nearest row on the focused side.
+    fn snap_to_side(&mut self) {
+        if !self.split_active()
+            || self.on_side(self.cursor.row, self.old_side)
+            || self.folded.contains(&self.cursor.row)
+            || self.doc.split.is_empty()
+        {
+            return;
+        }
+        let old = self.old_side;
+        let unit = self.unit_of(self.cursor.row);
+        let side_row = |u: usize| {
+            let s = self.doc.split.get(u)?;
+            let r = if old { s.old } else { s.new }?;
+            (self.on_side(r, old) && !self.hidden(r) || self.folded.contains(&r)).then_some(r)
+        };
+        let found = (0..self.doc.split.len())
+            .find_map(|d| side_row(unit + d).or_else(|| side_row(unit.checked_sub(d)?)));
+        if let Some(r) = found {
+            self.cursor.row = r;
+        }
+    }
+
+    fn body(&self) -> Rect {
+        let a = self.area;
+        if self.split_active() {
+            Rect::new(a.x, a.y + 1, a.width, a.height.saturating_sub(1))
+        } else {
+            a
+        }
+    }
+
+    fn geom(&self) -> Geom {
+        let width = if self.split_active() {
+            self.area.width.saturating_sub(1) / 2
+        } else {
+            self.area.width
+        };
+        Geom::new(self.max_lineno, width)
+    }
+
+    fn height(&self) -> usize {
+        self.body().height.max(1) as usize
+    }
+
+    /// The visual rows for the current width, rebuilt when the document,
+    /// size, layout, or (when given) the file's notes change.
+    fn view(&self, diff: &FileDiff, notes: Option<&[Note]>) -> RefMut<'_, View> {
+        let mut v = self.view.borrow_mut();
+        if let Some(notes) = notes {
+            let mine = || {
+                notes.iter().filter(|n| {
+                    n.path == diff.path && n.revision == diff.revision && !n.locations.is_empty()
                 })
-                .map_err(error)?;
-            self.screen
-                .lock()
-                .unwrap()
-                .screen_mut()
-                .set_size(size.0, size.1);
-            self.size = size;
+            };
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            for note in mine() {
+                (&note.locations, &note.comment).hash(&mut hash);
+            }
+            let key = hash.finish();
+            if key != v.notes_key {
+                v.notes_key = key;
+                v.notes = mine()
+                    .map(|n| (n.locations.clone(), n.comment.clone()))
+                    .collect();
+            }
         }
+        let key = (
+            self.doc.revision,
+            self.area.width,
+            self.area.height,
+            self.split_active(),
+            v.notes_key,
+            self.folds,
+        );
+        let previous = v.key;
+        if previous != Some(key) {
+            v.key = Some(key);
+            // Resizes and note changes keep the top row; new content keeps the cursor's place.
+            let top = previous
+                .filter(|k| k.0 == key.0 && k.3 == key.3)
+                .map(|_| v.lines.locate(v.scroll).0);
+            self.rebuild(&mut v, diff, top);
+        }
+        v
+    }
+
+    fn rebuild(&self, v: &mut View, diff: &FileDiff, top: Option<usize>) {
+        let split = self.split_active();
+        let g = self.geom();
+        let View {
+            notes,
+            annotated,
+            cards,
+            ..
+        } = v;
+        *annotated = vec![false; self.doc.keys.len()];
+        cards.clear();
+        for (locations, comment) in notes.iter() {
+            let rows: Vec<usize> = (0..self.doc.keys.len())
+                .filter(|&r| {
+                    let (_, old, new) = self.doc.keys[r];
+                    (old.is_some() || new.is_some()) && locations.contains(&(old, new))
+                })
+                .collect();
+            let Some(&first) = rows.first() else { continue };
+            for r in rows {
+                annotated[r] = true;
+            }
+            let old_side = split && !self.on_side(first, false);
+            cards.entry(self.unit_of(first)).or_default().push(card(
+                comment,
+                g.text_w as usize,
+                old_side,
+            ));
+        }
+        v.wraps = if split {
+            Vec::new()
+        } else {
+            diff.rows
+                .iter()
+                .map(|r| wrap_row(r, g.text_w as usize))
+                .collect()
+        };
+        let units = if split {
+            self.doc.split.len()
+        } else {
+            self.doc.keys.len()
+        };
+        // Rows inside a folded hunk take no lines (nor do their cards).
+        let lines: Vec<usize> = (0..units)
+            .map(|u| {
+                let row = if split {
+                    self.doc.split[u].old.or(self.doc.split[u].new).unwrap_or(0)
+                } else {
+                    u
+                };
+                if self.hidden(row) {
+                    0
+                } else {
+                    v.cards_height(u) + if split { 1 } else { v.wraps[u].starts.len() }
+                }
+            })
+            .collect();
+        v.lines.rebuild(lines.into_iter());
+        let h = self.height();
+        let cursor = self.cursor_line(v);
+        v.scroll = match top {
+            Some(unit) => v.lines.first.get(unit).copied().unwrap_or(0),
+            None => cursor.saturating_sub(v.offset.min(h - 1)),
+        };
+        self.settle(v, cursor);
+    }
+
+    /// Clamps the scroll position and records the cursor's place in the viewport.
+    fn settle(&self, v: &mut View, cursor: usize) {
+        let h = self.height();
+        v.scroll = v.scroll.min(v.lines.total().saturating_sub(h));
+        if cursor < v.scroll {
+            v.scroll = cursor;
+        } else if cursor >= v.scroll + h {
+            v.scroll = cursor + 1 - h;
+        }
+        v.offset = cursor - v.scroll;
+    }
+
+    fn cursor_line(&self, v: &View) -> usize {
+        if self.doc.keys.is_empty() {
+            return 0;
+        }
+        let unit = self.unit_of(self.cursor.row);
+        let sub = match v.wraps.get(unit) {
+            Some(w) if !self.split_active() => w
+                .starts
+                .partition_point(|&s| s <= self.clamped().col)
+                .saturating_sub(1),
+            _ => 0,
+        };
+        v.lines.first.get(unit).copied().unwrap_or(0) + v.cards_height(unit) + sub
+    }
+
+    fn ensure_visible(&mut self, diff: &FileDiff) {
+        if self.doc.keys.is_empty() {
+            return;
+        }
+        {
+            let mut v = self.view(diff, None);
+            let cursor = self.cursor_line(&v);
+            let top = v
+                .lines
+                .first
+                .get(self.unit_of(self.cursor.row))
+                .copied()
+                .unwrap_or(cursor);
+            // Moving up onto an annotated row shows its card too.
+            if cursor < v.scroll && cursor - top < self.height() {
+                v.scroll = top;
+            }
+            self.settle(&mut v, cursor);
+        }
+        self.pan_to_cursor();
+    }
+
+    /// Split view doesn't wrap: pans sideways to keep the cursor's column visible.
+    fn pan_to_cursor(&mut self) {
+        if self.split_active() {
+            let col = self.clamped().col;
+            let (mut at, mut x, mut cw) = (0, 0, 1);
+            for (_, n, w) in clusters(&self.doc.texts[self.cursor.row]) {
+                if at == col {
+                    cw = w.max(1);
+                    break;
+                }
+                at += n;
+                x += w;
+            }
+            // The whole cluster, so a wide one at the right edge still shows.
+            let w = self.geom().text_w as usize;
+            if x < self.hscroll {
+                self.hscroll = x;
+            } else if x + cw > self.hscroll + w {
+                self.hscroll = x + cw - w;
+            }
+        }
+    }
+
+    /// The selectable position shown on visual line `line`, or the nearest
+    /// one after it (`forward`) or before it. Wrapped rows give the start of
+    /// that visual line, keeping the cursor's column when it's already there.
+    fn position_at(
+        &self,
+        v: &View,
+        line: usize,
+        forward: bool,
+        rows: &[usize],
+    ) -> Option<Position> {
+        let split = self.split_active();
+        let mut line = line.min(v.lines.total().checked_sub(1)?);
+        loop {
+            let (unit, sub) = v.lines.locate(line);
+            let row = if split {
+                let s = self.doc.split[unit];
+                if self.old_side { s.old } else { s.new }
+            } else {
+                Some(unit)
+            };
+            if let (Some(row), Some(sub)) = (row, sub.checked_sub(v.cards_height(unit)))
+                && rows.binary_search(&row).is_ok()
+            {
+                let col = match v.wraps.get(unit).filter(|_| !split) {
+                    Some(w) => {
+                        let (start, end) = (
+                            w.starts[sub],
+                            w.starts.get(sub + 1).copied().unwrap_or(usize::MAX),
+                        );
+                        let col = self.clamped().col;
+                        if row == self.cursor.row && (start..end).contains(&col) {
+                            col
+                        } else {
+                            start
+                        }
+                    }
+                    None => self.cursor.col,
+                };
+                return Some(Position { row, col });
+            }
+            line = if forward {
+                Some(line + 1).filter(|&l| l < v.lines.total())?
+            } else {
+                line.checked_sub(1)?
+            };
+        }
+    }
+
+    fn scroll_lines(&mut self, diff: &FileDiff, delta: isize) {
+        let (top, bottom) = {
+            let mut v = self.view(diff, None);
+            let h = self.height();
+            let max = v.lines.total().saturating_sub(h);
+            v.scroll = v.scroll.saturating_add_signed(delta).min(max);
+            (v.scroll, v.scroll + h - 1)
+        };
+        // Keep the cursor on screen, like Vim's Ctrl+e / Ctrl+y, down to the
+        // visual line of a wrapped row.
+        let target = {
+            let v = self.view.borrow();
+            let current = self.cursor_line(&v);
+            let rows = self.side_rows();
+            if current < top {
+                self.position_at(&v, top, true, &rows)
+            } else if current > bottom {
+                self.position_at(&v, bottom, false, &rows)
+            } else {
+                None
+            }
+        };
+        if let Some(pos) = target {
+            self.cursor = pos;
+        }
+        let mut v = self.view(diff, None);
+        let cursor = self.cursor_line(&v);
+        v.offset = cursor.saturating_sub(v.scroll).min(self.height() - 1);
+    }
+
+    fn step(&mut self, delta: isize) {
+        let rows = self.side_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let k = rows
+            .binary_search(&self.cursor.row)
+            .unwrap_or_else(|k| k.min(rows.len() - 1));
+        self.cursor.row = rows[k.saturating_add_signed(delta).min(rows.len() - 1)];
+    }
+
+    pub fn motion(&mut self, diff: &FileDiff, motion: Motion) {
+        if self.doc.keys.is_empty() {
+            return;
+        }
+        let h = self.height();
+        let at = self.clamped();
+        match motion {
+            // Whole grapheme clusters, so `h` / `l` never stop inside one.
+            Motion::Left => {
+                let starts = self.cluster_starts(at.row);
+                self.cursor.col = starts
+                    .iter()
+                    .rev()
+                    .find(|&&s| s < at.col)
+                    .copied()
+                    .unwrap_or(0);
+            }
+            Motion::Right => {
+                let starts = self.cluster_starts(at.row);
+                let next = starts.iter().find(|&&s| s > at.col).or(starts.last());
+                self.cursor.col = next.copied().unwrap_or(0);
+            }
+            Motion::Up => self.step(-1),
+            Motion::Down => self.step(1),
+            Motion::WordNext | Motion::WordBack | Motion::WordEnd => {
+                let c = match motion {
+                    Motion::WordBack => 'b',
+                    Motion::WordEnd => 'e',
+                    _ => 'w',
+                };
+                self.cursor = navigation::word(&self.doc.texts, &self.side_rows(), at, c);
+            }
+            Motion::LineStart => self.cursor.col = 0,
+            Motion::FirstNonBlank => {
+                self.cursor.col = self.doc.texts[at.row]
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .count();
+            }
+            Motion::LineEnd => {
+                self.cursor.col = self.cluster_starts(at.row).last().copied().unwrap_or(0)
+            }
+            Motion::Top | Motion::Bottom => {
+                let rows = self.side_rows();
+                let row = if motion == Motion::Top {
+                    rows.first()
+                } else {
+                    rows.last()
+                };
+                if let Some(&row) = row {
+                    self.cursor = Position { row, col: 0 };
+                }
+            }
+            Motion::HalfDown | Motion::HalfUp | Motion::PageDown | Motion::PageUp => {
+                let page = if matches!(motion, Motion::HalfDown | Motion::HalfUp) {
+                    h / 2
+                } else {
+                    h.saturating_sub(1)
+                };
+                let delta = page.max(1) as isize;
+                let delta = if matches!(motion, Motion::HalfUp | Motion::PageUp) {
+                    -delta
+                } else {
+                    delta
+                };
+                // Move by visual lines, so wrapped rows and note cards count.
+                let target = {
+                    let mut v = self.view(diff, None);
+                    let current = self.cursor_line(&v);
+                    v.scroll = v
+                        .scroll
+                        .saturating_add_signed(delta)
+                        .min(v.lines.total().saturating_sub(h));
+                    let line = current.saturating_add_signed(delta);
+                    let rows = self.side_rows();
+                    self.position_at(&v, line, delta > 0, &rows)
+                        .or_else(|| self.position_at(&v, line, delta < 0, &rows))
+                };
+                if let Some(pos) = target {
+                    self.cursor = pos;
+                }
+            }
+            Motion::ScrollDown => return self.scroll_lines(diff, 1),
+            Motion::ScrollUp => return self.scroll_lines(diff, -1),
+        }
+        self.ensure_visible(diff);
+    }
+
+    /// Moves to the first hunk, or the first source row when nothing changed.
+    pub fn first_hunk(&mut self, diff: &FileDiff) {
+        match self.doc.targets.first().copied() {
+            Some(target) => self.go_target(diff, target),
+            None => {
+                self.cursor = Position {
+                    row: self.doc.stacked_rows.first().copied().unwrap_or(0),
+                    col: 0,
+                };
+                self.normalize_side();
+                let mut v = self.view(diff, None);
+                v.scroll = 0;
+                let cursor = self.cursor_line(&v);
+                self.settle(&mut v, cursor);
+            }
+        }
+    }
+
+    /// Where a target lands: its row, or its header while the hunk is folded.
+    fn landing(&self, target: &Target) -> usize {
+        if self.hidden(target.row) {
+            self.doc.hunk_of[target.row].unwrap_or(target.row)
+        } else {
+            target.row
+        }
+    }
+
+    /// `[` / `]`: previous or next hunk, clamped at the ends. Returns a hint
+    /// when there's nowhere to go.
+    pub fn hunk(&mut self, diff: &FileDiff, forward: bool) -> Option<&'static str> {
+        let targets = &self.doc.targets;
+        if targets.is_empty() {
+            return Some("No changed hunks in this file");
+        }
+        let unit = self.unit_of(self.cursor.row);
+        let found = if forward {
+            targets
+                .iter()
+                .find(|t| self.unit_of(self.landing(t)) > unit)
+        } else {
+            targets
+                .iter()
+                .rev()
+                .find(|t| self.unit_of(self.landing(t)) < unit)
+        };
+        let Some(&target) = found else {
+            return Some(if forward { "Last hunk" } else { "First hunk" });
+        };
+        self.go_target(diff, target);
+        None
+    }
+
+    fn go_target(&mut self, diff: &FileDiff, target: Target) {
+        self.cursor = Position {
+            row: self.landing(&target),
+            col: 0,
+        };
+        self.old_side = target.old_side;
+        self.snap_to_side();
+        self.pan_to_cursor();
+        let h = self.height();
+        let mut v = self.view(diff, None);
+        let cursor = self.cursor_line(&v);
+        let anchor = v
+            .lines
+            .first
+            .get(self.unit_of(target.anchor))
+            .copied()
+            .unwrap_or(cursor);
+        // Show the hunk header above the change when both fit.
+        v.scroll = if anchor <= cursor && cursor < anchor + h {
+            anchor
+        } else {
+            cursor
+        };
+        self.settle(&mut v, cursor);
+    }
+
+    /// Moves to `pos` (the nearest source row), centered.
+    fn seek(&mut self, diff: &FileDiff, pos: Position) {
+        if self.doc.keys.is_empty() {
+            return;
+        }
+        let row = pos.row.min(self.doc.keys.len() - 1);
+        let rows = &self.doc.stacked_rows;
+        let row = rows
+            .get(rows.partition_point(|&r| r < row))
+            .or(rows.last())
+            .copied()
+            .unwrap_or(row);
+        self.reveal(row);
+        self.cursor = Position { row, col: pos.col };
+        self.normalize_side();
+        self.pan_to_cursor();
+        let h = self.height();
+        let mut v = self.view(diff, None);
+        let cursor = self.cursor_line(&v);
+        v.scroll = cursor.saturating_sub(h / 2);
+        self.settle(&mut v, cursor);
+    }
+
+    /// The row showing source line `line` on the given side. In stacked
+    /// layout a new-side miss falls back to deleted lines.
+    pub fn source_row(&self, line: u32, old_side: bool) -> Option<usize> {
+        let keys = &self.doc.keys;
+        let side = |r: &RowKey| {
+            is_source(r.0)
+                && if old_side {
+                    r.1 == Some(line)
+                } else {
+                    r.2 == Some(line)
+                }
+        };
+        keys.iter().position(side).or_else(|| {
+            (!self.split_active())
+                .then(|| {
+                    keys.iter()
+                        .position(|k| is_source(k.0) && k.1 == Some(line))
+                })
+                .flatten()
+        })
+    }
+
+    /// `<leader>h` / `<leader>l`: focus the old or new side of a split diff.
+    pub fn set_side(&mut self, diff: &FileDiff, old: bool) {
+        self.old_side = old;
+        if !self.split_active() {
+            return;
+        }
+        if self.selection.is_some_and(|s| s.old_side != Some(old)) {
+            self.selection = None;
+        }
+        self.snap_to_side();
+        self.ensure_visible(diff);
+    }
+
+    /// `S`: the next draw rebuilds the layout around the cursor.
+    pub fn toggle_split(&mut self) {
+        self.split = !self.split;
+        self.normalize_side();
+        self.snap_to_side();
+    }
+
+    /// `v` / `V`: start, switch, or end a character or line selection.
+    pub fn visual(&mut self, lines: bool) {
+        match self.selection {
+            Some(s) if s.lines == lines => self.selection = None,
+            Some(s) => self.selection = Some(Selection { lines, ..s }),
+            None if self.kind(self.cursor.row).is_some_and(is_source) => {
+                let old_side = self.split_active().then_some(self.old_side);
+                self.selection = Some(Selection {
+                    anchor: self.clamped(),
+                    lines,
+                    old_side,
+                });
+            }
+            None => {}
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Escape: clears the selection, then search highlights. `false` when
+    /// there was nothing to clear.
+    pub fn escape(&mut self) -> bool {
+        if self.selection.take().is_some() {
+            return true;
+        }
+        std::mem::take(&mut self.highlight)
+    }
+
+    fn in_selection(&self, s: &Selection, row: usize) -> bool {
+        !self.hidden(row)
+            && s.old_side.map_or_else(
+                || self.kind(row).is_some_and(is_source),
+                |old| self.on_side(row, old),
+            )
+    }
+
+    /// The selected text (or the cursor's line) with its rows, and whether
+    /// it was taken from the old side. `None` on headers and notices.
+    pub fn capture(&self) -> Option<(Vec<(usize, String)>, bool)> {
+        let cursor = self.clamped();
+        let Some(s) = self.selection else {
+            let source = self.kind(cursor.row).is_some_and(is_source);
+            let old_side = self.split_active() && self.old_side;
+            return source.then(|| {
+                (
+                    vec![(cursor.row, self.doc.texts[cursor.row].clone())],
+                    old_side,
+                )
+            });
+        };
+        let (lo, hi) = (s.anchor.min(cursor), s.anchor.max(cursor));
+        let rows = (lo.row..=hi.row)
+            .filter(|&r| self.in_selection(&s, r))
+            .map(|r| {
+                let text = &self.doc.texts[r];
+                let text = if s.lines {
+                    text.clone()
+                } else {
+                    text.chars()
+                        .enumerate()
+                        .filter(|&(col, _)| s.contains(cursor, Position { row: r, col }))
+                        .map(|(_, c)| c)
+                        .collect()
+                };
+                (r, text)
+            })
+            .collect();
+        Some((rows, s.old_side.unwrap_or(false)))
+    }
+
+    /// `/`: compiles and runs a new search; empty input repeats the last one.
+    /// An invalid pattern keeps the previous search and cursor.
+    pub fn search(&mut self, diff: &FileDiff, pattern: &str) -> Result<(), String> {
+        if !pattern.is_empty() {
+            let search = Search::new(pattern)?;
+            self.hits = navigation::matches(
+                &self.doc.texts,
+                self.doc.stacked_rows.iter().copied(),
+                &search.regex,
+            );
+            self.search = Some(search);
+        }
+        self.search_next(diff, false)
+    }
+
+    /// `n` / `N`: the next or previous match on the focused side, wrapping.
+    /// A match inside a folded hunk unfolds it.
+    pub fn search_next(&mut self, diff: &FileDiff, backward: bool) -> Result<(), String> {
+        let Some(search) = &self.search else {
+            return Err("No previous search".into());
+        };
+        self.highlight = true;
+        let eligible = |h: &&Hit| !self.split_active() || self.on_side(h.row, self.old_side);
+        let at = (self.cursor.row, self.clamped().col);
+        let next = if backward {
+            let mut hits = self.hits.iter().rev().filter(eligible);
+            hits.clone()
+                .find(|h| (h.row, h.start) < at)
+                .or_else(|| hits.next())
+        } else {
+            let mut hits = self.hits.iter().filter(eligible);
+            hits.clone()
+                .find(|h| (h.row, h.start) > at)
+                .or_else(|| hits.next())
+        };
+        let Some(&hit) = next else {
+            return Err(format!("Pattern not found: {}", search.pattern));
+        };
+        let at = (hit.row, hit.start);
+        self.reveal(hit.row);
+        self.cursor = Position {
+            row: at.0,
+            col: at.1,
+        };
+        self.ensure_visible(diff);
         Ok(())
     }
 
-    pub fn draw(&self, area: Rect, buffer: &mut Buffer, focused: bool) {
-        let parser = self.screen.lock().unwrap();
-        PseudoTerminal::new(parser.screen())
-            .cursor(tui_term::widget::Cursor::default().visibility(focused))
-            .render(area, buffer);
-    }
-}
-
-impl Drop for Reader {
-    fn drop(&mut self) {
-        let _ = self.rpc.shutdown(std::net::Shutdown::Both);
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-fn key_notation(key: KeyEvent) -> Option<String> {
-    let name = match key.code {
-        KeyCode::Char('<') => "lt".into(),
-        KeyCode::Char(c)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+    /// The source cell under a mouse position, and its side.
+    fn hit_test(&self, diff: &FileDiff, x: u16, y: u16) -> Option<(Position, bool)> {
+        let body = self.body();
+        if x < body.x
+            || x >= body.right()
+            || y < body.y
+            || y >= body.bottom()
+            || self.doc.keys.is_empty()
         {
-            return Some(c.to_string());
+            return None;
         }
-        KeyCode::Char(c) => c.to_string(),
-        KeyCode::Enter => "CR".into(),
-        KeyCode::Esc => "Esc".into(),
-        KeyCode::Backspace => "BS".into(),
-        KeyCode::Tab => "Tab".into(),
-        KeyCode::BackTab => return Some("<S-Tab>".into()),
-        KeyCode::Up => "Up".into(),
-        KeyCode::Down => "Down".into(),
-        KeyCode::Left => "Left".into(),
-        KeyCode::Right => "Right".into(),
-        KeyCode::Home => "Home".into(),
-        KeyCode::End => "End".into(),
-        KeyCode::PageUp => "PageUp".into(),
-        KeyCode::PageDown => "PageDown".into(),
-        KeyCode::Delete => "Del".into(),
-        KeyCode::Insert => "Insert".into(),
-        KeyCode::F(n) => format!("F{n}"),
-        _ => return None,
-    };
-    let mut modifiers = String::new();
-    for (flag, name) in [
-        (KeyModifiers::CONTROL, "C-"),
-        (KeyModifiers::ALT, "M-"),
-        (KeyModifiers::SHIFT, "S-"),
-        (KeyModifiers::SUPER, "D-"),
-    ] {
-        if key.modifiers.contains(flag) {
-            modifiers.push_str(name);
+        let v = self.view(diff, None);
+        let line = v.scroll + (y - body.y) as usize;
+        if line >= v.lines.total() {
+            return None;
         }
-    }
-    Some(format!("<{modifiers}{name}>"))
-}
-
-fn color(color: Color) -> Json {
-    match color {
-        Color::Rgb(r, g, b) => json!(format!("#{r:02x}{g:02x}{b:02x}")),
-        Color::Indexed(n) => json!(n),
-        _ => json!("NONE"),
-    }
-}
-
-fn document(diff: &FileDiff, generation: u64, cursor: Position, p: &Palette) -> Json {
-    let mut highlights = serde_json::Map::new();
-    for (kind, bg, gutter, fg) in [
-        ("Add", p.add_bg, p.add_gutter, p.green),
-        ("Del", p.del_bg, p.del_gutter, p.red),
-        ("Hunk", p.hunk_bg, p.hunk_bg, p.faint),
-        ("Ctx", Color::Reset, Color::Reset, p.faint),
-        ("Meta", Color::Reset, Color::Reset, p.faint),
-    ] {
-        highlights.insert(format!("Rx{kind}"), json!({"bg":color(bg)}));
-        highlights.insert(
-            format!("Rx{kind}Gutter"),
-            json!({"fg":color(fg),"bg":color(gutter)}),
-        );
-    }
-    for (name, bg, fg) in [
-        ("Visual", p.blue, p.selection_fg),
-        ("Search", p.yellow, p.search_fg),
-        ("IncSearch", p.yellow, p.search_fg),
-    ] {
-        highlights.insert(
-            name.into(),
-            json!({"bg":color(bg),"fg":color(fg),"bold":true}),
-        );
-    }
-    highlights.insert("Normal".into(), json!({"fg":"NONE","bg":"NONE"}));
-    for name in ["DiffAdd", "DiffChange", "DiffDelete", "DiffText"] {
-        highlights.insert(name.into(), json!({"fg":"NONE","bg":"NONE"}));
-    }
-    highlights.insert(
-        "DiffDelete".into(),
-        json!({"fg":color(p.faint),"bg":color(p.sel_bg)}),
-    );
-    for name in ["WinBar", "WinBarNC"] {
-        highlights.insert(
-            name.into(),
-            json!({"fg":color(p.muted),"bg":"NONE","bold":true}),
-        );
-    }
-    highlights.insert(
-        "WinSeparator".into(),
-        json!({"fg":color(p.faint),"bg":"NONE"}),
-    );
-    highlights.insert(
-        "RxAnnotation".into(),
-        json!({"fg":color(p.annotation),"bg":"NONE","bold":true}),
-    );
-    highlights.insert(
-        "RxNoteLabel".into(),
-        json!({"fg":color(p.annotation),"bg":color(p.annotation_bg),"bold":true}),
-    );
-    highlights.insert("RxNoteJoin".into(), json!({"fg":color(p.annotation_fg),"bg":color(p.annotation),"bold":true}));
-    highlights.insert(
-        "RxNoteText".into(),
-        json!({"fg":color(p.fg),"bg":color(p.annotation_bg)}),
-    );
-    let rows:Vec<_>=diff.rows.iter().map(|row| {
-        let (kind,sign,number)=match row.kind {
-            RowKind::Add=>("Add","+",row.new.map(|n|n.to_string()).unwrap_or_default()),
-            RowKind::Del=>("Del","−",row.old.map(|n|n.to_string()).unwrap_or_default()),
-            RowKind::Hunk=>("Hunk"," ","⋯".into()), RowKind::Meta=>("Meta"," ",String::new()),
-            RowKind::Ctx=>("Ctx"," ",row.new.map(|n|n.to_string()).unwrap_or_default()),
-        };
-        let mut byte=0;
-        let mut spans=Vec::new();
-        for seg in &row.segs {
-            let start=byte; byte+=seg.text.len();
-            if byte==start { continue; }
-            let group=format!("Rx{kind}S{}B{}E{}",seg.fg.unwrap_or(255),seg.bold as u8,seg.emph as u8);
-            let mut style=json!({"bold":seg.bold});
-            if let Some(fg)=seg.fg {
-                let (r,g,b)=p.ansi[usize::from(fg).min(15)];
-                style["fg"]=color(Color::Rgb(r,g,b));
+        let (unit, sub) = v.lines.locate(line);
+        let sub = sub.checked_sub(v.cards_height(unit))?;
+        let g = self.geom();
+        let (row, old, pane) = if self.split_active() {
+            let s = self.doc.split[unit];
+            if x < body.x + g.width {
+                (s.old?, true, body.x)
+            } else if x > body.x + g.width {
+                (s.new?, false, body.x + g.width + 1)
+            } else {
+                return None;
             }
-            if seg.emph && matches!(row.kind,RowKind::Add|RowKind::Del) { style["bg"]=color(if row.kind==RowKind::Add {p.add_emph} else {p.del_emph}); }
-            highlights.insert(group.clone(),style);
-            spans.push(json!({"start":start,"finish":byte,"group":group}));
+        } else {
+            (unit, self.kind(unit) == Some(RowKind::Del), body.x)
+        };
+        if !self.kind(row).is_some_and(is_source) {
+            return None;
         }
-        json!({"text":annotations::text(row),"kind":kind,"sign":sign,"number":number,"spans":spans,"old":row.old,"new":row.new})
-    }).collect();
-    let byte = diff
-        .rows
-        .get(cursor.row)
-        .map(|r| {
-            annotations::text(r)
-                .chars()
-                .take(cursor.col)
-                .map(char::len_utf8)
-                .sum::<usize>()
-        })
-        .unwrap_or(0);
-    json!({"path":diff.path,"max_lineno":diff.max_lineno,"rows":rows,"generation":generation,"cursor":[cursor.row,byte],"highlights":highlights})
+        let mut cell = x.saturating_sub(pane + g.text_off) as usize;
+        let mut col = 0;
+        // Only this visual line's characters: blank space after a wrapped
+        // line maps to its last character, not into the continuation.
+        let mut end = usize::MAX;
+        if let Some(w) = v.wraps.get(unit).filter(|_| !self.split_active()) {
+            col = w.starts[sub];
+            end = w.starts.get(sub + 1).copied().unwrap_or(usize::MAX);
+            if sub > 0 {
+                cell = cell.saturating_sub(w.indent);
+            }
+        } else {
+            cell += self.hscroll;
+        }
+        let mut at = 0;
+        for (_, n, w) in clusters(&self.doc.texts[row]) {
+            if at < col {
+                at += n;
+                continue;
+            }
+            // Past the end lands on the last cluster, never inside it.
+            if cell < w || at + n >= end.min(self.len(row)) {
+                break;
+            }
+            cell -= w;
+            at += n;
+        }
+        Some((Position { row, col: at }, old))
+    }
+
+    /// A click: moves the cursor there. `false` outside source text.
+    pub fn click(&mut self, diff: &FileDiff, x: u16, y: u16) -> bool {
+        let Some((pos, old)) = self.hit_test(diff, x, y) else {
+            return false;
+        };
+        self.cursor = pos;
+        if self.split_active() {
+            self.old_side = old;
+        }
+        self.selection = None;
+        self.press = Some((pos, old));
+        self.ensure_visible(diff);
+        true
+    }
+
+    /// A drag after a click selects characters on the same side.
+    pub fn drag(&mut self, diff: &FileDiff, x: u16, y: u16) {
+        let (Some((anchor, side)), Some((pos, old))) = (self.press, self.hit_test(diff, x, y))
+        else {
+            return;
+        };
+        let split = self.split_active();
+        if split && old != side {
+            return;
+        }
+        if self.selection.is_none() {
+            self.selection = Some(Selection {
+                anchor,
+                lines: false,
+                old_side: split.then_some(side),
+            });
+        }
+        self.cursor = pos;
+        self.ensure_visible(diff);
+    }
+
+    pub fn release(&mut self) {
+        self.press = None;
+    }
+
+    pub fn draw(
+        &self,
+        area: Rect,
+        diff: &FileDiff,
+        notes: &[Note],
+        p: &Palette,
+        focused: bool,
+        buf: &mut Buffer,
+    ) {
+        if area.is_empty() || self.doc.keys.is_empty() {
+            return;
+        }
+        let v = self.view(diff, Some(notes));
+        let split = self.split_active();
+        let body = self.body();
+        let g = self.geom();
+        let paint = Paint {
+            diff,
+            view: &v,
+            p,
+            g,
+            focused,
+            cursor: self.clamped(),
+        };
+        if split {
+            for (x, old) in [(area.x, true), (area.x + g.width + 1, false)] {
+                let style = if self.old_side == old {
+                    Style::new().fg(p.blue).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().fg(p.faint)
+                };
+                buf.set_stringn(
+                    x,
+                    area.y,
+                    if old { " Old" } else { " New" },
+                    g.width as usize,
+                    style,
+                );
+            }
+        }
+        for line in 0..body.height {
+            let visual = v.scroll + line as usize;
+            if visual >= v.lines.total() {
+                break;
+            }
+            let (unit, sub) = v.lines.locate(visual);
+            let y = body.y + line;
+            if let Some(cards) = v.cards.get(&unit)
+                && sub < v.cards_height(unit)
+            {
+                let mut k = sub;
+                for card in cards {
+                    if k < card.height() {
+                        let pane = if card.old_side || !split {
+                            area.x
+                        } else {
+                            area.x + g.width + 1
+                        };
+                        draw_card(buf, pane, y, g, card, k, p);
+                        break;
+                    }
+                    k -= card.height();
+                }
+                continue;
+            }
+            let sub = sub - v.cards_height(unit);
+            if !split {
+                self.draw_row(
+                    buf,
+                    &paint,
+                    area.x,
+                    area.width,
+                    y,
+                    unit,
+                    sub,
+                    None,
+                    v.wraps.get(unit),
+                );
+                continue;
+            }
+            let SplitRow { old, new } = self.doc.split[unit];
+            if let Some(r) = old.filter(|&r| old == new && !self.kind(r).is_some_and(is_source)) {
+                self.draw_row(buf, &paint, area.x, area.width, y, r, 0, None, None);
+                continue;
+            }
+            buf.set_string(area.x + g.width, y, "│", Style::new().fg(p.rule));
+            for (x, row, old_side) in [(area.x, old, true), (area.x + g.width + 1, new, false)] {
+                match row {
+                    Some(r) => {
+                        self.draw_row(buf, &paint, x, g.width, y, r, 0, Some(old_side), None)
+                    }
+                    None => buf.set_style(Rect::new(x, y, g.width, 1), Style::new().bg(p.sel_bg)),
+                }
+            }
+        }
+    }
+
+    /// One visual line of diff row `r`: gutter, sign, text (line `sub` of
+    /// its wrap), then cursor, search, and selection on top. `side` is the
+    /// split pane, `None` when stacked or spanning both panes.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_row(
+        &self,
+        buf: &mut Buffer,
+        c: &Paint,
+        x: u16,
+        width: u16,
+        y: u16,
+        r: usize,
+        sub: usize,
+        side: Option<bool>,
+        wrap: Option<&Wrapped>,
+    ) {
+        let (p, g) = (c.p, c.g);
+        let row = &c.diff.rows[r];
+        let (row_bg, gutter_bg, emph_bg, sign, sign_fg) = match row.kind {
+            RowKind::Add => (
+                Some(p.add_bg),
+                Some(p.add_gutter),
+                Some(p.add_emph),
+                "+",
+                p.green,
+            ),
+            RowKind::Del => (
+                Some(p.del_bg),
+                Some(p.del_gutter),
+                Some(p.del_emph),
+                "−",
+                p.red,
+            ),
+            RowKind::Hunk => (Some(p.hunk_bg), Some(p.hunk_bg), None, " ", p.faint),
+            _ => (None, None, None, " ", p.faint),
+        };
+        let base = row_bg.map_or(Style::new(), |bg| Style::new().bg(bg));
+        buf.set_style(Rect::new(x, y, width, 1), base);
+        let annotated = c.view.annotated.get(r).copied().unwrap_or(false);
+        let gutter = if annotated {
+            Style::new().bg(p.annotation).fg(p.annotation_fg)
+        } else {
+            gutter_bg.map_or(Style::new(), |bg| Style::new().bg(bg))
+        };
+        buf.set_style(Rect::new(x, y, g.gutter_w.min(width), 1), gutter);
+        let right = (x + width).saturating_sub(1);
+        let gw = g.num_w as usize;
+        if sub == 0 {
+            let number = match side {
+                Some(true) => row.old,
+                Some(false) => row.new,
+                None if row.kind == RowKind::Del => row.old,
+                None => row.new,
+            };
+            let text = match (row.kind, number) {
+                (RowKind::Hunk, _) => format!("{:>gw$}", "⋯"),
+                (_, Some(n)) => format!("{n:>gw$}"),
+                _ => String::new(),
+            };
+            let fg = if annotated {
+                p.annotation_fg
+            } else if changed(row.kind) {
+                p.muted
+            } else {
+                p.faint
+            };
+            buf.set_stringn(
+                x + 1,
+                y,
+                &text,
+                gw.min(width.saturating_sub(1) as usize),
+                gutter.fg(fg),
+            );
+            if x + g.gutter_w < right {
+                buf.set_string(
+                    x + g.gutter_w,
+                    y,
+                    sign,
+                    base.fg(sign_fg).add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+        let text_x = x + g.text_off;
+        if text_x >= right {
+            return;
+        }
+        // The cursor's row is marked even while another pane has focus.
+        let mine = side.is_none_or(|s| s == self.old_side);
+        if mine && c.cursor.row == r && row.kind != RowKind::Meta {
+            buf.set_string(
+                x,
+                y,
+                "▸",
+                gutter.fg(if c.focused { p.blue } else { p.faint }),
+            );
+        }
+        match row.kind {
+            RowKind::Hunk => {
+                let (header, func) = split_hunk(&row.segs[0].text);
+                let (nx, _) = buf.set_stringn(
+                    text_x,
+                    y,
+                    header,
+                    (right - text_x) as usize,
+                    base.fg(p.faint),
+                );
+                let (nx, _) = if nx < right {
+                    buf.set_stringn(nx, y, func, (right - nx) as usize, base.fg(p.muted))
+                } else {
+                    (nx, y)
+                };
+                if self.folded.contains(&r) && nx < right {
+                    let n = self.doc.keys[r + 1..]
+                        .iter()
+                        .take_while(|k| k.0 != RowKind::Hunk)
+                        .count();
+                    let label = format!("  ⋯ {n} lines folded (z)");
+                    buf.set_stringn(nx, y, label, (right - nx) as usize, base.fg(p.blue));
+                }
+                return;
+            }
+            RowKind::Meta => {
+                let style = base.fg(p.faint).add_modifier(Modifier::ITALIC);
+                buf.set_stringn(
+                    text_x,
+                    y,
+                    &row.segs[0].text,
+                    (right - text_x) as usize,
+                    style,
+                );
+                return;
+            }
+            _ => {}
+        }
+        let cursor_here = c.focused && mine && c.cursor.row == r;
+        let hits: &[Hit] = if self.highlight && mine {
+            let start = self.hits.partition_point(|h| h.row < r);
+            let end = start + self.hits[start..].partition_point(|h| h.row == r);
+            &self.hits[start..end]
+        } else {
+            &[]
+        };
+        let selection = self.selection.filter(|s| {
+            self.in_selection(s, r)
+                && (side.is_none() || s.old_side.is_none() || s.old_side == side)
+        });
+        let (from, to, indent) = match wrap {
+            Some(w) => (
+                w.starts[sub],
+                w.starts.get(sub + 1).copied().unwrap_or(usize::MAX),
+                if sub > 0 { w.indent } else { 0 },
+            ),
+            None => (0, usize::MAX, 0),
+        };
+        let mut skip = if side.is_some() { self.hscroll } else { 0 };
+        let mut cx = text_x + indent as u16;
+        let mut col = 0;
+        let (mut segs, mut seg_end, mut style) = (row.segs.iter(), 0, base);
+        // Clusters of the whole row, like wrapping and clicks, so a segment
+        // boundary inside one doesn't split it; it takes its first char's style.
+        for (g, n, w) in clusters(&self.doc.texts[r]) {
+            while col >= seg_end
+                && let Some(seg) = segs.next()
+            {
+                seg_end += seg.text.chars().count();
+                style = base.fg(seg.fg.map_or(p.fg, |i| {
+                    let (r, g, b) = p.ansi[usize::from(i).min(15)];
+                    Color::Rgb(r, g, b)
+                }));
+                if seg.bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if seg.emph
+                    && let Some(bg) = emph_bg
+                {
+                    style = style.bg(bg);
+                }
+            }
+            if col >= to {
+                break;
+            }
+            if col >= from {
+                if skip > 0 {
+                    // A wide cluster cut by the scroll leaves its visible
+                    // cells blank, so cells line up with clicks.
+                    cx += w.saturating_sub(skip) as u16;
+                    skip = skip.saturating_sub(w);
+                    col += n;
+                    continue;
+                }
+                if cx + w as u16 > right {
+                    break;
+                }
+                let span = col..col + n;
+                let pos = Position { row: r, col };
+                let cell = if selection.is_some_and(|s| s.contains(c.cursor, pos)) {
+                    Style::new()
+                        .fg(p.selection_fg)
+                        .bg(p.blue)
+                        .add_modifier(Modifier::BOLD)
+                } else if hits
+                    .iter()
+                    .any(|h| h.start < span.end && span.start < h.end)
+                {
+                    Style::new()
+                        .fg(p.search_fg)
+                        .bg(p.yellow)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else if cursor_here && span.contains(&c.cursor.col) {
+                    style.add_modifier(Modifier::REVERSED)
+                } else {
+                    style
+                };
+                if w > 0 {
+                    buf.set_stringn(cx, y, g, w, cell);
+                }
+                cx += w as u16;
+            }
+            col += n;
+        }
+        if cursor_here && sub == 0 && self.len(r) == 0 && side.is_none_or(|_| self.hscroll == 0) {
+            buf.set_style(
+                Rect::new(text_x, y, 1, 1),
+                base.add_modifier(Modifier::REVERSED),
+            );
+        }
+    }
+}
+
+/// Line `k` of a note card: a labeled top border, padded body lines, and a
+/// violet bar that joins the card to the annotated gutters below.
+fn draw_card(buf: &mut Buffer, pane: u16, y: u16, g: Geom, card: &Card, k: usize, p: &Palette) {
+    let x = pane + g.gutter_w;
+    let right = pane + g.width;
+    if x >= right {
+        return;
+    }
+    let max = (right - x) as usize;
+    let w = card.width;
+    let label = Style::new()
+        .fg(p.annotation)
+        .bg(p.annotation_bg)
+        .add_modifier(Modifier::BOLD);
+    let text = Style::new().fg(p.fg).bg(p.annotation_bg);
+    let n = card.lines.len();
+    if k == 0 {
+        buf.set_stringn(
+            x,
+            y,
+            format!("╭─ NOTE {}╮", "─".repeat(w.saturating_sub(9))),
+            max,
+            label,
+        );
+    } else if k == n + 3 {
+        let join = (x - pane) + w as u16;
+        buf.set_style(
+            Rect::new(pane, y, join.min(g.width), 1),
+            Style::new().bg(p.annotation),
+        );
+    } else {
+        let body = if k == 1 || k == n + 2 {
+            ""
+        } else {
+            &card.lines[k - 2]
+        };
+        let interior = format!("  {body}{}", " ".repeat(w.saturating_sub(4 + body.width())));
+        let (nx, _) = buf.set_stringn(x, y, "│", max, label);
+        let (nx, _) = buf.set_stringn(nx, y, &interior, (right.saturating_sub(nx)) as usize, text);
+        if nx < right {
+            buf.set_stringn(nx, y, "│", 1, label);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -483,511 +1721,498 @@ mod tests {
     use super::*;
     use crate::git::{DRow, Seg};
 
-    #[test]
-    #[ignore = "requires installed Neovim 0.10+ and permission for PTYs/local sockets"]
-    fn empty_reader_emits_navigation_actions() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut reader = Reader::start(dir.path()).unwrap();
-        for (keys, action) in [("<Tab>","focus"),(" p","picker"),(":q<CR>","quit")] {
-            reader.call("nvim_input",json!([keys])).unwrap();
-            std::thread::sleep(Duration::from_millis(150));
-            let (_,actions)=reader.poll().unwrap();
-            assert!(actions.iter().any(|a|a["action"]==action),"missing {action}: {actions:?}");
+    fn row(kind: RowKind, old: Option<u32>, new: Option<u32>, text: &str) -> DRow {
+        DRow {
+            kind,
+            old,
+            new,
+            segs: vec![Seg {
+                text: text.into(),
+                fg: None,
+                bold: false,
+                emph: false,
+            }],
         }
     }
 
-    #[test]
-    #[ignore = "requires installed Neovim 0.10+ and permission for PTYs/local sockets"]
-    fn split_reader_preserves_source_rows_and_annotations() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut reader = Reader::start(dir.path()).unwrap();
-        let diff = fixture();
-        let palette = Palette::from(None);
-        reader
-            .load(&diff, 1, Position { row: 2, col: 0 }, &palette)
-            .unwrap();
-        reader.split = true;
-        reader
-            .load(&diff, 1, Position::default(), &palette)
-            .unwrap();
-        let inspect = |r: &mut Reader| -> Json {
-            let result = r
-                .call(
-                    "nvim_exec_lua",
-                    json!([
-                        r#"
-              local result = {}
-              for _,win in ipairs(vim.api.nvim_list_wins()) do
-                result[vim.wo[win].winbar:match('%w+')] = {
-                  lines=vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win),0,-1,false),
-                  diff=vim.wo[win].diff, scrollbind=vim.wo[win].scrollbind, wrap=vim.wo[win].wrap,
-                  modifiable=vim.bo[vim.api.nvim_win_get_buf(win)].modifiable,
-                  gutter=vim.api.nvim_eval_statusline(vim.wo[win].statuscolumn,
-                    {winid=win,use_statuscol_lnum=math.min(2,vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(win)))}).str
-                }
-              end
-              return result
-            "#,
-                        []
-                    ]),
-                )
-                .unwrap();
-            rmpv::ext::from_value(result).unwrap()
-        };
-        let state = inspect(&mut reader);
-        assert_eq!(state["Old"]["lines"][1], "é old value");
-        assert_eq!(state["New"]["lines"][1], "é new value");
-        assert!(state["Old"]["gutter"].as_str().unwrap().contains('−'));
-        assert!(state["New"]["gutter"].as_str().unwrap().contains('+'));
-        for side in ["Old", "New"] {
-            assert_eq!(state[side]["lines"].as_array().unwrap().len(), 3);
-            assert_eq!(state[side]["diff"], true);
-            assert_eq!(state[side]["scrollbind"], true);
-            assert_eq!(state[side]["wrap"], false);
-            assert_eq!(state[side]["modifiable"], false);
-        }
-        for width in [140, 60, 80] {
-            reader.resize(Rect::new(0, 0, width, 24)).unwrap();
-            std::thread::sleep(Duration::from_millis(150));
-            let widths = reader.call("nvim_exec_lua",json!(["local w=vim.api.nvim_list_wins(); return {vim.api.nvim_win_get_width(w[1]),vim.api.nvim_win_get_width(w[2])}",[]])).unwrap();
-            let widths = widths.as_array().unwrap();
-            assert!(
-                widths[0]
-                    .as_i64()
-                    .unwrap()
-                    .abs_diff(widths[1].as_i64().unwrap())
-                    <= 1,
-                "{widths:?}"
-            );
-        }
-        reader
-            .notes(vec![
-                json!({"rows":[1],"comment":"old note"}),
-                json!({"rows":[2],"comment":"new note"}),
-            ])
-            .unwrap();
-        for (source, text) in [(1, "é old value"), (2, "é new value")] {
-            reader
-                .reveal(
-                    Position {
-                        row: source,
-                        col: 0,
-                    },
-                    &diff,
-                    source == 1,
-                )
-                .unwrap();
-            assert_eq!(
-                reader
-                    .call("nvim_eval", json!(["&winbar"]))
-                    .unwrap()
-                    .as_str(),
-                Some(if source == 1 { " Old" } else { " New" })
-            );
-            reader.call("nvim_input", json!(["V a"])).unwrap();
-            std::thread::sleep(Duration::from_millis(150));
-            let (_, actions) = reader.poll().unwrap();
-            let action = actions.iter().find(|a| a["action"] == "annotate").unwrap();
-            assert_eq!(action["selection"][0]["row"], source);
-            assert_eq!(action["selection"][0]["text"], text);
-            for keys in ["G:40<CR>", "G40G"] {
-                reader.call("nvim_input", json!([keys])).unwrap();
-                std::thread::sleep(Duration::from_millis(150));
-                assert_eq!(
-                    reader
-                        .call("nvim_eval", json!(["line('.')"]))
-                        .unwrap()
-                        .as_u64(),
-                    Some(2)
-                );
-            }
-        }
-        let text = reader.screen.lock().unwrap().screen().contents();
-        assert!(
-            text.contains("old note") && text.contains("new note"),
-            "{text}"
-        );
-        reader.split = false;
-        reader
-            .load(&diff, 1, Position::default(), &palette)
-            .unwrap();
-        assert_eq!(
-            reader
-                .call("nvim_eval", json!(["winnr('$')"]))
-                .unwrap()
-                .as_u64(),
-            Some(1)
-        );
-        assert_eq!(
-            reader
-                .call("nvim_eval", json!(["line('.')"]))
-                .unwrap()
-                .as_u64(),
-            Some(3)
-        );
-        assert_eq!(
-            reader.call("nvim_eval", json!(["&diff"])).unwrap().as_u64(),
-            Some(0)
-        );
-        reader.split = true;
-        let mut added = diff.clone();
-        added.path = "added.rs".into();
-        added.rows.retain(|r| r.kind == RowKind::Add);
-        reader
-            .load(&added, 2, Position::default(), &palette)
-            .unwrap();
-        let state = inspect(&mut reader);
-        assert_eq!(state["Old"]["lines"], json!([""]));
-        assert_eq!(state["New"]["lines"], json!(["é new value"]));
-        let mut deleted = diff.clone();
-        deleted.path = "deleted.rs".into();
-        deleted.rows.retain(|r| r.kind == RowKind::Del);
-        reader
-            .load(&deleted, 3, Position::default(), &palette)
-            .unwrap();
-        let state = inspect(&mut reader);
-        assert_eq!(state["New"]["lines"], json!([""]));
-        assert_eq!(state["Old"]["lines"], json!(["é old value"]));
-    }
-
-    fn fixture() -> FileDiff {
+    fn diff(rows: Vec<DRow>) -> FileDiff {
+        let max_lineno = rows
+            .iter()
+            .filter_map(|r| r.old.max(r.new))
+            .max()
+            .unwrap_or(1);
         FileDiff {
             revision: 1,
             path: "x.rs".into(),
             context: 3,
-            max_lineno: 42,
-            rows: vec![
-                DRow {
-                    kind: RowKind::Hunk,
-                    old: None,
-                    new: None,
-                    segs: vec![Seg {
-                        text: "@@ -40,2 +40,2 @@".into(),
-                        fg: None,
-                        bold: false,
-                        emph: false,
-                    }],
-                },
-                DRow {
-                    kind: RowKind::Del,
-                    old: Some(40),
-                    new: None,
-                    segs: vec![Seg {
-                        text: "é old value".into(),
-                        fg: Some(5),
-                        bold: false,
-                        emph: true,
-                    }],
-                },
-                DRow {
-                    kind: RowKind::Add,
-                    old: None,
-                    new: Some(40),
-                    segs: vec![Seg {
-                        text: "é new value".into(),
-                        fg: Some(2),
-                        bold: false,
-                        emph: true,
-                    }],
-                },
-                DRow {
-                    kind: RowKind::Ctx,
-                    old: Some(41),
-                    new: Some(41),
-                    segs: vec![Seg {
-                        text: "last line".into(),
-                        fg: None,
-                        bold: false,
-                        emph: false,
-                    }],
-                },
-            ],
+            rows,
+            max_lineno,
         }
     }
 
-    #[test]
-    fn input_notation_preserves_native_keys() {
-        let key = |c, m| key_notation(KeyEvent::new(c, m)).unwrap();
-        assert_eq!(key(KeyCode::Char('<'), KeyModifiers::NONE), "<lt>");
-        assert_eq!(key(KeyCode::Char('é'), KeyModifiers::NONE), "é");
-        assert_eq!(key(KeyCode::Char('V'), KeyModifiers::SHIFT), "V");
-        assert_eq!(key(KeyCode::Char('f'), KeyModifiers::CONTROL), "<C-f>");
-        assert_eq!(key(KeyCode::BackTab, KeyModifiers::SHIFT), "<S-Tab>");
-    }
-
-    #[test]
-    fn document_uses_source_gutters_and_byte_spans() {
-        let d = document(
-            &fixture(),
-            7,
-            Position { row: 1, col: 2 },
-            &Palette::from(None),
-        );
-        assert_eq!(d["rows"][1]["number"], "40");
-        assert_eq!(d["rows"][1]["text"], "é old value");
-        assert_eq!(d["rows"][1]["spans"][0]["finish"], 12);
-        assert_eq!(d["cursor"], json!([1, 3]));
-        assert!(
-            d["highlights"]["RxDelS5B0E1"]["fg"]
-                .as_str()
-                .unwrap()
-                .starts_with('#')
-        );
-    }
-
-    #[test]
-    #[ignore = "requires installed Neovim 0.10+ and permission for PTYs/local sockets"]
-    fn annotation_callouts_update_without_changing_source_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut reader = Reader::start(dir.path()).unwrap();
+    fn reader(d: &FileDiff, width: u16) -> Reader {
+        let mut reader = Reader::default();
+        reader.resize(Rect::new(0, 0, width, 12));
+        reader.load(d, 1, None);
         reader
-            .load(&fixture(), 1, Position::default(), &Palette::from(None))
-            .unwrap();
-        let rendered = |reader: &mut Reader| {
-            assert_eq!(
-                reader
-                    .call("nvim_buf_line_count", json!([0]))
-                    .unwrap()
-                    .as_u64(),
-                Some(4)
+    }
+
+    /// Two hunks, the second deleting only, separated by context.
+    fn hunks() -> FileDiff {
+        use RowKind::*;
+        diff(vec![
+            row(Hunk, None, None, "@@ -1,4 +1,4 @@ fn one"),
+            row(Ctx, Some(1), Some(1), "a"),
+            row(Del, Some(2), None, "b"),
+            row(Add, None, Some(2), "B"),
+            row(Ctx, Some(3), Some(3), "c"),
+            row(Hunk, None, None, "@@ -20,3 +20,1 @@ fn two"),
+            row(Ctx, Some(20), Some(20), "t"),
+            row(Del, Some(21), None, "u"),
+            row(Del, Some(22), None, "v"),
+        ])
+    }
+
+    #[test]
+    fn native_review_navigation() {
+        let d = hunks();
+        for width in [60, 160] {
+            let mut r = reader(&d, width);
+            if width == 160 {
+                r.toggle_split();
+                assert!(r.split());
+                r.first_hunk(&d);
+            }
+            // A new file opens on its first change, header above it.
+            let first = if r.split() { 3 } else { 2 };
+            assert_eq!(r.cursor().row, first);
+            assert!(
+                !r.split() || !r.old_side(),
+                "a hunk with additions opens on the new side"
             );
-            std::thread::sleep(Duration::from_millis(150));
-            let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 24));
-            reader.draw(buffer.area, &mut buffer, false);
-            let text = reader.screen.lock().unwrap().screen().contents();
-            (buffer, text)
-        };
-        reader
-            .notes(vec![json!({"rows":[1,2],"comment":"hi\nsecond line"})])
-            .unwrap();
-        let (buffer, text) = rendered(&mut reader);
-        assert!(text.contains("╭─ NOTE "), "{text}");
-        assert!(text.contains("│  hi"));
-        assert!(!text.contains("╭──────┴"), "{text}");
-        assert!(text.contains("second line"));
-        assert!(!text.contains('💬'));
-        let joined: Vec<_> = buffer
-            .content
-            .iter()
-            .filter(|c| c.bg == Palette::from(None).annotation)
-            .collect();
-        assert!(joined.len() > 30);
-        assert!(joined.iter().any(|c| c.symbol()=="4" && c.fg==Palette::from(None).annotation_fg));
-        assert_eq!(
-            reader
-                .call("nvim_eval", json!(["search('second line', 'nw')"]))
-                .unwrap()
-                .as_u64(),
-            Some(0)
+            assert_eq!(r.view.borrow().scroll, 0);
+            assert_eq!(r.hunk(&d, true), None);
+            assert_eq!(
+                (r.cursor().row, r.old_side()),
+                (7, true),
+                "deleted-only hunk lands on the old side"
+            );
+            assert_eq!(r.hunk(&d, true), Some("Last hunk"));
+            assert_eq!(r.cursor().row, 7);
+            assert_eq!(r.hunk(&d, false), None);
+            assert_eq!(r.cursor().row, first);
+            assert_eq!(r.hunk(&d, false), Some("First hunk"));
+            r.hunk(&d, true);
+            r.motion(&d, Motion::Top);
+            assert_eq!(r.cursor().row, 1);
+            r.motion(&d, Motion::Bottom);
+            assert_eq!(r.cursor().row, 8);
+        }
+        // `z` folds the cursor's hunk to its header; jumps into it unfold it.
+        let mut r = reader(&d, 60);
+        assert!(r.toggle_fold(&d));
+        assert_eq!(r.cursor().row, 0);
+        assert!(r.capture().is_none(), "a folded header is not source text");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 12));
+        r.draw(buf.area, &d, &[], &Palette::from(None), true, &mut buf);
+        let screen: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(screen.contains("4 lines folded") && !screen.contains(" b "));
+        r.motion(&d, Motion::Down);
+        assert_eq!(r.cursor().row, 6, "folded rows are skipped");
+        assert_eq!(r.hunk(&d, false), None);
+        assert_eq!(r.cursor().row, 0, "[ lands on the folded header");
+        r.motion(&d, Motion::Down);
+        r.search(&d, "^b$").unwrap();
+        assert_eq!(r.cursor().row, 2, "a match inside the fold unfolds it");
+        assert!(r.folded.is_empty());
+        r.motion(&d, Motion::Up);
+        r.motion(&d, Motion::Up);
+        assert!(
+            r.toggle_fold(&d) && r.toggle_fold(&d),
+            "z on a folded header unfolds it"
         );
-        reader
-            .notes(vec![json!({"rows":[1,2],"comment":"edited"})])
-            .unwrap();
-        let (_, text) = rendered(&mut reader);
-        assert!(text.contains("│  edited"));
-        assert!(!text.contains("second line"));
-        reader.notes(vec![json!({"rows":[1],"comment":"Check the source ranges and Unicode é中 carefully. ".repeat(4)})]).unwrap();
-        let card_widths = |reader: &mut Reader| -> Vec<usize> {
-            let result = reader
-                .call(
-                    "nvim_exec_lua",
-                    json!([
-                        r#"
-              local ns=vim.api.nvim_get_namespaces()['rexdiff-notes']
-              local card=vim.api.nvim_buf_get_extmarks(0,ns,0,-1,{details=true})[1][4].virt_lines
-              local widths={}
-              for _,line in ipairs(card) do
-                local text=''
-                for _,chunk in ipairs(line) do text=text..chunk[1] end
-                widths[#widths+1]=vim.fn.strdisplaywidth(text)-6
-              end
-              return widths
-            "#,
-                        []
-                    ]),
-                )
-                .unwrap();
-            rmpv::ext::from_value(result).unwrap()
-        };
-        let wide = card_widths(&mut reader);
-        assert!(wide.len() >= 7);
-        assert!(wide.iter().all(|w| *w == wide[0] && *w <= 56));
-        reader.resize(Rect::new(0, 0, 48, 24)).unwrap();
-        std::thread::sleep(Duration::from_millis(150));
-        let narrow = card_widths(&mut reader);
-        assert!(narrow.len() > wide.len());
-        assert!(narrow.iter().all(|w| *w == narrow[0] && *w <= 32));
-        reader.resize(Rect::new(0, 0, 80, 24)).unwrap();
-        reader.notes(Vec::new()).unwrap();
-        let (_, text) = rendered(&mut reader);
-        assert!(!text.contains('▌') && !text.contains("edited"));
-        reader
-            .notes(vec![json!({"rows":[1],"comment":"old file"})])
-            .unwrap();
-        let mut next = fixture();
-        next.path = "next.rs".into();
-        reader
-            .load(&next, 2, Position::default(), &Palette::from(None))
-            .unwrap();
-        let (_, text) = rendered(&mut reader);
-        assert!(!text.contains('▌') && !text.contains("old file"));
+        assert!(r.folded.is_empty());
+        // Whole-file mode: runs of changes separated by context.
+        use RowKind::*;
+        let mut whole = diff(vec![
+            row(Hunk, None, None, "@@ -1,9 +1,8 @@"),
+            row(Ctx, Some(1), Some(1), "1"),
+            row(Add, None, Some(2), "2"),
+            row(Ctx, Some(2), Some(3), "3"),
+            row(Ctx, Some(3), Some(4), "4"),
+            row(Del, Some(4), None, "5"),
+        ]);
+        whole.context = crate::app::FULL_CONTEXT;
+        let mut r = reader(&whole, 60);
+        assert_eq!(r.cursor().row, 2);
+        assert_eq!(r.hunk(&whole, true), None);
+        assert_eq!((r.cursor().row, r.old_side()), (5, true));
+        // No changes: first source row; notices only: nothing to select.
+        let same = diff(vec![
+            row(Ctx, Some(1), Some(1), "x"),
+            row(Ctx, Some(2), Some(2), "y"),
+        ]);
+        let mut r = reader(&same, 60);
+        assert_eq!(r.cursor().row, 0);
+        assert_eq!(r.hunk(&same, true), Some("No changed hunks in this file"));
+        let binary = diff(vec![row(Meta, None, None, "Binary file — no text diff")]);
+        let r = reader(&binary, 60);
+        assert!(r.capture().is_none());
     }
 
     #[test]
-    #[ignore = "requires installed Neovim 0.10+ and permission for PTYs/local sockets"]
-    fn neovim_reader_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut reader = Reader::start(dir.path()).unwrap();
-        reader
-            .load(&fixture(), 7, Position::default(), &Palette::from(None))
-            .unwrap();
-        let input = |r: &mut Reader, keys: &str| {
-            r.call("nvim_input", json!([keys])).unwrap();
-            std::thread::sleep(Duration::from_millis(500));
+    fn native_selection_and_split_coordinates() {
+        use RowKind::*;
+        let d = diff(vec![
+            row(Hunk, None, None, "@@ -9,3 +9,2 @@"),
+            row(Del, Some(9), None, "aé中z"),
+            row(Del, Some(10), None, "old two"),
+            row(Del, Some(11), None, "old three"),
+            row(Add, None, Some(9), "new one"),
+            row(Ctx, Some(12), Some(10), "shared"),
+        ]);
+        let mut r = reader(&d, 160);
+        r.motion(&d, Motion::Right);
+        r.motion(&d, Motion::Right);
+        r.visual(false);
+        r.motion(&d, Motion::Left);
+        let (rows, old) = r.capture().unwrap();
+        assert_eq!(rows, vec![(1, "é中".to_string())]);
+        assert!(!old);
+        r.clear_selection();
+        // Unequal runs: three deletions pair with one addition, then filler.
+        r.toggle_split();
+        assert!(r.split());
+        assert_eq!(
+            r.doc.split[1],
+            SplitRow {
+                old: Some(1),
+                new: Some(4)
+            }
+        );
+        assert_eq!(
+            r.doc.split[2],
+            SplitRow {
+                old: Some(2),
+                new: None
+            }
+        );
+        assert_eq!(
+            r.doc.split[4],
+            SplitRow {
+                old: Some(5),
+                new: Some(5)
+            }
+        );
+        r.set_side(&d, true);
+        r.motion(&d, Motion::Top);
+        assert_eq!(r.cursor().row, 1);
+        r.visual(true);
+        for _ in 0..4 {
+            r.motion(&d, Motion::Down);
+        }
+        assert_eq!(r.cursor().row, 5, "filler rows are not selectable");
+        let (rows, old) = r.capture().unwrap();
+        assert!(old);
+        assert_eq!(
+            rows.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+            vec![1, 2, 3, 5]
+        );
+        assert_eq!(
+            rows[3].1, "shared",
+            "gutters, cards and filler stay out of captured text"
+        );
+        let before = r.capture();
+        for width in [40, 100, 160] {
+            r.resize(Rect::new(0, 0, width, 12));
+            assert_eq!(r.capture(), before, "resize does not mutate the capture");
+        }
+        r.clear_selection();
+        // Switching sides keeps the shared row; old-only rows keep old numbers.
+        r.set_side(&d, false);
+        assert_eq!(r.cursor().row, 5);
+        r.set_side(&d, true);
+        r.motion(&d, Motion::Up);
+        r.motion(&d, Motion::Up);
+        assert_eq!(r.cursor().row, 2);
+        r.set_side(&d, false);
+        assert_eq!(r.cursor().row, 4, "nearest new-side row");
+        assert_eq!(r.source_row(10, true), Some(2));
+        assert_eq!(r.source_row(10, false), Some(5));
+        assert_eq!(
+            r.source_row(11, false),
+            None,
+            "split jumps stay on the focused side"
+        );
+        r.split = false;
+        assert_eq!(
+            r.source_row(11, false),
+            Some(3),
+            "stacked falls back to deleted lines"
+        );
+        // A note card is a visual row: it never shifts source coordinates.
+        r.split = true;
+        let note = Note {
+            id: 1,
+            path: "x.rs".into(),
+            line: Some(9),
+            old_side: true,
+            locations: vec![(Some(9), None)],
+            revision: 1,
+            target: String::new(),
+            preview: Vec::new(),
+            historical: false,
+            comment: "why?".into(),
         };
-        input(&mut reader, "ggj0vl a");
-        let (_, actions) = reader.poll().unwrap();
-        let selection = actions
-            .iter()
-            .find(|a| a["action"] == "annotate")
-            .expect("annotation callback");
-        assert_eq!(selection["generation"], 7);
-        assert_eq!(selection["selection"][0]["row"], 1);
-        assert_eq!(selection["selection"][0]["text"], "é ");
-        input(&mut reader, "/new<CR>");
-        assert_eq!(
-            reader
-                .call("nvim_eval", json!(["line('.')"]))
-                .unwrap()
-                .as_u64(),
-            Some(3)
+        let mut buf = Buffer::empty(Rect::new(0, 0, 160, 12));
+        r.draw(
+            buf.area,
+            &d,
+            std::slice::from_ref(&note),
+            &Palette::from(None),
+            true,
+            &mut buf,
         );
-        input(&mut reader, "ggdd");
+        let screen: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(screen.contains("NOTE") && screen.contains("why?"));
+        r.set_side(&d, true);
+        r.motion(&d, Motion::Top);
+        assert_eq!(r.cursor().row, 1);
+        // Split view doesn't wrap: moving along a long line pans to keep the cursor visible.
+        let long = diff(vec![
+            row(Hunk, None, None, "@@ -1 +1 @@"),
+            row(Add, None, Some(1), &"x".repeat(200)),
+        ]);
+        let mut r = reader(&long, 160);
+        r.toggle_split();
+        r.motion(&long, Motion::LineEnd);
         assert_eq!(
-            reader
-                .call("nvim_buf_line_count", json!([0]))
-                .unwrap()
-                .as_u64(),
-            Some(4)
+            r.hscroll,
+            200 - r.geom().text_w as usize,
+            "the line end sits at the right edge"
         );
-        input(&mut reader, "<Esc>ggj0<C-v>jl a");
-        let (_, actions) = reader.poll().unwrap();
-        let selection = actions
-            .iter()
-            .find(|a| a["action"] == "annotate")
-            .expect("block selection callback");
-        assert_eq!(selection["selection"].as_array().unwrap().len(), 2);
-        assert_eq!(selection["selection"][1]["text"], "é ");
-        input(&mut reader, "ggj0vaw");
+        r.first_hunk(&long);
+        assert_eq!(r.hscroll, 0, "a hunk jump brings column 0 back into view");
+        r.motion(&long, Motion::LineEnd);
+        r.motion(&long, Motion::LineStart);
+        assert_eq!(r.hscroll, 0);
+    }
+
+    #[test]
+    fn wrapped_rows_page_scroll_click_and_graphemes() {
+        use RowKind::*;
+        // A 10-column text area (width 17): the first row wraps into 30 lines.
+        let d = diff(vec![
+            row(Ctx, Some(1), Some(1), &"aaaa ".repeat(60)),
+            row(Ctx, Some(2), Some(2), "tail"),
+        ]);
+        let mut r = reader(&d, 17);
+        assert_eq!(r.geom().text_w, 10);
+        r.motion(&d, Motion::HalfDown);
         assert_eq!(
-            reader
-                .call("nvim_eval", json!(["mode()"]))
-                .unwrap()
-                .as_str(),
-            Some("v")
+            r.cursor(),
+            Position { row: 0, col: 60 },
+            "half a page of visual lines, not rows"
         );
-        reader
-            .load(&fixture(), 8, Position::default(), &Palette::from(None))
-            .unwrap();
+        r.motion(&d, Motion::Top);
+        r.motion(&d, Motion::ScrollDown);
         assert_eq!(
-            reader
-                .call("nvim_eval", json!(["mode()"]))
-                .unwrap()
-                .as_str(),
-            Some("v")
+            r.cursor(),
+            Position { row: 0, col: 10 },
+            "scrolling keeps the cursor on a visible line"
         );
+        // Clicking past a wrapped line's end stays on that line.
+        let d = diff(vec![row(Ctx, Some(1), Some(1), "abc defghij")]);
+        let mut r = reader(&d, 17);
+        assert!(r.click(&d, 6 + 8, 0));
+        assert_eq!(r.cursor().col, 3);
+        // Combining marks and joined emoji are one cell group each: painted
+        // whole, stepped over by h/l, clicked and wrapped by their width.
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let d = diff(vec![row(
+            Ctx,
+            Some(1),
+            Some(1),
+            &format!("e\u{301}{family}x"),
+        )]);
+        let mut r = reader(&d, 40);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 12));
+        r.draw(buf.area, &d, &[], &Palette::from(None), false, &mut buf);
+        assert_eq!(buf[(6, 0)].symbol(), "e\u{301}");
+        assert_eq!(buf[(7, 0)].symbol(), family);
+        assert_eq!(buf[(9, 0)].symbol(), "x");
+        r.motion(&d, Motion::Right);
+        assert_eq!(r.cursor().col, 2);
+        r.motion(&d, Motion::Right);
+        assert_eq!(r.cursor().col, 7);
+        r.motion(&d, Motion::Left);
+        assert_eq!(r.cursor().col, 2);
+        assert!(r.click(&d, 9, 0));
+        assert_eq!(r.cursor().col, 7);
+        let emoji = row(Ctx, Some(1), Some(1), &family.repeat(10));
         assert_eq!(
-            reader
-                .call("nvim_eval", json!(["line('.')"]))
-                .unwrap()
-                .as_u64(),
-            Some(2)
+            wrap_row(&emoji, 10).starts,
+            vec![0, 25],
+            "five 2-cell emoji per line"
         );
-        input(&mut reader, "<Esc>");
-        let mut updated = fixture();
-        updated.rows[1].segs[0].text = "changed old line".into();
-        reader
-            .load(&updated, 9, Position::default(), &Palette::from(None))
-            .unwrap();
+        // A segment boundary inside a cluster doesn't split it.
+        let mut cut = row(Ctx, Some(1), Some(1), "e");
+        cut.segs.push(Seg {
+            text: "\u{301}x".into(),
+            fg: None,
+            bold: false,
+            emph: false,
+        });
+        let d = diff(vec![cut]);
+        let r = reader(&d, 40);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 12));
+        r.draw(buf.area, &d, &[], &Palette::from(None), false, &mut buf);
+        assert_eq!(buf[(6, 0)].symbol(), "e\u{301}");
+        assert_eq!(buf[(7, 0)].symbol(), "x");
+        // `$` then `j` onto a shorter row ending in a joined emoji: the
+        // cursor sits on the emoji's start, so `h` leaves it.
+        let d = diff(vec![
+            row(Ctx, Some(1), Some(1), &"x".repeat(20)),
+            row(Ctx, Some(2), Some(2), &format!("ab{family}")),
+        ]);
+        let mut r = reader(&d, 40);
+        r.motion(&d, Motion::LineEnd);
+        r.motion(&d, Motion::Down);
+        assert_eq!(r.cursor().col, 2);
+        r.motion(&d, Motion::Left);
+        assert_eq!(r.cursor().col, 1);
+    }
+
+    #[test]
+    fn split_panning_keeps_wide_clusters_whole() {
+        use RowKind::*;
+        // Width 47 splits into 16-column text areas; the new pane's text
+        // starts at x=30 and ends before x=46.
+        let screen = |r: &Reader, d: &FileDiff| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 47, 12));
+            r.draw(buf.area, d, &[], &Palette::from(None), true, &mut buf);
+            buf
+        };
+        let d = diff(vec![row(
+            Ctx,
+            Some(1),
+            Some(1),
+            &format!("{}中", "a".repeat(20)),
+        )]);
+        let mut r = reader(&d, 47);
+        r.toggle_split();
+        assert_eq!(r.geom().text_w, 16);
+        r.motion(&d, Motion::LineEnd);
         assert_eq!(
-            reader
-                .call("nvim_eval", json!(["line('.')"]))
-                .unwrap()
-                .as_u64(),
-            Some(2)
+            screen(&r, &d)[(44, 1)].symbol(),
+            "中",
+            "the cursor's wide cluster shows"
         );
-        reader.resize(Rect::new(0, 0, 60, 18)).unwrap();
-        std::thread::sleep(Duration::from_millis(80));
+        // An odd scroll cuts a wide cluster: clicks match what's painted.
+        let d = diff(vec![row(
+            Ctx,
+            Some(1),
+            Some(1),
+            &format!("{}a", "中".repeat(20)),
+        )]);
+        let mut r = reader(&d, 47);
+        r.toggle_split();
+        r.motion(&d, Motion::LineEnd);
+        assert_eq!(r.hscroll, 25);
+        assert_eq!(screen(&r, &d)[(31, 1)].symbol(), "中");
+        assert!(r.click(&d, 31, 1));
+        assert_eq!(r.cursor().col, 13);
+    }
+
+    #[test]
+    fn reload_on_a_folded_header_stays_in_its_hunk() {
+        let mut d = hunks();
+        let mut r = reader(&d, 60);
+        r.hunk(&d, true);
+        assert!(r.toggle_fold(&d));
+        assert_eq!(r.cursor().row, 5);
+        d.rows[8].segs[0].text = "w".into();
+        r.load(&d, 2, None);
+        assert_eq!(r.cursor().row, 6);
+    }
+
+    #[test]
+    fn native_regex_search() {
+        use RowKind::*;
+        let d = diff(vec![
+            row(Hunk, None, None, "@@ -1,3 +1,3 @@ foo"),
+            row(Del, Some(1), None, "let Foo = 1;"),
+            row(Add, None, Some(1), "let é中foo = 2;"),
+            row(Ctx, Some(2), Some(2), "bar | baz"),
+        ]);
+        let mut r = reader(&d, 60);
+        r.search(&d, "foo").unwrap();
         assert_eq!(
-            reader
-                .call("nvim_eval", json!(["&columns"]))
-                .unwrap()
-                .as_u64(),
-            Some(60)
+            r.cursor(),
+            Position { row: 1, col: 4 },
+            "smart case ignores case for lowercase patterns"
         );
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 60, 18));
-        reader.draw(buffer.area, &mut buffer, true);
-        let cell = buffer
-            .content
-            .iter()
-            .find(|c| c.symbol() == "é")
-            .expect("rendered Unicode text");
-        assert_eq!(cell.bg, Palette::from(None).add_emph);
-        let hit = buffer
-            .content
-            .windows(3)
-            .find(|cells| {
-                cells[0].symbol() == "n" && cells[1].symbol() == "e" && cells[2].symbol() == "w"
-            })
-            .unwrap();
-        assert_eq!(hit[0].bg, Palette::from(None).yellow);
-        let mut tall = fixture();
-        tall.path = "long.rs".into();
-        tall.max_lineno = 120;
-        tall.rows = (1..=120)
-            .map(|line| {
-                let mut row = fixture().rows[3].clone();
-                row.old = Some(line);
-                row.new = Some(line);
-                row.segs[0].text = format!("source row {line}");
-                row
-            })
-            .collect();
-        reader.resize(Rect::new(0, 0, 60, 8)).unwrap();
-        reader
-            .load(&tall, 10, Position::default(), &Palette::from(None))
-            .unwrap();
-        reader
-            .reveal(Position { row: 89, col: 0 }, &tall, false)
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(150));
+        r.search_next(&d, false).unwrap();
+        assert_eq!(
+            r.cursor(),
+            Position { row: 2, col: 6 },
+            "byte offsets map to characters"
+        );
+        r.search(&d, "Foo").unwrap();
+        assert_eq!(
+            r.cursor(),
+            Position { row: 1, col: 4 },
+            "uppercase makes it case-sensitive, wrapping"
+        );
+        r.search(&d, "bar|baz").unwrap();
+        assert_eq!(r.cursor(), Position { row: 3, col: 0 });
+        r.search_next(&d, false).unwrap();
+        assert_eq!(r.cursor().col, 6);
+        r.search_next(&d, true).unwrap();
+        r.search_next(&d, true).unwrap();
+        assert_eq!(r.cursor().col, 6, "N reverses and wraps");
+        r.search(&d, r"FOO\s\S").unwrap_err();
+        r.search(&d, r"foo\s\S").unwrap();
+        assert_eq!(
+            r.cursor().row,
+            1,
+            "escapes like \\S don't make the search case-sensitive"
+        );
+        r.search(&d, "bar|baz").unwrap();
+        r.search_next(&d, false).unwrap();
+        assert!(r.search(&d, "[").is_err());
+        assert_eq!(r.cursor().col, 6, "invalid pattern keeps the cursor");
+        assert_eq!(r.search.as_ref().unwrap().pattern, "bar|baz");
+        r.search(&d, "").unwrap();
+        assert_eq!(r.cursor().col, 0, "empty input repeats the previous search");
+        r.search(&d, "^").unwrap();
+        let mut rows = Vec::new();
+        for _ in 0..4 {
+            rows.push(r.cursor().row);
+            r.search_next(&d, false).unwrap();
+        }
+        assert_eq!(
+            rows,
+            vec![1, 2, 3, 1],
+            "zero-width matches advance without looping"
+        );
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 12));
+        r.draw(buf.area, &d, &[], &Palette::from(None), false, &mut buf);
         assert!(
-            reader
-                .screen
-                .lock()
-                .unwrap()
-                .screen()
-                .contents()
-                .contains("source row 90")
-        );
-        let screen_row = reader
-            .call("nvim_eval", json!(["winline()"]))
-            .unwrap()
-            .as_u64()
-            .unwrap();
-        assert!(
-            screen_row > 1 && screen_row < 7,
-            "selected code should be centered in the resized reader"
-        );
-        input(&mut reader, ":e ../outside<CR>");
-        let (_, actions) = reader.poll().unwrap();
-        assert!(
-            actions
+            buf.content
                 .iter()
-                .any(|a| a["action"] == "open" && a["argument"] == "../outside")
+                .all(|c| c.bg != Palette::from(None).yellow),
+            "zero-width hits are not highlighted"
         );
-        reader.child.kill().unwrap();
-        reader.child.wait().unwrap();
-        assert!(reader.poll().is_err());
+        // Split: matches on the other side and in note cards are skipped.
+        let mut r = reader(&d, 160);
+        r.toggle_split();
+        r.set_side(&d, true);
+        r.search(&d, "foo").unwrap();
+        assert_eq!(r.cursor().row, 1);
+        r.search_next(&d, false).unwrap();
+        assert_eq!(r.cursor().row, 1, "never the opposite side");
+        assert!(r.escape() && !r.highlight);
+        assert!(!r.escape());
     }
 }

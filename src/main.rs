@@ -1,11 +1,14 @@
-mod app;
 mod annotations;
-mod project;
-mod reader;
+mod app;
 mod git;
 mod highlight;
+mod keymap;
+mod navigation;
+mod project;
+mod reader;
 mod theme;
 mod tree;
+mod wrap;
 
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -21,36 +24,34 @@ Usage:
       --focus                              focus the panel when it opens
   rexdiff view                             run the panel in the current terminal
 
-In the panel:
-  ↑↓ / j k        previous / next row (folders and files)
-  ← → / h l       collapse/parent or expand/enter a folder
-  space           stage/unstage a changed file; on a folder: open/close
-  Enter           focus the selected file
-  Tab / Shift-Tab switch focus between the tree and file
-  v / V / Ctrl+v  in the file: native character / line / block selection; Esc clears
-  Space+a         in the file: annotate selection, or the whole file; Enter adds
+In the panel (? lists every key; each key works the same in the tree, file, and notes):
+  ↑↓ / j k        down / up in the focused pane (the tree previews the file)
+  ← → / h l       left / right; in the tree, collapse/parent or expand/enter a folder
+  Enter / Tab     open the selected file at its first hunk (Enter folds a folder, edits a note)
+  Tab / Shift-Tab cycle the tree, file, and notes
+  z               tree: stage/unstage a file, fold a folder; file: fold the hunk
+  Space e / h / l hide/show the tree / old side / new side of a split diff
+  [ ] / { }       previous / next hunk / file
+  g / G           top / bottom of the focused pane (:N jumps to source line N)
+  0 ^ $ w b e     line and word motions in the file
+  Ctrl+f/b/d/u    full/half-page movement; J K / Ctrl+e/y scroll the file
+  v / V           select characters / lines; Esc clears selection, then search
+  / n N           regex smart-case search; next / previous match
+  a / A           annotate the file's line or selection / the whole file
                   in notes: arrows move the cursor; Shift+Enter inserts a newline
-  Space+s         in the file: paste queued annotations to an agent in this tab
-  Space+l         in the file: list annotations: Enter edits, d deletes, Esc closes
-  a / s / L       in the tree: annotate file / send notes / list annotations
+  s               paste queued annotations to an agent in this tab
+  L               show/focus the notes; again hides: Enter edits, Delete removes
+  x / S           whole file / split or stacked layout
+  Ctrl+p          fuzzy file picker; :e PATH opens a project file
+  :               command line: :N :e :base :diff :context :notes :commit :reload
+                  :changes :branches :help :q (Tab completes)
   H (Shift+h)     browse checked-out branch commits; Enter opens a commit diff
-  D (Shift+d)     in Changes/History: combined branch diff from the merge base
-  B (Shift+b)     in Changes/History: choose the branch comparison base
+  D (Shift+d)     combined branch diff from the merge base
+  B (Shift+b)     choose the branch comparison base
   W (Shift+w)     return to working-tree changes
   t               toggle changed files / all project files (including ignored files)
-  Ctrl+p          in the tree: fuzzy file picker (Space+p in the file); :e PATH opens a project file
-  \\               hide/show the left sidebar
-  gg / G / :N     first / last / source line N; NG and :Source N also use source lines
-  0 ^ $ w b e     line and word motions in the file
-  / ? n N         native regex smart-case search forward/backward, repeat/reverse
-  Ctrl+f/b/d/u    full/half-page movement; Ctrl+e/y scroll one line
-  x               in the tree: toggle whole file (Space+x in the file)
-  S               in the tree: toggle stacked/split diff (Space+d in the file)
-  Ctrl+w h/l      in split view: focus the old/new side
-  :q              quit from the file reader (q from the tree)
-  Neovim 0.10+ is required; the reader uses a clean config and read-only scratch buffers.
   c               commit what's staged: type the message, Enter commits, Esc cancels
-  d               discard the changes of the file or folder under the cursor (y confirms)
+  d               discard the changes of the tree's file or folder, or the open file (y confirms)
   1 / 2           Changes / Branches screen
 
 On the Branches screen:
@@ -61,7 +62,7 @@ On the Branches screen:
   p               pull the branch (current: git pull; others: fast-forward only)
   P (Shift+P)     push the branch (to its upstream, or `origin` with -u)
   m               update the branch from its upstream, then merge it into the current one
-  d / D           delete the local branch (y confirms); D deletes it even if it isn't merged
+  d / D           delete the local branch (y/Enter confirms); D deletes it even if it isn't merged
   f               fetch from all remotes (git fetch --all --prune)
   Esc / 1         back to Changes
   + -             tree height                r    reload the repository   q  quit
@@ -71,7 +72,11 @@ On the Branches screen:
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("show");
-    let rest = if args.is_empty() { &args[..] } else { &args[1..] };
+    let rest = if args.is_empty() {
+        &args[..]
+    } else {
+        &args[1..]
+    };
     let result = match cmd {
         "show" => show(rest),
         "hide" => hide().map(|_| ()),
@@ -121,14 +126,19 @@ fn rex_ctx() -> Result<RexCtx, String> {
 
 /// File that records which rexdiff pane belongs to this terminal.
 fn state_file(block: &str) -> PathBuf {
-    let name: String = block.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    let name: String = block
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
     state_dir().join(name)
 }
 
 pub fn state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"))
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
+        })
         .join("rexdiff")
 }
 
@@ -160,20 +170,27 @@ fn alive(ctx: &RexCtx, id: &str) -> bool {
 }
 
 fn open_pane(ctx: &RexCtx) -> Option<String> {
-    let id = std::fs::read_to_string(state_file(&ctx.block)).ok()?.trim().to_string();
+    let id = std::fs::read_to_string(state_file(&ctx.block))
+        .ok()?
+        .trim()
+        .to_string();
     alive(ctx, &id).then_some(id)
 }
 
 /// If the current pane is itself a rexdiff panel, returns its state file.
 fn owner_state_of(block: &str) -> Option<PathBuf> {
-    std::fs::read_dir(state_dir()).ok()?.flatten().map(|e| e.path()).find(|p| {
-        std::fs::read_to_string(p).is_ok_and(|id| id.trim() == block)
-    })
+    std::fs::read_dir(state_dir())
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|id| id.trim() == block))
 }
 
 /// Accepts a path or a `file://host/path` URL (how Rex reports a terminal's folder).
 fn parse_cwd(s: &str) -> PathBuf {
-    let Some(rest) = s.strip_prefix("file://") else { return PathBuf::from(s) };
+    let Some(rest) = s.strip_prefix("file://") else {
+        return PathBuf::from(s);
+    };
     let path = &rest[rest.find('/').unwrap_or(rest.len())..];
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -223,8 +240,22 @@ fn show(args: &[String]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let out = rex()
-        .args(["split", "-s", &ctx.session, "-b", &ctx.block, "--split", dir, "--ratio", &ratio])
-        .arg(if focus { "--focus=true" } else { "--focus=false" })
+        .args([
+            "split",
+            "-s",
+            &ctx.session,
+            "-b",
+            &ctx.block,
+            "--split",
+            dir,
+            "--ratio",
+            &ratio,
+        ])
+        .arg(if focus {
+            "--focus=true"
+        } else {
+            "--focus=false"
+        })
         .args(["--label", "rexdiff", "--json", "-c"])
         .arg(&cwd)
         .arg("--")
@@ -235,9 +266,11 @@ fn show(args: &[String]) -> Result<(), String> {
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("unexpected response from rex: {e}"))?;
-    let id = json["block_ids"][0].as_str().ok_or("rex did not return the pane id")?;
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("unexpected response from rex: {e}"))?;
+    let id = json["block_ids"][0]
+        .as_str()
+        .ok_or("rex did not return the pane id")?;
     let file = state_file(&ctx.block);
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);

@@ -18,18 +18,29 @@ impl Browser {
         std::thread::spawn(move || {
             for dir in requests {
                 let path = root.join(&dir);
-                let Ok(real) = path.canonicalize() else { continue };
+                let Ok(real) = path.canonicalize() else {
+                    continue;
+                };
                 if !real.starts_with(&root) {
                     continue;
                 }
-                let Ok(children) = std::fs::read_dir(path) else { continue };
+                let Ok(children) = std::fs::read_dir(path) else {
+                    continue;
+                };
                 let mut entries = Vec::new();
                 for child in children.flatten() {
                     if child.file_name() == ".git" {
                         continue;
                     }
-                    let Ok(kind) = child.file_type() else { continue };
-                    let path = child.path().strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+                    let Ok(kind) = child.file_type() else {
+                        continue;
+                    };
+                    let path = child
+                        .path()
+                        .strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
                     if !kind.is_dir() && contained(&root, &path).is_err() {
                         continue;
                     }
@@ -47,7 +58,11 @@ impl Browser {
                 }
             }
         });
-        let out = Self { requests: tx, replies: rx, entries: Default::default() };
+        let out = Self {
+            requests: tx,
+            replies: rx,
+            entries: Default::default(),
+        };
         out.request("");
         out
     }
@@ -73,9 +88,15 @@ pub fn contained(root: &Path, path: &str) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let file = root.join(path).canonicalize().map_err(|e| e.to_string())?;
     if !file.starts_with(&root)
-        || file.strip_prefix(&root).unwrap().components().any(|c| c.as_os_str() == ".git")
+        || file
+            .strip_prefix(&root)
+            .unwrap()
+            .components()
+            .any(|c| c.as_os_str() == ".git")
     {
-        return Err("Choose a file inside the project, outside Git administrative directories".into());
+        return Err(
+            "Choose a file inside the project, outside Git administrative directories".into(),
+        );
     }
     if !file.is_file() {
         return Err("Not a regular file".into());
@@ -101,13 +122,17 @@ impl Picker {
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
         std::thread::spawn(move || {
-            let Ok(repo) = git2::Repository::discover(&root) else { return };
+            let Ok(repo) = git2::Repository::discover(&root) else {
+                return;
+            };
             let mut dirs = vec![root.clone()];
             while let Some(dir) = dirs.pop() {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let Ok(entries) = std::fs::read_dir(dir) else { continue };
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    continue;
+                };
                 let mut entries: Vec<_> = entries.flatten().collect();
                 entries.sort_by_key(|e| e.file_name());
                 for entry in entries {
@@ -120,7 +145,9 @@ impl Picker {
                     if repo.is_path_ignored(entry.path()).unwrap_or(true) {
                         continue;
                     }
-                    let Ok(kind) = entry.file_type() else { continue };
+                    let Ok(kind) = entry.file_type() else {
+                        continue;
+                    };
                     if kind.is_dir() {
                         dirs.push(entry.path());
                     } else if kind.is_file() || kind.is_symlink() {
@@ -152,7 +179,9 @@ impl Picker {
         for _ in 0..512 {
             match self.rx.try_recv() {
                 Ok(path) => {
-                    injector.push(path.clone(), |s, cols| cols[0] = Utf32String::from(s.as_str()));
+                    injector.push(path.clone(), |s, cols| {
+                        cols[0] = Utf32String::from(s.as_str())
+                    });
                     self.paths.push(path);
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -167,12 +196,23 @@ impl Picker {
             && self.matcher.snapshot().pattern().column_pattern(0).atoms
                 == self.matcher.pattern.column_pattern(0).atoms
         {
-            let selected = if self.user_selected { self.results.get(self.cursor).cloned() } else { None };
-            self.results = self.matcher.snapshot().matched_items(..).map(|m| m.data.clone()).collect();
+            let selected = if self.user_selected {
+                self.results.get(self.cursor).cloned()
+            } else {
+                None
+            };
+            self.results = self
+                .matcher
+                .snapshot()
+                .matched_items(..)
+                .map(|m| m.data.clone())
+                .collect();
             if self.query.is_empty() {
                 self.results.sort();
             }
-            self.cursor = selected.and_then(|p| self.results.iter().position(|x| x == &p)).unwrap_or(0);
+            self.cursor = selected
+                .and_then(|p| self.results.iter().position(|x| x == &p))
+                .unwrap_or(0);
         }
     }
     pub fn update(&mut self) {
@@ -209,7 +249,8 @@ impl Picker {
                         ratatui::text::Span::styled(
                             text,
                             ratatui::style::Style::new().add_modifier(
-                                ratatui::style::Modifier::BOLD | ratatui::style::Modifier::UNDERLINED,
+                                ratatui::style::Modifier::BOLD
+                                    | ratatui::style::Modifier::UNDERLINED,
                             ),
                         )
                     } else {
@@ -255,7 +296,12 @@ mod tests {
         }
         assert!(picker.paths.iter().any(|p| p == "visible.rs"));
         assert!(picker.paths.iter().any(|p| p == ".gitignore"));
-        assert!(!picker.paths.iter().any(|p| p == "debug.log" || p.starts_with("build/")));
+        assert!(
+            !picker
+                .paths
+                .iter()
+                .any(|p| p == "debug.log" || p.starts_with("build/"))
+        );
         drop(picker);
         drop(repo);
         std::fs::remove_dir_all(root).unwrap();
@@ -265,8 +311,10 @@ mod tests {
         use nucleo::pattern::{CaseMatching, Normalization, Pattern};
         let mut matcher = nucleo::Matcher::new(Config::DEFAULT.match_paths());
         let pattern = Pattern::parse("sapr", CaseMatching::Smart, Normalization::Smart);
-        let result =
-            pattern.match_list(["src/app.rs", "something/a/path/really/long", "README.md"], &mut matcher);
+        let result = pattern.match_list(
+            ["src/app.rs", "something/a/path/really/long", "README.md"],
+            &mut matcher,
+        );
         assert_eq!(result[0].0, "src/app.rs");
         assert_eq!(result.len(), 2);
         assert_eq!(
