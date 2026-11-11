@@ -29,19 +29,15 @@ pub fn wrap_row(row: &DRow, width: usize) -> Wrapped {
         return Wrapped { starts, indent: 0 };
     }
 
-    let leading = row
-        .segs
-        .iter()
-        .flat_map(|s| s.text.chars())
-        .take_while(|c| *c == ' ')
-        .count();
+    let text = crate::annotations::text(row);
+    let leading = text.chars().take_while(|c| *c == ' ').count();
     // Too large an indent would leave little room for the text.
     let indent = if leading <= width / 2 { leading } else { 0 };
 
     let mut col = 0; // column in the current visual line
     let mut i = 0; // char index
     let mut brk: Option<(usize, usize)> = None; // (index, column) right after the last space
-    for (g, n, w) in row.segs.iter().flat_map(|s| clusters(&s.text)) {
+    for (g, n, w) in clusters(&text) {
         if col + w > width && col > 0 {
             let line_start = *starts.last().expect("starts is never empty");
             let (at, at_col) = match brk {

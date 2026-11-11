@@ -72,7 +72,7 @@ enum Focus {
     Notes,
 }
 
-/// Where the reader goes once the requested file and revision load. Applied
+/// Where the reader goes once the requested file loads. Applied
 /// once, by cached and async loads alike; selecting another file cancels it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PendingSeek {
@@ -84,7 +84,6 @@ enum PendingSeek {
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Pending {
     path: String,
-    revision: u64,
     seek: PendingSeek,
 }
 
@@ -812,7 +811,6 @@ impl App {
     /// Asks for `path` with `seek`, applied now if it's already showing.
     fn seek_to(&mut self, path: String, seek: PendingSeek) {
         self.pending = Some(Pending {
-            revision: self.revision(&path),
             path: path.clone(),
             seek,
         });
@@ -850,10 +848,6 @@ impl App {
         let Some(pending) = self.pending.clone().filter(|p| p.path == d.path) else {
             return;
         };
-        if pending.revision != d.revision {
-            self.pending = None;
-            return;
-        }
         let (row, old_side) = match pending.seek {
             PendingSeek::FirstHunk => {
                 self.reader.first_hunk(d);

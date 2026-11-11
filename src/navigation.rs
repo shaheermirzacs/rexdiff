@@ -1,6 +1,7 @@
 //! Regex search and word motions over the reader's cached row text.
 
 use regex::{Regex, RegexBuilder};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::annotations::Position;
 
@@ -78,8 +79,9 @@ fn class(c: char) -> u8 {
     }
 }
 
-/// A place in the text of `rows`, walked one character at a time; each row
-/// ends with a virtual newline at its byte length.
+/// A place in the text of `rows`, walked one grapheme cluster at a time (so
+/// accents and joined emoji never split a word); each row ends with a
+/// virtual newline at its byte length. A cluster's class is its first char's.
 struct Cursor<'a> {
     texts: &'a [String],
     rows: &'a [usize],
@@ -98,8 +100,8 @@ impl Cursor<'_> {
 
     fn next(&mut self) -> bool {
         let text = self.text();
-        if let Some(c) = text[self.byte..].chars().next() {
-            self.byte += c.len_utf8();
+        if let Some(g) = text[self.byte..].graphemes(true).next() {
+            self.byte += g.len();
         } else if self.k + 1 < self.rows.len() {
             self.k += 1;
             self.byte = 0;
@@ -112,7 +114,7 @@ impl Cursor<'_> {
     fn prev(&mut self) -> bool {
         if self.byte > 0 {
             self.byte = self.text()[..self.byte]
-                .char_indices()
+                .grapheme_indices(true)
                 .next_back()
                 .map_or(0, |(i, _)| i);
         } else if self.k > 0 {
@@ -212,5 +214,9 @@ mod tests {
         let back = word(&texts, &rows, back, 'b');
         assert_eq!(back, Position { row: 0, col: 3 });
         assert_eq!(word(&texts, &rows, back, 'b'), Position::default());
+        // An accent belongs to its letter's word.
+        let texts = vec!["cafe\u{301} bar".to_string()];
+        assert_eq!(word(&texts, &[0], Position::default(), 'w').col, 6);
+        assert_eq!(word(&texts, &[0], Position::default(), 'e').col, 3);
     }
 }

@@ -78,6 +78,8 @@ fn changed(kind: RowKind) -> bool {
 struct Doc {
     /// Bumps whenever text or line numbers change (not for highlighting).
     revision: u64,
+    /// Whole-file mode, which changes the hunk targets.
+    whole: bool,
     texts: Vec<String>,
     keys: Vec<RowKey>,
     split: Vec<SplitRow>,
@@ -140,6 +142,7 @@ impl Doc {
             old_rows: rows(|k| matches!(k, RowKind::Del | RowKind::Ctx)),
             new_rows: rows(|k| matches!(k, RowKind::Add | RowKind::Ctx)),
             targets: targets(&keys, whole),
+            whole,
             texts,
             keys,
             split,
@@ -371,13 +374,19 @@ impl Reader {
             self.generation = Some(generation);
             let texts: Vec<String> = diff.rows.iter().map(annotations::text).collect();
             let keys: Vec<RowKey> = diff.rows.iter().map(|r| (r.kind, r.old, r.new)).collect();
-            if !same_file || texts != self.doc.texts || keys != self.doc.keys {
-                let previous = if same_file {
-                    self.doc.keys.get(self.cursor.row).copied()
-                } else {
-                    None
-                };
-                let whole = diff.context >= crate::app::FULL_CONTEXT;
+            let whole = diff.context >= crate::app::FULL_CONTEXT;
+            if !same_file
+                || texts != self.doc.texts
+                || keys != self.doc.keys
+                || whole != self.doc.whole
+            {
+                // A hunk header has no line numbers: follow the source row below it.
+                let rows = &self.doc.stacked_rows;
+                let previous = rows
+                    .get(rows.partition_point(|&r| r < self.cursor.row))
+                    .or(rows.last())
+                    .filter(|_| same_file)
+                    .map(|&r| self.doc.keys[r]);
                 self.doc = Doc::new(texts, keys, whole, self.doc.revision + 1);
                 self.path = diff.path.clone();
                 self.max_lineno = diff.max_lineno;
@@ -533,7 +542,7 @@ impl Reader {
     /// Char offsets where the grapheme clusters of `row` start.
     fn cluster_starts(&self, row: usize) -> Vec<usize> {
         let mut at = 0;
-        clusters(&self.doc.texts[row])
+        clusters(self.doc.texts.get(row).map_or("", String::as_str))
             .map(|(_, n, _)| {
                 at += n;
                 at - n
@@ -541,13 +550,17 @@ impl Reader {
             .collect()
     }
 
+    /// The cursor as shown: on the start of the cluster holding its column,
+    /// or of the row's last cluster.
     fn clamped(&self) -> Position {
+        let starts = self.cluster_starts(self.cursor.row);
         Position {
             row: self.cursor.row,
-            col: self
-                .cursor
-                .col
-                .min(self.len(self.cursor.row).saturating_sub(1)),
+            col: starts
+                .into_iter()
+                .take_while(|&s| s <= self.cursor.col)
+                .last()
+                .unwrap_or(0),
         }
     }
 
@@ -769,19 +782,21 @@ impl Reader {
     fn pan_to_cursor(&mut self) {
         if self.split_active() {
             let col = self.clamped().col;
-            let mut at = 0;
-            let x: usize = clusters(&self.doc.texts[self.cursor.row])
-                .take_while(|&(_, n, _)| {
-                    at += n;
-                    at <= col
-                })
-                .map(|(_, _, w)| w)
-                .sum();
+            let (mut at, mut x, mut cw) = (0, 0, 1);
+            for (_, n, w) in clusters(&self.doc.texts[self.cursor.row]) {
+                if at == col {
+                    cw = w.max(1);
+                    break;
+                }
+                at += n;
+                x += w;
+            }
+            // The whole cluster, so a wide one at the right edge still shows.
             let w = self.geom().text_w as usize;
             if x < self.hscroll {
                 self.hscroll = x;
-            } else if x >= self.hscroll + w {
-                self.hscroll = x + 1 - w;
+            } else if x + cw > self.hscroll + w {
+                self.hscroll = x + cw - w;
             }
         }
     }
@@ -1201,10 +1216,7 @@ impl Reader {
         };
         self.highlight = true;
         let eligible = |h: &&Hit| !self.split_active() || self.on_side(h.row, self.old_side);
-        let at = (
-            self.cursor.row,
-            self.cursor.col.min(self.len(self.cursor.row)),
-        );
+        let at = (self.cursor.row, self.clamped().col);
         let next = if backward {
             let mut hits = self.hits.iter().rev().filter(eligible);
             hits.clone()
@@ -1283,20 +1295,14 @@ impl Reader {
                 at += n;
                 continue;
             }
-            if cell < w || at + n >= end {
+            // Past the end lands on the last cluster, never inside it.
+            if cell < w || at + n >= end.min(self.len(row)) {
                 break;
             }
             cell -= w;
             at += n;
         }
-        let col = at;
-        Some((
-            Position {
-                row,
-                col: col.min(self.len(row).saturating_sub(1)),
-            },
-            old,
-        ))
+        Some((Position { row, col: at }, old))
     }
 
     /// A click: moves the cursor there. `false` outside source text.
@@ -1593,61 +1599,68 @@ impl Reader {
         let mut skip = if side.is_some() { self.hscroll } else { 0 };
         let mut cx = text_x + indent as u16;
         let mut col = 0;
-        'segments: for seg in &row.segs {
-            let mut style = base.fg(seg.fg.map_or(p.fg, |i| {
-                let (r, g, b) = p.ansi[usize::from(i).min(15)];
-                Color::Rgb(r, g, b)
-            }));
-            if seg.bold {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            if seg.emph
-                && let Some(bg) = emph_bg
+        let (mut segs, mut seg_end, mut style) = (row.segs.iter(), 0, base);
+        // Clusters of the whole row, like wrapping and clicks, so a segment
+        // boundary inside one doesn't split it; it takes its first char's style.
+        for (g, n, w) in clusters(&self.doc.texts[r]) {
+            while col >= seg_end
+                && let Some(seg) = segs.next()
             {
-                style = style.bg(bg);
-            }
-            // Whole grapheme clusters, so combining marks and joined emoji
-            // render as in the file; columns still count characters.
-            for (g, n, w) in clusters(&seg.text) {
-                if col >= to {
-                    break 'segments;
+                seg_end += seg.text.chars().count();
+                style = base.fg(seg.fg.map_or(p.fg, |i| {
+                    let (r, g, b) = p.ansi[usize::from(i).min(15)];
+                    Color::Rgb(r, g, b)
+                }));
+                if seg.bold {
+                    style = style.add_modifier(Modifier::BOLD);
                 }
-                if col >= from {
-                    if skip > 0 {
-                        skip = skip.saturating_sub(w);
-                        col += n;
-                        continue;
-                    }
-                    if cx + w as u16 > right {
-                        break 'segments;
-                    }
-                    let span = col..col + n;
-                    let pos = Position { row: r, col };
-                    let cell = if selection.is_some_and(|s| s.contains(c.cursor, pos)) {
-                        Style::new()
-                            .fg(p.selection_fg)
-                            .bg(p.blue)
-                            .add_modifier(Modifier::BOLD)
-                    } else if hits
-                        .iter()
-                        .any(|h| h.start < span.end && span.start < h.end)
-                    {
-                        Style::new()
-                            .fg(p.search_fg)
-                            .bg(p.yellow)
-                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                    } else if cursor_here && span.contains(&c.cursor.col) {
-                        style.add_modifier(Modifier::REVERSED)
-                    } else {
-                        style
-                    };
-                    if w > 0 {
-                        buf.set_stringn(cx, y, g, w, cell);
-                    }
-                    cx += w as u16;
+                if seg.emph
+                    && let Some(bg) = emph_bg
+                {
+                    style = style.bg(bg);
                 }
-                col += n;
             }
+            if col >= to {
+                break;
+            }
+            if col >= from {
+                if skip > 0 {
+                    // A wide cluster cut by the scroll leaves its visible
+                    // cells blank, so cells line up with clicks.
+                    cx += w.saturating_sub(skip) as u16;
+                    skip = skip.saturating_sub(w);
+                    col += n;
+                    continue;
+                }
+                if cx + w as u16 > right {
+                    break;
+                }
+                let span = col..col + n;
+                let pos = Position { row: r, col };
+                let cell = if selection.is_some_and(|s| s.contains(c.cursor, pos)) {
+                    Style::new()
+                        .fg(p.selection_fg)
+                        .bg(p.blue)
+                        .add_modifier(Modifier::BOLD)
+                } else if hits
+                    .iter()
+                    .any(|h| h.start < span.end && span.start < h.end)
+                {
+                    Style::new()
+                        .fg(p.search_fg)
+                        .bg(p.yellow)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else if cursor_here && span.contains(&c.cursor.col) {
+                    style.add_modifier(Modifier::REVERSED)
+                } else {
+                    style
+                };
+                if w > 0 {
+                    buf.set_stringn(cx, y, g, w, cell);
+                }
+                cx += w as u16;
+            }
+            col += n;
         }
         if cursor_here && sub == 0 && self.len(r) == 0 && side.is_none_or(|_| self.hscroll == 0) {
             buf.set_style(
@@ -2042,6 +2055,85 @@ mod tests {
             vec![0, 25],
             "five 2-cell emoji per line"
         );
+        // A segment boundary inside a cluster doesn't split it.
+        let mut cut = row(Ctx, Some(1), Some(1), "e");
+        cut.segs.push(Seg {
+            text: "\u{301}x".into(),
+            fg: None,
+            bold: false,
+            emph: false,
+        });
+        let d = diff(vec![cut]);
+        let r = reader(&d, 40);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 12));
+        r.draw(buf.area, &d, &[], &Palette::from(None), false, &mut buf);
+        assert_eq!(buf[(6, 0)].symbol(), "e\u{301}");
+        assert_eq!(buf[(7, 0)].symbol(), "x");
+        // `$` then `j` onto a shorter row ending in a joined emoji: the
+        // cursor sits on the emoji's start, so `h` leaves it.
+        let d = diff(vec![
+            row(Ctx, Some(1), Some(1), &"x".repeat(20)),
+            row(Ctx, Some(2), Some(2), &format!("ab{family}")),
+        ]);
+        let mut r = reader(&d, 40);
+        r.motion(&d, Motion::LineEnd);
+        r.motion(&d, Motion::Down);
+        assert_eq!(r.cursor().col, 2);
+        r.motion(&d, Motion::Left);
+        assert_eq!(r.cursor().col, 1);
+    }
+
+    #[test]
+    fn split_panning_keeps_wide_clusters_whole() {
+        use RowKind::*;
+        // Width 47 splits into 16-column text areas; the new pane's text
+        // starts at x=30 and ends before x=46.
+        let screen = |r: &Reader, d: &FileDiff| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 47, 12));
+            r.draw(buf.area, d, &[], &Palette::from(None), true, &mut buf);
+            buf
+        };
+        let d = diff(vec![row(
+            Ctx,
+            Some(1),
+            Some(1),
+            &format!("{}中", "a".repeat(20)),
+        )]);
+        let mut r = reader(&d, 47);
+        r.toggle_split();
+        assert_eq!(r.geom().text_w, 16);
+        r.motion(&d, Motion::LineEnd);
+        assert_eq!(
+            screen(&r, &d)[(44, 1)].symbol(),
+            "中",
+            "the cursor's wide cluster shows"
+        );
+        // An odd scroll cuts a wide cluster: clicks match what's painted.
+        let d = diff(vec![row(
+            Ctx,
+            Some(1),
+            Some(1),
+            &format!("{}a", "中".repeat(20)),
+        )]);
+        let mut r = reader(&d, 47);
+        r.toggle_split();
+        r.motion(&d, Motion::LineEnd);
+        assert_eq!(r.hscroll, 25);
+        assert_eq!(screen(&r, &d)[(31, 1)].symbol(), "中");
+        assert!(r.click(&d, 31, 1));
+        assert_eq!(r.cursor().col, 13);
+    }
+
+    #[test]
+    fn reload_on_a_folded_header_stays_in_its_hunk() {
+        let mut d = hunks();
+        let mut r = reader(&d, 60);
+        r.hunk(&d, true);
+        assert!(r.toggle_fold(&d));
+        assert_eq!(r.cursor().row, 5);
+        d.rows[8].segs[0].text = "w".into();
+        r.load(&d, 2, None);
+        assert_eq!(r.cursor().row, 6);
     }
 
     #[test]
