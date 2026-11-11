@@ -1,5 +1,7 @@
 //! The one table of key bindings. Dispatch, the help overlay, and the
 //! command line all read it, so listed keys cannot drift from bound keys.
+//! The Changes screen has a single set: a key does the same thing whichever
+//! pane has focus, acting on the focused list where that matters.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -44,7 +46,7 @@ pub enum Action {
     Reload,
     Left,
     Right,
-    Stage,
+    StageOrFold,
     Activate,
     Discard,
     History,
@@ -56,14 +58,11 @@ pub enum Action {
     Grow,
     Shrink,
     Move(Motion),
-    Count(u8),
-    MotionPrefix,
     Search,
     SearchNext,
     SearchPrev,
     VisualChar,
     VisualLine,
-    EditNote,
     DeleteNote,
     Checkout,
     OpenHistory,
@@ -103,32 +102,23 @@ impl Action {
     }
 }
 
-/// Where a binding applies. `Changes` covers all three review panes.
+/// Where a binding applies: every screen, or one of them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Scope {
     Global,
     Changes,
-    Tree,
-    Reader,
-    Notes,
     Branches,
     History,
 }
 
 impl Scope {
-    /// The tables consulted for a focused scope, most specific first.
-    fn layers(self) -> [Scope; 3] {
-        match self {
-            Scope::Tree | Scope::Reader | Scope::Notes => [self, Scope::Changes, Scope::Global],
-            _ => [self, self, Scope::Global],
-        }
+    /// The tables consulted for a screen, most specific first.
+    fn layers(self) -> [Scope; 2] {
+        [self, Scope::Global]
     }
 
     pub fn title(self) -> &'static str {
         match self {
-            Scope::Tree => "Changes · file tree",
-            Scope::Reader => "Changes · file reader",
-            Scope::Notes => "Changes · notes",
             Scope::Branches => "Branches",
             Scope::History => "History",
             Scope::Global | Scope::Changes => "Changes",
@@ -136,12 +126,11 @@ impl Scope {
     }
 }
 
-/// A key press with exact modifiers, or the second key of `Space x` / `z x`.
+/// A key press with exact modifiers, or the second key of `Space x`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Key {
     Press(KeyCode, KeyModifiers),
     Leader(char),
-    Z(char),
 }
 
 impl Key {
@@ -164,6 +153,7 @@ impl Key {
             KeyCode::Tab => "Tab".into(),
             KeyCode::BackTab => "Shift+Tab".into(),
             KeyCode::Backspace => "Backspace".into(),
+            KeyCode::Delete => "Delete".into(),
             KeyCode::Up => "↑".into(),
             KeyCode::Down => "↓".into(),
             KeyCode::Left => "←".into(),
@@ -178,7 +168,6 @@ impl Key {
             Key::Press(c, m) if m.contains(KeyModifiers::CONTROL) => format!("Ctrl+{}", code(c)),
             Key::Press(c, _) => code(c),
             Key::Leader(c) => format!("Space {c}"),
-            Key::Z(c) => format!("z{c}"),
         }
     }
 }
@@ -209,40 +198,64 @@ const fn code(c: KeyCode) -> Key {
 }
 
 use Action as A;
-use Scope::{Branches, Changes, Global, History, Notes, Reader, Tree};
+use Scope::{Branches, Changes, Global, History};
 
 // A `static`, not a `const`: `help` compares bindings by address.
 pub static BINDINGS: &[Binding] = &[
     b(Global, ch('q'), A::Quit, "Quit"),
     b(Global, ctrl('c'), A::Quit, "Quit"),
-    b(Global, ch('?'), A::Help, "Help for this screen"),
+    b(Global, ch('?'), A::Help, "Help: every key on this screen"),
     b(Global, ch(':'), A::Command, "Command line (Tab completes)"),
     b(Global, ch('1'), A::Changes, "Changes screen"),
     b(Global, ch('2'), A::Branches, "Branches screen"),
     b(Global, ch('W'), A::WorkingTree, "Working-tree changes"),
-    // Shared by the tree, reader and notes.
-    b(Changes, ch('j'), A::Down, "Down"),
-    b(Changes, code(KeyCode::Down), A::Down, "Down"),
-    b(Changes, ch('k'), A::Up, "Up"),
-    b(Changes, code(KeyCode::Up), A::Up, "Up"),
-    b(Changes, ch('g'), A::Top, "Top of the focused list or file"),
+    // Changes: one set for the tree, the reader, and the notes.
+    b(Changes, ch('j'), A::Down, "Down in the focused pane"),
+    b(
+        Changes,
+        code(KeyCode::Down),
+        A::Down,
+        "Down in the focused pane",
+    ),
+    b(Changes, ch('k'), A::Up, "Up in the focused pane"),
+    b(Changes, code(KeyCode::Up), A::Up, "Up in the focused pane"),
+    b(
+        Changes,
+        ch('h'),
+        A::Left,
+        "Left (tree: collapse / parent folder)",
+    ),
+    b(
+        Changes,
+        code(KeyCode::Left),
+        A::Left,
+        "Left (tree: collapse / parent folder)",
+    ),
+    b(
+        Changes,
+        ch('l'),
+        A::Right,
+        "Right (tree: expand / enter folder)",
+    ),
+    b(
+        Changes,
+        code(KeyCode::Right),
+        A::Right,
+        "Right (tree: expand / enter folder)",
+    ),
+    b(Changes, ch('g'), A::Top, "Top of the focused pane"),
     b(
         Changes,
         code(KeyCode::Home),
         A::Top,
-        "Top of the focused list or file",
+        "Top of the focused pane",
     ),
-    b(
-        Changes,
-        ch('G'),
-        A::Bottom,
-        "Bottom of the focused list or file (NG: source line N)",
-    ),
+    b(Changes, ch('G'), A::Bottom, "Bottom of the focused pane"),
     b(
         Changes,
         code(KeyCode::End),
         A::Bottom,
-        "Bottom of the focused list or file (NG: source line N)",
+        "Bottom of the focused pane",
     ),
     b(Changes, ctrl('d'), A::HalfDown, "Half page down"),
     b(Changes, ctrl('u'), A::HalfUp, "Half page up"),
@@ -252,31 +265,15 @@ pub static BINDINGS: &[Binding] = &[
     b(Changes, code(KeyCode::PageUp), A::PageUp, "Page up"),
     b(
         Changes,
-        ch('a'),
-        A::Annotate,
-        "Annotate line or selection (file in the tree)",
+        code(KeyCode::Enter),
+        A::Activate,
+        "Open file / fold folder / edit note",
     ),
-    b(Changes, ch('A'), A::AnnotateFile, "Annotate the whole file"),
-    b(Changes, ch('c'), A::Commit, "Commit staged changes"),
-    b(Changes, ch('s'), A::Send, "Send notes to an agent"),
-    b(
-        Changes,
-        ch('L'),
-        A::Notes,
-        "Show / focus notes; again hides",
-    ),
-    b(Changes, ch('x'), A::Context, "Whole-file context"),
-    b(Changes, ch('S'), A::Layout, "Split / stacked layout"),
-    b(Changes, ctrl('p'), A::Picker, "Project file picker"),
-    b(Changes, ch('['), A::PrevHunk, "Previous hunk"),
-    b(Changes, ch(']'), A::NextHunk, "Next hunk"),
-    b(Changes, ch('{'), A::PrevFile, "Previous file"),
-    b(Changes, ch('}'), A::NextFile, "Next file"),
     b(
         Changes,
         code(KeyCode::Tab),
         A::FocusNext,
-        "Next pane (opens the file in the tree)",
+        "Next pane (opens the file from the tree)",
     ),
     b(
         Changes,
@@ -284,6 +281,69 @@ pub static BINDINGS: &[Binding] = &[
         A::FocusPrev,
         "Previous pane",
     ),
+    b(
+        Changes,
+        ch('z'),
+        A::StageOrFold,
+        "Stage file / fold folder (tree); fold hunk (file)",
+    ),
+    b(
+        Changes,
+        ch('a'),
+        A::Annotate,
+        "Annotate the file's line or selection",
+    ),
+    b(Changes, ch('A'), A::AnnotateFile, "Annotate the whole file"),
+    b(
+        Changes,
+        ch('L'),
+        A::Notes,
+        "Show / focus notes; again hides",
+    ),
+    b(Changes, ch('s'), A::Send, "Send notes to an agent"),
+    b(
+        Changes,
+        code(KeyCode::Delete),
+        A::DeleteNote,
+        "Delete the selected note (notes)",
+    ),
+    b(
+        Changes,
+        code(KeyCode::Backspace),
+        A::DeleteNote,
+        "Delete the selected note (notes)",
+    ),
+    b(Changes, ch('['), A::PrevHunk, "Previous hunk"),
+    b(Changes, ch(']'), A::NextHunk, "Next hunk"),
+    b(Changes, ch('{'), A::PrevFile, "Previous file"),
+    b(Changes, ch('}'), A::NextFile, "Next file"),
+    b(
+        Changes,
+        ch('/'),
+        A::Search,
+        "Search the file (regex, smart case)",
+    ),
+    b(Changes, ch('n'), A::SearchNext, "Next match"),
+    b(Changes, ch('N'), A::SearchPrev, "Previous match"),
+    b(Changes, ch('w'), A::Move(Motion::WordNext), "Next word"),
+    b(Changes, ch('b'), A::Move(Motion::WordBack), "Previous word"),
+    b(Changes, ch('e'), A::Move(Motion::WordEnd), "End of word"),
+    b(Changes, ch('0'), A::Move(Motion::LineStart), "Line start"),
+    b(
+        Changes,
+        ch('^'),
+        A::Move(Motion::FirstNonBlank),
+        "First non-blank",
+    ),
+    b(Changes, ch('$'), A::Move(Motion::LineEnd), "Line end"),
+    b(Changes, ch('v'), A::VisualChar, "Select characters"),
+    b(Changes, ch('V'), A::VisualLine, "Select lines"),
+    b(Changes, ch('J'), A::ScrollDown, "Scroll the file down"),
+    b(Changes, ctrl('e'), A::ScrollDown, "Scroll the file down"),
+    b(Changes, ch('K'), A::ScrollUp, "Scroll the file up"),
+    b(Changes, ctrl('y'), A::ScrollUp, "Scroll the file up"),
+    b(Changes, ch('x'), A::Context, "Whole-file context"),
+    b(Changes, ch('S'), A::Layout, "Split / stacked layout"),
     b(Changes, ch(' '), A::Leader, "Leader prefix"),
     b(
         Changes,
@@ -303,139 +363,38 @@ pub static BINDINGS: &[Binding] = &[
         A::NewSide,
         "New side of a split diff",
     ),
-    b(Changes, code(KeyCode::Esc), A::Back, "Back"),
-    // The file tree.
-    b(Tree, ch('h'), A::Left, "Collapse / parent folder"),
+    b(Changes, ch('c'), A::Commit, "Commit staged changes"),
     b(
-        Tree,
-        code(KeyCode::Left),
-        A::Left,
-        "Collapse / parent folder",
-    ),
-    b(Tree, ch('l'), A::Right, "Expand / enter folder"),
-    b(
-        Tree,
-        code(KeyCode::Right),
-        A::Right,
-        "Expand / enter folder",
+        Changes,
+        ch('d'),
+        A::Discard,
+        "Discard the file's changes (y confirms)",
     ),
     b(
-        Tree,
-        code(KeyCode::Enter),
-        A::Activate,
-        "Open file / fold folder",
-    ),
-    b(Tree, ch('z'), A::Stage, "Stage / unstage file; fold folder"),
-    b(Tree, ch('d'), A::Discard, "Discard changes (y confirms)"),
-    b(Tree, ch('J'), A::ScrollDown, "Scroll the file down"),
-    b(Tree, ch('K'), A::ScrollUp, "Scroll the file up"),
-    b(
-        Tree,
-        ch('H'),
-        A::History,
-        "Commits of the checked-out branch",
-    ),
-    b(
-        Tree,
+        Changes,
         ch('D'),
         A::BranchDiff,
         "Branch diff from the merge base",
     ),
-    b(Tree, ch('B'), A::Base, "Comparison base"),
-    b(Tree, ch('t'), A::AllFiles, "Changed / all project files"),
-    b(Tree, ch('r'), A::Reload, "Reload the repository"),
-    b(Tree, ch('+'), A::Grow, "Bigger tree"),
-    b(Tree, ch('='), A::Grow, "Bigger tree"),
-    b(Tree, ch('-'), A::Shrink, "Smaller tree"),
-    // The file reader.
-    b(Reader, ch('h'), A::Move(Motion::Left), "Left"),
-    b(Reader, code(KeyCode::Left), A::Move(Motion::Left), "Left"),
-    b(Reader, ch('l'), A::Move(Motion::Right), "Right"),
+    b(Changes, ch('B'), A::Base, "Comparison base"),
     b(
-        Reader,
-        code(KeyCode::Right),
-        A::Move(Motion::Right),
-        "Right",
+        Changes,
+        ch('H'),
+        A::History,
+        "Commits of the checked-out branch",
     ),
-    b(Reader, ch('w'), A::Move(Motion::WordNext), "Next word"),
-    b(Reader, ch('b'), A::Move(Motion::WordBack), "Previous word"),
-    b(Reader, ch('e'), A::Move(Motion::WordEnd), "End of word"),
-    b(Reader, ch('0'), A::Move(Motion::LineStart), "Line start"),
+    b(Changes, ch('t'), A::AllFiles, "Changed / all project files"),
+    b(Changes, ctrl('p'), A::Picker, "Project file picker"),
+    b(Changes, ch('r'), A::Reload, "Reload the repository"),
+    b(Changes, ch('+'), A::Grow, "Bigger tree"),
+    b(Changes, ch('='), A::Grow, "Bigger tree"),
+    b(Changes, ch('-'), A::Shrink, "Smaller tree"),
     b(
-        Reader,
-        ch('^'),
-        A::Move(Motion::FirstNonBlank),
-        "First non-blank",
-    ),
-    b(Reader, ch('$'), A::Move(Motion::LineEnd), "Line end"),
-    b(
-        Reader,
-        ctrl('e'),
-        A::Move(Motion::ScrollDown),
-        "Scroll down a line",
-    ),
-    b(
-        Reader,
-        ctrl('y'),
-        A::Move(Motion::ScrollUp),
-        "Scroll up a line",
-    ),
-    b(Reader, ch('z'), A::MotionPrefix, "Scroll prefix"),
-    b(
-        Reader,
-        Key::Z('t'),
-        A::Move(Motion::PlaceTop),
-        "Cursor line to the top",
-    ),
-    b(
-        Reader,
-        Key::Z('z'),
-        A::Move(Motion::PlaceCenter),
-        "Cursor line to the middle",
-    ),
-    b(
-        Reader,
-        Key::Z('b'),
-        A::Move(Motion::PlaceBottom),
-        "Cursor line to the bottom",
-    ),
-    b(
-        Reader,
-        Key::Z('h'),
-        A::Move(Motion::ScrollLeft),
-        "Scroll left (split)",
-    ),
-    b(
-        Reader,
-        Key::Z('l'),
-        A::Move(Motion::ScrollRight),
-        "Scroll right (split)",
-    ),
-    b(Reader, ch('v'), A::VisualChar, "Select characters"),
-    b(Reader, ch('V'), A::VisualLine, "Select lines"),
-    b(Reader, ch('/'), A::Search, "Regex search (smart case)"),
-    b(Reader, ch('n'), A::SearchNext, "Next match"),
-    b(Reader, ch('N'), A::SearchPrev, "Previous match"),
-    b(Reader, ch('1'), A::Count(1), "Count prefix"),
-    b(Reader, ch('2'), A::Count(2), "Count prefix"),
-    b(Reader, ch('3'), A::Count(3), "Count prefix"),
-    b(Reader, ch('4'), A::Count(4), "Count prefix"),
-    b(Reader, ch('5'), A::Count(5), "Count prefix"),
-    b(Reader, ch('6'), A::Count(6), "Count prefix"),
-    b(Reader, ch('7'), A::Count(7), "Count prefix"),
-    b(Reader, ch('8'), A::Count(8), "Count prefix"),
-    b(Reader, ch('9'), A::Count(9), "Count prefix"),
-    b(
-        Reader,
+        Changes,
         code(KeyCode::Esc),
         A::Back,
-        "Clear selection, then search, then back",
+        "Clear selection / search, close notes, back",
     ),
-    // The notes list.
-    b(Notes, code(KeyCode::Enter), A::EditNote, "Edit the note"),
-    b(Notes, ch('d'), A::DeleteNote, "Delete the note"),
-    b(Notes, ch('q'), A::Back, "Close notes"),
-    b(Notes, code(KeyCode::Esc), A::Back, "Close notes"),
     // Branches.
     b(Branches, ch('j'), A::Down, "Down"),
     b(Branches, code(KeyCode::Down), A::Down, "Down"),
@@ -519,12 +478,7 @@ pub fn lookup(scope: Scope, key: Key) -> Option<&'static Binding> {
 /// a more specific table takes over.
 pub fn help(scope: Scope) -> Vec<(Vec<Key>, &'static str, Action)> {
     let mut out: Vec<(Vec<Key>, &'static str, Action)> = Vec::new();
-    let mut seen = Vec::new();
     for layer in scope.layers() {
-        if seen.contains(&layer) {
-            continue;
-        }
-        seen.push(layer);
         for binding in BINDINGS.iter().filter(|b| b.scope == layer) {
             if lookup(scope, binding.key).is_none_or(|winner| !std::ptr::eq(winner, binding)) {
                 continue;

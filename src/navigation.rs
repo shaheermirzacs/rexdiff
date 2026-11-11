@@ -136,15 +136,9 @@ impl Cursor<'_> {
     }
 }
 
-/// `w`, `b`, or `e` repeated `count` times through `rows` (display order),
-/// without collecting the document's characters.
-pub fn word(
-    texts: &[String],
-    rows: &[usize],
-    cursor: Position,
-    motion: char,
-    count: usize,
-) -> Position {
+/// `w`, `b`, or `e` through `rows` (display order), without collecting the
+/// document's characters.
+pub fn word(texts: &[String], rows: &[usize], cursor: Position, motion: char) -> Position {
     if rows.is_empty() {
         return cursor;
     }
@@ -165,27 +159,25 @@ pub fn word(
         k,
         byte,
     };
-    for _ in 0..count {
-        match motion {
-            'b' => {
+    match motion {
+        'b' => {
+            c.prev();
+            while class(c.char()) == 0 && c.prev() {}
+            while c.peek(false).is_some_and(|p| class(p) == class(c.char())) {
                 c.prev();
-                while class(c.char()) == 0 && c.prev() {}
-                while c.peek(false).is_some_and(|p| class(p) == class(c.char())) {
-                    c.prev();
-                }
             }
-            'e' => {
+        }
+        'e' => {
+            c.next();
+            while class(c.char()) == 0 && c.next() {}
+            while c.peek(true).is_some_and(|n| class(n) == class(c.char())) {
                 c.next();
-                while class(c.char()) == 0 && c.next() {}
-                while c.peek(true).is_some_and(|n| class(n) == class(c.char())) {
-                    c.next();
-                }
             }
-            _ => {
-                let start = class(c.char());
-                while class(c.char()) == start && c.next() {}
-                while class(c.char()) == 0 && c.next() {}
-            }
+        }
+        _ => {
+            let start = class(c.char());
+            while class(c.char()) == start && c.next() {}
+            while class(c.char()) == 0 && c.next() {}
         }
     }
     Position {
@@ -206,26 +198,19 @@ mod tests {
             "  next".to_string(),
         ];
         let rows = [0, 2];
-        assert_eq!(word(&texts, &rows, Position::default(), 'w', 1).col, 3);
+        assert_eq!(word(&texts, &rows, Position::default(), 'w').col, 3);
         assert_eq!(
-            word(&texts, &rows, Position { row: 0, col: 3 }, 'e', 1).col,
+            word(&texts, &rows, Position { row: 0, col: 3 }, 'e').col,
             13
         );
         assert_eq!(
-            word(&texts, &rows, Position { row: 0, col: 14 }, 'w', 1),
+            word(&texts, &rows, Position { row: 0, col: 14 }, 'w'),
             Position { row: 2, col: 2 }
         );
-        assert_eq!(
-            word(&texts, &rows, Position { row: 2, col: 2 }, 'b', 1),
-            Position { row: 0, col: 14 }
-        );
-        assert_eq!(
-            word(&texts, &rows, Position { row: 2, col: 2 }, 'b', 2),
-            Position { row: 0, col: 3 }
-        );
-        assert_eq!(
-            word(&texts, &rows, Position { row: 2, col: 2 }, 'b', 3),
-            Position::default()
-        );
+        let back = word(&texts, &rows, Position { row: 2, col: 2 }, 'b');
+        assert_eq!(back, Position { row: 0, col: 14 });
+        let back = word(&texts, &rows, back, 'b');
+        assert_eq!(back, Position { row: 0, col: 3 });
+        assert_eq!(word(&texts, &rows, back, 'b'), Position::default());
     }
 }

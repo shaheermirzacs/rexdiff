@@ -2,8 +2,9 @@
 //! stacked/split rendering of one diff document. The app owns the document;
 //! the reader keeps everything derived from it, cached per generation.
 
+use std::borrow::Cow;
 use std::cell::{RefCell, RefMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use ratatui::buffer::Buffer;
@@ -19,8 +20,6 @@ use crate::wrap::{WrapCache, Wrapped, wrap_row};
 
 /// Narrowest text column of each split pane; below it the reader stacks.
 const MIN_SPLIT_TEXT: u16 = 16;
-/// Columns `zh` / `zl` scroll per count.
-const HSCROLL_STEP: usize = 4;
 
 /// Cursor and viewport movements inside the reader.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,11 +42,6 @@ pub enum Motion {
     PageUp,
     ScrollDown,
     ScrollUp,
-    PlaceTop,
-    PlaceCenter,
-    PlaceBottom,
-    ScrollLeft,
-    ScrollRight,
 }
 
 /// One display row of the split layout, as indices into the diff rows;
@@ -92,6 +86,8 @@ struct Doc {
     old_rows: Vec<usize>,
     new_rows: Vec<usize>,
     targets: Vec<Target>,
+    /// The hunk header above each row (itself, for headers).
+    hunk_of: Vec<Option<usize>>,
 }
 
 impl Doc {
@@ -126,7 +122,19 @@ impl Doc {
         }
         let rows =
             |keep: fn(RowKind) -> bool| (0..n).filter(|&r| keep(keys[r].0)).collect::<Vec<_>>();
+        let mut header = None;
+        let hunk_of = keys
+            .iter()
+            .enumerate()
+            .map(|(r, k)| {
+                if k.0 == RowKind::Hunk {
+                    header = Some(r);
+                }
+                header
+            })
+            .collect();
         Self {
+            hunk_of,
             revision,
             stacked_rows: rows(is_source),
             old_rows: rows(|k| matches!(k, RowKind::Del | RowKind::Ctx)),
@@ -235,7 +243,7 @@ fn card(comment: &str, text_width: usize, old_side: bool) -> Card {
 /// Visual rows for one width: wraps, note cards, and the scroll position.
 #[derive(Default)]
 struct View {
-    key: Option<(u64, u16, u16, bool, u64)>,
+    key: Option<(u64, u16, u16, bool, u64, u64)>,
     notes_key: u64,
     /// The file's notes from the last draw: source locations and comment.
     notes: Vec<(Vec<RowLines>, String)>,
@@ -317,6 +325,10 @@ pub struct Reader {
     search: Option<Search>,
     hits: Vec<Hit>,
     highlight: bool,
+    /// Folded hunks, by header row; cleared when the content changes.
+    folded: HashSet<usize>,
+    /// Bumps on every fold change, so the layout rebuilds.
+    folds: u64,
     view: RefCell<View>,
 }
 
@@ -370,6 +382,7 @@ impl Reader {
                 self.path = diff.path.clone();
                 self.max_lineno = diff.max_lineno;
                 self.selection = None;
+                self.folded.clear();
                 self.press = None;
                 self.hits = self.search.as_ref().map_or_else(Vec::new, |s| {
                     navigation::matches(
@@ -435,11 +448,73 @@ impl Reader {
         }
     }
 
-    fn side_rows(&self) -> &[usize] {
-        match (self.split_active(), self.old_side) {
+    /// Selectable rows in display order: source rows on the focused side,
+    /// with folded hunks standing in as their headers.
+    fn side_rows(&self) -> Cow<'_, [usize]> {
+        let rows = match (self.split_active(), self.old_side) {
             (false, _) => &self.doc.stacked_rows,
             (true, true) => &self.doc.old_rows,
             (true, false) => &self.doc.new_rows,
+        };
+        if self.folded.is_empty() {
+            return Cow::Borrowed(rows);
+        }
+        let mut out: Vec<usize> = rows.iter().copied().filter(|&r| !self.hidden(r)).collect();
+        out.extend(self.folded.iter().copied());
+        out.sort_unstable();
+        Cow::Owned(out)
+    }
+
+    /// Inside a folded hunk (its header stays visible).
+    fn hidden(&self, row: usize) -> bool {
+        self.kind(row) != Some(RowKind::Hunk)
+            && self
+                .doc
+                .hunk_of
+                .get(row)
+                .copied()
+                .flatten()
+                .is_some_and(|h| self.folded.contains(&h))
+    }
+
+    /// `z` in the reader: folds the hunk under the cursor, or unfolds it.
+    /// `false` when the cursor isn't in a hunk.
+    pub fn toggle_fold(&mut self, diff: &FileDiff) -> bool {
+        let row = self.cursor.row;
+        if self.folded.remove(&row) {
+            // Back onto the hunk's first source row.
+            let next = self
+                .doc
+                .stacked_rows
+                .get(self.doc.stacked_rows.partition_point(|&r| r <= row));
+            if let Some(&next) = next.filter(|&&r| self.doc.hunk_of[r] == Some(row)) {
+                self.cursor = Position { row: next, col: 0 };
+                self.normalize_side();
+                self.snap_to_side();
+            }
+        } else {
+            let Some(header) = self.doc.hunk_of.get(row).copied().flatten() else {
+                return false;
+            };
+            self.folded.insert(header);
+            self.cursor = Position {
+                row: header,
+                col: 0,
+            };
+            self.selection = None;
+        }
+        self.folds += 1;
+        self.ensure_visible(diff);
+        true
+    }
+
+    /// Unfolds the hunk holding `row`, for jumps that land inside it.
+    fn reveal(&mut self, row: usize) {
+        if self.hidden(row)
+            && let Some(header) = self.doc.hunk_of[row]
+        {
+            self.folded.remove(&header);
+            self.folds += 1;
         }
     }
 
@@ -480,6 +555,7 @@ impl Reader {
     fn snap_to_side(&mut self) {
         if !self.split_active()
             || self.on_side(self.cursor.row, self.old_side)
+            || self.folded.contains(&self.cursor.row)
             || self.doc.split.is_empty()
         {
             return;
@@ -489,7 +565,7 @@ impl Reader {
         let side_row = |u: usize| {
             let s = self.doc.split.get(u)?;
             let r = if old { s.old } else { s.new }?;
-            self.on_side(r, old).then_some(r)
+            (self.on_side(r, old) && !self.hidden(r) || self.folded.contains(&r)).then_some(r)
         };
         let found = (0..self.doc.split.len())
             .find_map(|d| side_row(unit + d).or_else(|| side_row(unit.checked_sub(d)?)));
@@ -548,6 +624,7 @@ impl Reader {
             self.area.height,
             self.split_active(),
             v.notes_key,
+            self.folds,
         );
         let previous = v.key;
         if previous != Some(key) {
@@ -603,8 +680,20 @@ impl Reader {
         } else {
             self.doc.keys.len()
         };
+        // Rows inside a folded hunk take no lines (nor do their cards).
         let lines: Vec<usize> = (0..units)
-            .map(|u| v.cards_height(u) + if split { 1 } else { v.wraps[u].starts.len() })
+            .map(|u| {
+                let row = if split {
+                    self.doc.split[u].old.or(self.doc.split[u].new).unwrap_or(0)
+                } else {
+                    u
+                };
+                if self.hidden(row) {
+                    0
+                } else {
+                    v.cards_height(u) + if split { 1 } else { v.wraps[u].starts.len() }
+                }
+            })
             .collect();
         v.lines.rebuild(lines.into_iter());
         let h = self.height();
@@ -718,25 +807,24 @@ impl Reader {
         self.cursor.row = rows[k.saturating_add_signed(delta).min(rows.len() - 1)];
     }
 
-    pub fn motion(&mut self, diff: &FileDiff, motion: Motion, count: usize) {
+    pub fn motion(&mut self, diff: &FileDiff, motion: Motion) {
         if self.doc.keys.is_empty() {
             return;
         }
-        let n = count.max(1);
         let h = self.height();
         let at = self.clamped();
         match motion {
-            Motion::Left => self.cursor.col = at.col.saturating_sub(n),
-            Motion::Right => self.cursor.col = (at.col + n).min(self.len(at.row).saturating_sub(1)),
-            Motion::Up => self.step(-(n as isize)),
-            Motion::Down => self.step(n as isize),
+            Motion::Left => self.cursor.col = at.col.saturating_sub(1),
+            Motion::Right => self.cursor.col = (at.col + 1).min(self.len(at.row).saturating_sub(1)),
+            Motion::Up => self.step(-1),
+            Motion::Down => self.step(1),
             Motion::WordNext | Motion::WordBack | Motion::WordEnd => {
                 let c = match motion {
                     Motion::WordBack => 'b',
                     Motion::WordEnd => 'e',
                     _ => 'w',
                 };
-                self.cursor = navigation::word(&self.doc.texts, self.side_rows(), at, c, n);
+                self.cursor = navigation::word(&self.doc.texts, &self.side_rows(), at, c);
             }
             Motion::LineStart => self.cursor.col = 0,
             Motion::FirstNonBlank => {
@@ -763,7 +851,7 @@ impl Reader {
                 } else {
                     h.saturating_sub(1)
                 };
-                let delta = (page.max(1) * n) as isize;
+                let delta = page.max(1) as isize;
                 let delta = if matches!(motion, Motion::HalfUp | Motion::PageUp) {
                     -delta
                 } else {
@@ -778,24 +866,8 @@ impl Reader {
                 }
                 self.step(delta);
             }
-            Motion::ScrollDown => return self.scroll_lines(diff, n as isize),
-            Motion::ScrollUp => return self.scroll_lines(diff, -(n as isize)),
-            Motion::PlaceTop | Motion::PlaceCenter | Motion::PlaceBottom => {
-                let mut v = self.view(diff, None);
-                let cursor = self.cursor_line(&v);
-                v.scroll = match motion {
-                    Motion::PlaceTop => cursor,
-                    Motion::PlaceCenter => cursor.saturating_sub(h / 2),
-                    _ => cursor.saturating_sub(h - 1),
-                }
-                .min(v.lines.total().saturating_sub(1));
-                v.offset = cursor - v.scroll;
-                return;
-            }
-            Motion::ScrollLeft => {
-                return self.hscroll = self.hscroll.saturating_sub(HSCROLL_STEP * n);
-            }
-            Motion::ScrollRight => return self.hscroll += HSCROLL_STEP * n,
+            Motion::ScrollDown => return self.scroll_lines(diff, 1),
+            Motion::ScrollUp => return self.scroll_lines(diff, -1),
         }
         self.ensure_visible(diff);
     }
@@ -818,37 +890,43 @@ impl Reader {
         }
     }
 
-    /// `[` / `]`: previous or next hunk, `count` times, clamped at the ends.
-    /// Returns a hint when it stopped at a boundary.
-    pub fn hunk(&mut self, diff: &FileDiff, forward: bool, count: usize) -> Option<&'static str> {
+    /// Where a target lands: its row, or its header while the hunk is folded.
+    fn landing(&self, target: &Target) -> usize {
+        if self.hidden(target.row) {
+            self.doc.hunk_of[target.row].unwrap_or(target.row)
+        } else {
+            target.row
+        }
+    }
+
+    /// `[` / `]`: previous or next hunk, clamped at the ends. Returns a hint
+    /// when there's nowhere to go.
+    pub fn hunk(&mut self, diff: &FileDiff, forward: bool) -> Option<&'static str> {
         let targets = &self.doc.targets;
         if targets.is_empty() {
             return Some("No changed hunks in this file");
         }
         let unit = self.unit_of(self.cursor.row);
-        let n = count.max(1);
-        let last = targets.len() - 1;
-        let (index, hint) = if forward {
-            match targets.iter().position(|t| self.unit_of(t.row) > unit) {
-                Some(i) if i + n - 1 <= last => (i + n - 1, None),
-                Some(_) => (last, Some("Last hunk")),
-                None => return Some("Last hunk"),
-            }
+        let found = if forward {
+            targets
+                .iter()
+                .find(|t| self.unit_of(self.landing(t)) > unit)
         } else {
-            match targets.iter().rposition(|t| self.unit_of(t.row) < unit) {
-                Some(i) if i >= n - 1 => (i + 1 - n, None),
-                Some(_) => (0, Some("First hunk")),
-                None => return Some("First hunk"),
-            }
+            targets
+                .iter()
+                .rev()
+                .find(|t| self.unit_of(self.landing(t)) < unit)
         };
-        let target = targets[index];
+        let Some(&target) = found else {
+            return Some(if forward { "Last hunk" } else { "First hunk" });
+        };
         self.go_target(diff, target);
-        hint
+        None
     }
 
     fn go_target(&mut self, diff: &FileDiff, target: Target) {
         self.cursor = Position {
-            row: target.row,
+            row: self.landing(&target),
             col: 0,
         };
         self.old_side = target.old_side;
@@ -883,6 +961,7 @@ impl Reader {
             .or(rows.last())
             .copied()
             .unwrap_or(row);
+        self.reveal(row);
         self.cursor = Position { row, col: pos.col };
         self.normalize_side();
         let h = self.height();
@@ -965,10 +1044,11 @@ impl Reader {
     }
 
     fn in_selection(&self, s: &Selection, row: usize) -> bool {
-        s.old_side.map_or_else(
-            || self.kind(row).is_some_and(is_source),
-            |old| self.on_side(row, old),
-        )
+        !self.hidden(row)
+            && s.old_side.map_or_else(
+                || self.kind(row).is_some_and(is_source),
+                |old| self.on_side(row, old),
+            )
     }
 
     /// The selected text (or the cursor's line) with its rows, and whether
@@ -1017,42 +1097,37 @@ impl Reader {
             );
             self.search = Some(search);
         }
-        self.search_next(diff, false, 1)
+        self.search_next(diff, false)
     }
 
     /// `n` / `N`: the next or previous match on the focused side, wrapping.
-    pub fn search_next(
-        &mut self,
-        diff: &FileDiff,
-        backward: bool,
-        count: usize,
-    ) -> Result<(), String> {
+    /// A match inside a folded hunk unfolds it.
+    pub fn search_next(&mut self, diff: &FileDiff, backward: bool) -> Result<(), String> {
         let Some(search) = &self.search else {
             return Err("No previous search".into());
         };
         self.highlight = true;
         let eligible = |h: &&Hit| !self.split_active() || self.on_side(h.row, self.old_side);
-        let mut at = (
+        let at = (
             self.cursor.row,
             self.cursor.col.min(self.len(self.cursor.row)),
         );
-        for _ in 0..count.max(1) {
-            let next = if backward {
-                let mut hits = self.hits.iter().rev().filter(eligible);
-                hits.clone()
-                    .find(|h| (h.row, h.start) < at)
-                    .or_else(|| hits.next())
-            } else {
-                let mut hits = self.hits.iter().filter(eligible);
-                hits.clone()
-                    .find(|h| (h.row, h.start) > at)
-                    .or_else(|| hits.next())
-            };
-            let Some(hit) = next else {
-                return Err(format!("Pattern not found: {}", search.pattern));
-            };
-            at = (hit.row, hit.start);
-        }
+        let next = if backward {
+            let mut hits = self.hits.iter().rev().filter(eligible);
+            hits.clone()
+                .find(|h| (h.row, h.start) < at)
+                .or_else(|| hits.next())
+        } else {
+            let mut hits = self.hits.iter().filter(eligible);
+            hits.clone()
+                .find(|h| (h.row, h.start) > at)
+                .or_else(|| hits.next())
+        };
+        let Some(&hit) = next else {
+            return Err(format!("Pattern not found: {}", search.pattern));
+        };
+        let at = (hit.row, hit.start);
+        self.reveal(hit.row);
         self.cursor = Position {
             row: at.0,
             col: at.1,
@@ -1345,6 +1420,16 @@ impl Reader {
         if text_x >= right {
             return;
         }
+        // The cursor's row is marked even while another pane has focus.
+        let mine = side.is_none_or(|s| s == self.old_side);
+        if mine && c.cursor.row == r && row.kind != RowKind::Meta {
+            buf.set_string(
+                x,
+                y,
+                "▸",
+                gutter.fg(if c.focused { p.blue } else { p.faint }),
+            );
+        }
         match row.kind {
             RowKind::Hunk => {
                 let (header, func) = split_hunk(&row.segs[0].text);
@@ -1355,8 +1440,18 @@ impl Reader {
                     (right - text_x) as usize,
                     base.fg(p.faint),
                 );
-                if nx < right {
-                    buf.set_stringn(nx, y, func, (right - nx) as usize, base.fg(p.muted));
+                let (nx, _) = if nx < right {
+                    buf.set_stringn(nx, y, func, (right - nx) as usize, base.fg(p.muted))
+                } else {
+                    (nx, y)
+                };
+                if self.folded.contains(&r) && nx < right {
+                    let n = self.doc.keys[r + 1..]
+                        .iter()
+                        .take_while(|k| k.0 != RowKind::Hunk)
+                        .count();
+                    let label = format!("  ⋯ {n} lines folded (z)");
+                    buf.set_stringn(nx, y, label, (right - nx) as usize, base.fg(p.blue));
                 }
                 return;
             }
@@ -1373,11 +1468,7 @@ impl Reader {
             }
             _ => {}
         }
-        let mine = side.is_none_or(|s| s == self.old_side);
         let cursor_here = c.focused && mine && c.cursor.row == r;
-        if cursor_here {
-            buf.set_string(x, y, "▸", gutter.fg(p.blue));
-        }
         let hits: &[Hit] = if self.highlight && mine {
             let start = self.hits.partition_point(|h| h.row < r);
             let end = start + self.hits[start..].partition_point(|h| h.row == r);
@@ -1579,24 +1670,47 @@ mod tests {
                 "a hunk with additions opens on the new side"
             );
             assert_eq!(r.view.borrow().scroll, 0);
-            assert_eq!(r.hunk(&d, true, 1), None);
+            assert_eq!(r.hunk(&d, true), None);
             assert_eq!(
                 (r.cursor().row, r.old_side()),
                 (7, true),
                 "deleted-only hunk lands on the old side"
             );
-            assert_eq!(r.hunk(&d, true, 1), Some("Last hunk"));
+            assert_eq!(r.hunk(&d, true), Some("Last hunk"));
             assert_eq!(r.cursor().row, 7);
-            assert_eq!(r.hunk(&d, false, 5), Some("First hunk"));
+            assert_eq!(r.hunk(&d, false), None);
             assert_eq!(r.cursor().row, first);
-            assert_eq!(r.hunk(&d, false, 1), Some("First hunk"));
-            assert_eq!(r.hunk(&d, true, 2), Some("Last hunk"));
-            assert_eq!(r.cursor().row, 7);
-            r.motion(&d, Motion::Top, 1);
+            assert_eq!(r.hunk(&d, false), Some("First hunk"));
+            r.hunk(&d, true);
+            r.motion(&d, Motion::Top);
             assert_eq!(r.cursor().row, 1);
-            r.motion(&d, Motion::Bottom, 1);
+            r.motion(&d, Motion::Bottom);
             assert_eq!(r.cursor().row, 8);
         }
+        // `z` folds the cursor's hunk to its header; jumps into it unfold it.
+        let mut r = reader(&d, 60);
+        assert!(r.toggle_fold(&d));
+        assert_eq!(r.cursor().row, 0);
+        assert!(r.capture().is_none(), "a folded header is not source text");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 12));
+        r.draw(buf.area, &d, &[], &Palette::from(None), true, &mut buf);
+        let screen: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(screen.contains("4 lines folded") && !screen.contains(" b "));
+        r.motion(&d, Motion::Down);
+        assert_eq!(r.cursor().row, 6, "folded rows are skipped");
+        assert_eq!(r.hunk(&d, false), None);
+        assert_eq!(r.cursor().row, 0, "[ lands on the folded header");
+        r.motion(&d, Motion::Down);
+        r.search(&d, "^b$").unwrap();
+        assert_eq!(r.cursor().row, 2, "a match inside the fold unfolds it");
+        assert!(r.folded.is_empty());
+        r.motion(&d, Motion::Up);
+        r.motion(&d, Motion::Up);
+        assert!(
+            r.toggle_fold(&d) && r.toggle_fold(&d),
+            "z on a folded header unfolds it"
+        );
+        assert!(r.folded.is_empty());
         // Whole-file mode: runs of changes separated by context.
         use RowKind::*;
         let mut whole = diff(vec![
@@ -1610,7 +1724,7 @@ mod tests {
         whole.context = crate::app::FULL_CONTEXT;
         let mut r = reader(&whole, 60);
         assert_eq!(r.cursor().row, 2);
-        assert_eq!(r.hunk(&whole, true, 1), None);
+        assert_eq!(r.hunk(&whole, true), None);
         assert_eq!((r.cursor().row, r.old_side()), (5, true));
         // No changes: first source row; notices only: nothing to select.
         let same = diff(vec![
@@ -1619,10 +1733,7 @@ mod tests {
         ]);
         let mut r = reader(&same, 60);
         assert_eq!(r.cursor().row, 0);
-        assert_eq!(
-            r.hunk(&same, true, 1),
-            Some("No changed hunks in this file")
-        );
+        assert_eq!(r.hunk(&same, true), Some("No changed hunks in this file"));
         let binary = diff(vec![row(Meta, None, None, "Binary file — no text diff")]);
         let r = reader(&binary, 60);
         assert!(r.capture().is_none());
@@ -1640,9 +1751,10 @@ mod tests {
             row(Ctx, Some(12), Some(10), "shared"),
         ]);
         let mut r = reader(&d, 160);
-        r.motion(&d, Motion::Right, 2);
+        r.motion(&d, Motion::Right);
+        r.motion(&d, Motion::Right);
         r.visual(false);
-        r.motion(&d, Motion::Left, 1);
+        r.motion(&d, Motion::Left);
         let (rows, old) = r.capture().unwrap();
         assert_eq!(rows, vec![(1, "é中".to_string())]);
         assert!(!old);
@@ -1672,10 +1784,12 @@ mod tests {
             }
         );
         r.set_side(&d, true);
-        r.motion(&d, Motion::Top, 1);
+        r.motion(&d, Motion::Top);
         assert_eq!(r.cursor().row, 1);
         r.visual(true);
-        r.motion(&d, Motion::Down, 4);
+        for _ in 0..4 {
+            r.motion(&d, Motion::Down);
+        }
         assert_eq!(r.cursor().row, 5, "filler rows are not selectable");
         let (rows, old) = r.capture().unwrap();
         assert!(old);
@@ -1697,7 +1811,8 @@ mod tests {
         r.set_side(&d, false);
         assert_eq!(r.cursor().row, 5);
         r.set_side(&d, true);
-        r.motion(&d, Motion::Up, 2);
+        r.motion(&d, Motion::Up);
+        r.motion(&d, Motion::Up);
         assert_eq!(r.cursor().row, 2);
         r.set_side(&d, false);
         assert_eq!(r.cursor().row, 4, "nearest new-side row");
@@ -1740,8 +1855,20 @@ mod tests {
         let screen: String = buf.content.iter().map(|c| c.symbol()).collect();
         assert!(screen.contains("NOTE") && screen.contains("why?"));
         r.set_side(&d, true);
-        r.motion(&d, Motion::Top, 1);
+        r.motion(&d, Motion::Top);
         assert_eq!(r.cursor().row, 1);
+        // Split view doesn't wrap: moving along a long line pans to keep the cursor visible.
+        let long = diff(vec![row(Ctx, Some(1), Some(1), &"x".repeat(200))]);
+        let mut r = reader(&long, 160);
+        r.toggle_split();
+        r.motion(&long, Motion::LineEnd);
+        assert_eq!(
+            r.hscroll,
+            200 - r.geom().text_w as usize,
+            "the line end sits at the right edge"
+        );
+        r.motion(&long, Motion::LineStart);
+        assert_eq!(r.hscroll, 0);
     }
 
     #[test]
@@ -1760,7 +1887,7 @@ mod tests {
             Position { row: 1, col: 4 },
             "smart case ignores case for lowercase patterns"
         );
-        r.search_next(&d, false, 1).unwrap();
+        r.search_next(&d, false).unwrap();
         assert_eq!(
             r.cursor(),
             Position { row: 2, col: 6 },
@@ -1774,9 +1901,10 @@ mod tests {
         );
         r.search(&d, "bar|baz").unwrap();
         assert_eq!(r.cursor(), Position { row: 3, col: 0 });
-        r.search_next(&d, false, 1).unwrap();
+        r.search_next(&d, false).unwrap();
         assert_eq!(r.cursor().col, 6);
-        r.search_next(&d, true, 2).unwrap();
+        r.search_next(&d, true).unwrap();
+        r.search_next(&d, true).unwrap();
         assert_eq!(r.cursor().col, 6, "N reverses and wraps");
         r.search(&d, r"FOO\s\S").unwrap_err();
         r.search(&d, r"foo\s\S").unwrap();
@@ -1786,7 +1914,7 @@ mod tests {
             "escapes like \\S don't make the search case-sensitive"
         );
         r.search(&d, "bar|baz").unwrap();
-        r.search_next(&d, false, 1).unwrap();
+        r.search_next(&d, false).unwrap();
         assert!(r.search(&d, "[").is_err());
         assert_eq!(r.cursor().col, 6, "invalid pattern keeps the cursor");
         assert_eq!(r.search.as_ref().unwrap().pattern, "bar|baz");
@@ -1796,7 +1924,7 @@ mod tests {
         let mut rows = Vec::new();
         for _ in 0..4 {
             rows.push(r.cursor().row);
-            r.search_next(&d, false, 1).unwrap();
+            r.search_next(&d, false).unwrap();
         }
         assert_eq!(
             rows,
@@ -1817,7 +1945,7 @@ mod tests {
         r.set_side(&d, true);
         r.search(&d, "foo").unwrap();
         assert_eq!(r.cursor().row, 1);
-        r.search_next(&d, false, 1).unwrap();
+        r.search_next(&d, false).unwrap();
         assert_eq!(r.cursor().row, 1, "never the opposite side");
         assert!(r.escape() && !r.highlight);
         assert!(!r.escape());

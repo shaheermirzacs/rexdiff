@@ -108,10 +108,8 @@ struct App {
     completion: Option<(String, usize)>,
     /// The help overlay and its scroll offset.
     help: Option<usize>,
-    /// A count typed in the reader (`12j`).
-    count: Option<usize>,
-    /// `Space` or `z` waiting for its second key.
-    prefix: Option<Action>,
+    /// `Space` waiting for its second key.
+    leader: bool,
     focus: Focus,
     pending: Option<Pending>,
     notes: Vec<annotations::Note>,
@@ -259,8 +257,7 @@ impl App {
             command: None,
             completion: None,
             help: None,
-            count: None,
-            prefix: None,
+            leader: false,
             root: git2::Repository::discover(&cwd)
                 .ok()
                 .and_then(|r| r.workdir().map(Path::to_path_buf))
@@ -906,8 +903,7 @@ impl App {
 
     fn set_focus(&mut self, focus: Focus) {
         self.focus = focus;
-        self.prefix = None;
-        self.count = None;
+        self.leader = false;
     }
 
     // ---------------------------------------------------------------- input
@@ -1002,14 +998,16 @@ impl App {
         Some(f(&mut self.reader, d))
     }
 
-    /// Tree `J` / `K` and the mouse wheel: scroll the reader without focusing it.
+    /// `J` / `K` and the mouse wheel: scroll the reader, keeping focus.
     fn scroll_diff(&mut self, delta: isize) {
         let motion = if delta < 0 {
             Motion::ScrollUp
         } else {
             Motion::ScrollDown
         };
-        self.with_doc(|r, d| r.motion(d, motion, delta.unsigned_abs()));
+        for _ in 0..delta.unsigned_abs() {
+            self.with_doc(|r, d| r.motion(d, motion));
+        }
     }
 
     fn open_note(&mut self) {
@@ -1322,73 +1320,49 @@ impl App {
             }
             return;
         }
-        if let Some((action, count)) = self.resolve(k) {
-            self.act(action, count);
+        if let Some(action) = self.resolve(k) {
+            self.act(action);
         }
     }
 
     fn scope(&self) -> Scope {
-        match (self.view, self.focus) {
-            (View::Branches, _) => Scope::Branches,
-            (View::History, _) => Scope::History,
-            (View::Changes, Focus::Tree) => Scope::Tree,
-            (View::Changes, Focus::Reader) => Scope::Reader,
-            (View::Changes, Focus::Notes) => Scope::Notes,
+        match self.view {
+            View::Branches => Scope::Branches,
+            View::History => Scope::History,
+            View::Changes => Scope::Changes,
         }
     }
 
-    /// A key's action through the binding table, keeping `Space` / `z`
-    /// prefixes and reader counts between keys.
-    fn resolve(&mut self, k: KeyEvent) -> Option<(Action, Option<usize>)> {
-        let key = match self.prefix.take() {
-            Some(prefix) => match k.code {
+    /// A key's action through the binding table, keeping the `Space`
+    /// prefix between keys.
+    fn resolve(&mut self, k: KeyEvent) -> Option<Action> {
+        let key = match std::mem::take(&mut self.leader) {
+            true => match k.code {
                 KeyCode::Char(c)
                     if !k
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    if prefix == Action::Leader {
-                        Key::Leader(c)
-                    } else {
-                        Key::Z(c)
-                    }
+                    Key::Leader(c)
                 }
-                _ => {
-                    self.count = None;
-                    return None;
-                }
+                _ => return None,
             },
-            None => Key::from_event(&k),
+            false => Key::from_event(&k),
         };
-        let count = self.count.take();
-        if count.is_some() && k.code == KeyCode::Esc {
-            return None;
-        }
         let binding = keymap::lookup(self.scope(), key)?;
         if k.kind == KeyEventKind::Repeat && !binding.action.repeats() {
             return None;
         }
-        match binding.action {
-            Action::Leader | Action::MotionPrefix => {
-                self.prefix = Some(binding.action);
-                self.count = count;
-                None
-            }
-            Action::Count(digit) => {
-                self.count = Some((count.unwrap_or(0) * 10 + usize::from(digit)).min(99_999));
-                None
-            }
-            Action::Move(Motion::LineStart) if count.is_some() => {
-                self.count = count.map(|c| (c * 10).min(99_999));
-                None
-            }
-            action => Some((action, count)),
+        if binding.action == Action::Leader {
+            self.leader = true;
+            return None;
         }
+        Some(binding.action)
     }
 
-    /// The one dispatcher for keys and commands.
-    fn act(&mut self, action: Action, count: Option<usize>) {
-        let n = count.unwrap_or(1);
+    /// The one dispatcher for keys and commands. Keys mean the same thing in
+    /// every pane; movement acts on the focused one.
+    fn act(&mut self, action: Action) {
         match action {
             Action::Quit => self.quit = true,
             Action::Command => {
@@ -1409,16 +1383,12 @@ impl App {
             Action::Picker => self.open_picker(),
             Action::PrevHunk | Action::NextHunk => {
                 let forward = action == Action::NextHunk;
-                if let Some(Some(hint)) = self.with_doc(|r, d| r.hunk(d, forward, n)) {
+                if let Some(Some(hint)) = self.with_doc(|r, d| r.hunk(d, forward)) {
                     self.flash = Some(Flash::new(hint.into(), true));
                 }
             }
-            Action::PrevFile => self.step_file(-(n as isize)),
-            Action::NextFile => self.step_file(n as isize),
-            Action::Bottom if count.is_some() && self.scope() == Scope::Reader => {
-                let old_side = self.reader.old_side();
-                self.goto_line(n as u32, old_side);
-            }
+            Action::PrevFile => self.step_file(-1),
+            Action::NextFile => self.step_file(1),
             Action::Top
             | Action::Bottom
             | Action::Up
@@ -1426,10 +1396,10 @@ impl App {
             | Action::PageUp
             | Action::PageDown
             | Action::HalfUp
-            | Action::HalfDown => self.navigate(action, n),
+            | Action::HalfDown => self.navigate(action),
             Action::FocusNext => self.cycle_focus(true),
             Action::FocusPrev => self.cycle_focus(false),
-            Action::Leader | Action::MotionPrefix | Action::Count(_) => {}
+            Action::Leader => {}
             Action::Sidebar => {
                 self.sidebar = !self.sidebar;
                 if !self.sidebar && self.focus == Focus::Tree {
@@ -1442,15 +1412,38 @@ impl App {
             }
             Action::Back => self.back(),
             Action::Reload => self.reload(),
-            Action::Left | Action::Right => self.tree_motion(action == Action::Right),
-            Action::Stage => self.toggle_here(),
-            Action::Activate => match self.rows.get(self.cursor).map(|r| &r.item) {
-                Some(Item::File { idx, .. }) => {
-                    let path = self.files()[*idx].path.clone();
-                    self.activate(path);
+            Action::Left | Action::Right => match self.focus {
+                Focus::Tree => self.tree_motion(action == Action::Right),
+                Focus::Reader => {
+                    let motion = if action == Action::Left {
+                        Motion::Left
+                    } else {
+                        Motion::Right
+                    };
+                    self.with_doc(|r, d| r.motion(d, motion));
                 }
-                Some(Item::Dir { .. }) => self.toggle_dir(self.cursor),
-                None => {}
+                Focus::Notes => {}
+            },
+            Action::StageOrFold => match self.focus {
+                Focus::Tree => self.toggle_here(),
+                Focus::Reader => {
+                    if self.with_doc(|r, d| r.toggle_fold(d)) == Some(false) {
+                        self.flash = Some(Flash::new("No hunk to fold here".into(), false));
+                    }
+                }
+                Focus::Notes => {}
+            },
+            Action::Activate => match self.focus {
+                Focus::Tree => match self.rows.get(self.cursor).map(|r| &r.item) {
+                    Some(Item::File { idx, .. }) => {
+                        let path = self.files()[*idx].path.clone();
+                        self.activate(path);
+                    }
+                    Some(Item::Dir { .. }) => self.toggle_dir(self.cursor),
+                    None => {}
+                },
+                Focus::Notes => self.edit_note(),
+                Focus::Reader => {}
             },
             Action::Discard => self.ask_discard(),
             Action::History => {
@@ -1466,24 +1459,24 @@ impl App {
             Action::BranchDiff => self.open_review(None),
             Action::Base => self.command = Some(format!(":base {}", self.review_base)),
             Action::AllFiles => self.toggle_all_files(),
-            Action::ScrollDown => self.scroll_diff(n as isize),
-            Action::ScrollUp => self.scroll_diff(-(n as isize)),
+            Action::ScrollDown => self.scroll_diff(1),
+            Action::ScrollUp => self.scroll_diff(-1),
             Action::Grow | Action::Shrink => self.resize_tree(action == Action::Grow),
             Action::Move(motion) => {
-                self.with_doc(|r, d| r.motion(d, motion, n));
+                self.with_doc(|r, d| r.motion(d, motion));
             }
             Action::Search => self.command = Some("/".into()),
             Action::SearchNext | Action::SearchPrev => {
                 let backward = action == Action::SearchPrev;
-                if let Some(Err(e)) = self.with_doc(|r, d| r.search_next(d, backward, n)) {
+                if let Some(Err(e)) = self.with_doc(|r, d| r.search_next(d, backward)) {
                     self.flash = Some(Flash::new(e, false));
                 }
             }
             Action::VisualChar | Action::VisualLine => {
                 self.reader.visual(action == Action::VisualLine)
             }
-            Action::EditNote => self.edit_note(),
-            Action::DeleteNote => self.delete_note(),
+            Action::DeleteNote if self.focus == Focus::Notes => self.delete_note(),
+            Action::DeleteNote => {}
             Action::Checkout => self.checkout_selected(),
             Action::OpenHistory => self.open_history(),
             Action::Pull => self.pull_selected(),
@@ -1503,7 +1496,7 @@ impl App {
     }
 
     /// Up/down, paging, and `g` / `G` move the focused list or the reader.
-    fn navigate(&mut self, action: Action, n: usize) {
+    fn navigate(&mut self, action: Action) {
         let to = |at: usize, len: usize, page: usize| {
             let page = page.max(2) as isize;
             let delta = match action {
@@ -1516,8 +1509,7 @@ impl App {
                 Action::HalfUp => -(page / 2),
                 _ => page / 2,
             };
-            at.saturating_add_signed(delta * n as isize)
-                .min(len.saturating_sub(1))
+            at.saturating_add_signed(delta).min(len.saturating_sub(1))
         };
         match (self.view, self.focus) {
             (View::Branches, _) => {
@@ -1555,7 +1547,7 @@ impl App {
                     Action::HalfUp => Motion::HalfUp,
                     _ => Motion::HalfDown,
                 };
-                self.with_doc(|r, d| r.motion(d, motion, n));
+                self.with_doc(|r, d| r.motion(d, motion));
             }
         }
     }
@@ -1714,8 +1706,8 @@ impl App {
         self.activate(path);
     }
 
-    /// `a`: the reader's line or selection (the whole file on headers and
-    /// notices, and from the tree); `A`: always the whole file.
+    /// `a`: the open file's line or selection, from any pane (the whole file
+    /// on headers and notices); `A`: always the whole file.
     fn annotate(&mut self, whole: bool) {
         if self.annotation_rx.is_some() {
             return;
@@ -1724,20 +1716,7 @@ impl App {
             self.flash = Some(Flash::new("No file to annotate".into(), false));
             return;
         }
-        let capture = if self.focus == Focus::Tree {
-            if !matches!(
-                self.rows.get(self.cursor).map(|r| &r.item),
-                Some(Item::File { .. })
-            ) {
-                self.flash = Some(Flash::new("Select a file to annotate".into(), false));
-                return;
-            }
-            None
-        } else if whole {
-            None
-        } else {
-            self.reader.capture()
-        };
+        let capture = if whole { None } else { self.reader.capture() };
         if capture.as_ref().is_some_and(|(rows, _)| rows.is_empty()) {
             self.flash = Some(Flash::new("Select source text to annotate".into(), false));
             return;
@@ -1870,7 +1849,7 @@ impl App {
             return;
         }
         match keymap::parse(command.trim_start_matches(':')) {
-            Ok(keymap::Command::Run(action)) => self.act(action, None),
+            Ok(keymap::Command::Run(action)) => self.act(action),
             Ok(keymap::Command::Source(line)) => {
                 let old_side = self.reader.old_side();
                 self.goto_line(line, old_side);
@@ -1902,8 +1881,7 @@ impl App {
             let _ = self.jobs.send(Job::Branches);
         }
         self.view = view;
-        self.prefix = None;
-        self.count = None;
+        self.leader = false;
     }
 
     fn selected_branch(&self) -> Option<&BranchInfo> {
@@ -2025,7 +2003,8 @@ impl App {
     }
 
     /// `d`: get ready to throw away the changes of the file or folder under
-    /// the cursor, and ask for confirmation in the footer.
+    /// the tree cursor (the open file from other panes), and ask for
+    /// confirmation in the footer.
     fn ask_discard(&mut self) {
         if self.comparison.is_some() {
             return;
@@ -2033,22 +2012,33 @@ impl App {
         if self.busy.is_some() {
             return;
         }
-        let Some(row) = self.rows.get(self.cursor) else {
-            return;
-        };
         let files = self.files();
-        let (label, picked): (String, Vec<&git::FileEntry>) = match &row.item {
-            Item::File { idx, .. } => (files[*idx].path.clone(), vec![&files[*idx]]),
-            Item::Dir { path, .. } => {
-                let prefix = format!("{path}/");
-                (
-                    prefix.clone(),
-                    files
-                        .iter()
-                        .filter(|f| f.status != ' ' && f.path.starts_with(&prefix))
-                        .collect(),
-                )
+        let (label, picked): (String, Vec<&git::FileEntry>) = if self.focus == Focus::Tree {
+            let Some(row) = self.rows.get(self.cursor) else {
+                return;
+            };
+            match &row.item {
+                Item::File { idx, .. } => (files[*idx].path.clone(), vec![&files[*idx]]),
+                Item::Dir { path, .. } => {
+                    let prefix = format!("{path}/");
+                    (
+                        prefix.clone(),
+                        files
+                            .iter()
+                            .filter(|f| f.status != ' ' && f.path.starts_with(&prefix))
+                            .collect(),
+                    )
+                }
             }
+        } else {
+            let Some(f) = self
+                .active
+                .as_ref()
+                .and_then(|a| files.iter().find(|f| &f.path == a))
+            else {
+                return;
+            };
+            (f.path.clone(), vec![f])
         };
         if picked.is_empty() {
             return;
@@ -2200,8 +2190,7 @@ impl App {
             return;
         }
         if matches!(m.kind, MouseEventKind::Down(_)) {
-            self.prefix = None;
-            self.count = None;
+            self.leader = false;
         }
         if m.kind == MouseEventKind::Down(MouseButton::Left) && m.row == 0 {
             for (i, (x0, x1)) in self.tabs.get().iter().enumerate() {
@@ -3225,7 +3214,7 @@ impl App {
             })
             .border_style(Style::new().fg(p.annotation))
             .title(title)
-            .title_bottom(" ↑↓ preview · Enter edit · d delete · Esc close ");
+            .title_bottom(" ↑↓ preview · Enter edit · Del delete · Esc close ");
         let inner = block.inner(dock);
         block.render(dock, buf);
         if inner.is_empty() {
@@ -3625,70 +3614,52 @@ impl App {
             );
             right = right.saturating_sub(w + 3);
         }
-        if !self.notes.is_empty() {
-            put(
-                buf,
-                &mut x,
-                y,
-                right,
-                &format!("{} notes · ", self.notes.len()),
-                Style::new().fg(p.blue),
-            );
-        }
-        let back = match &self.comparison {
-            Some(c) if c.is_commit => [("Esc", "commits")].as_slice(),
-            Some(_) => [("B", "base")].as_slice(),
-            None => &[],
-        };
-        // The tree offers the other view: the branch diff from the working tree, and back.
+        // The review views switch to each other: D from the working tree, W back.
         let switch = if self.comparison.is_none() {
             ("D", "branch diff")
         } else {
             ("W", "working tree")
         };
-        let tree = [
-            ("Enter", "open"),
+        // One list for every pane: switching panes never reorders it; the
+        // comparison and the notes pane only append.
+        let changes = [
             switch,
             ("z", "stage/fold"),
             ("a", "annotate"),
+            ("L", "notes"),
+            ("[ ]", "hunks"),
+            ("{ }", "files"),
+            ("/", "search"),
+            ("S", "split"),
+            ("x", "whole file"),
             ("c", "commit"),
             ("d", "discard"),
-            ("L", "notes"),
-            ("{ }", "files"),
-            ("2", "branches"),
+            ("s", "send"),
+            ("Tab", "pane"),
             ("?", "help"),
-            (":", "command"),
         ];
-        let hints: &[(&str, &str)] = match (self.view, self.focus) {
-            (View::Changes, Focus::Reader) => &[
-                ("v/V", "select"),
-                ("a", "annotate"),
-                ("[ ]", "hunks"),
-                ("{ }", "files"),
-                ("/", "search"),
-                ("S", "split"),
-                ("Space e", "sidebar"),
-                ("Tab", "pane"),
-                ("?", "help"),
-            ],
-            (View::Changes, Focus::Notes) => &[
-                ("j/k", "preview"),
-                ("Enter", "edit"),
-                ("d", "delete"),
-                ("Esc", "close"),
-                ("?", "help"),
-            ],
-            (View::Changes, Focus::Tree) => &tree,
-            (View::History, _) => &[
+        // Context adds hints at the right end, so they always show and the
+        // fixed list keeps its order (narrow panes cut it from the end).
+        let mut extras: Vec<(&str, &str)> = Vec::new();
+        match &self.comparison {
+            Some(c) if c.is_commit && self.view == View::Changes => extras.push(("Esc", "commits")),
+            Some(_) if self.view == View::Changes => extras.push(("B", "base")),
+            _ => {}
+        }
+        if self.view == View::Changes && self.focus == Focus::Notes {
+            extras.extend([("Enter", "edit"), ("Del", "delete")]);
+        }
+        let hints: &[(&str, &str)] = match self.view {
+            View::Changes => &changes,
+            View::History => &[
                 ("↑↓", "move"),
                 ("Enter", "diff"),
-                ("D", "branch diff"),
+                switch,
                 ("B", "base"),
-                ("W", "working tree"),
                 ("Esc", "back"),
                 ("?", "help"),
             ],
-            (View::Branches, _) => &[
+            View::Branches => &[
                 ("↑↓", "move"),
                 ("space", "checkout"),
                 ("p", "pull"),
@@ -3701,13 +3672,32 @@ impl App {
                 ("?", "help"),
             ],
         };
-        let back = if self.view == View::Changes {
-            back
-        } else {
-            &[]
-        };
+        if !self.notes.is_empty() {
+            let notes = format!("{} notes", self.notes.len());
+            let mut nx = right.saturating_sub(notes.width() as u16 + 1);
+            put(buf, &mut nx, y, right, &notes, Style::new().fg(p.blue));
+            right = right.saturating_sub(notes.width() as u16 + 3);
+        }
+        if !extras.is_empty() {
+            let text: Vec<String> = extras.iter().map(|(k, w)| format!("{k} {w}")).collect();
+            let width =
+                text.iter().map(|t| t.width() as u16).sum::<u16>() + 3 * (text.len() as u16 - 1);
+            let mut ex = right.saturating_sub(width + 1);
+            for (key, what) in &extras {
+                put(buf, &mut ex, y, right, key, Style::new().fg(p.muted));
+                put(
+                    buf,
+                    &mut ex,
+                    y,
+                    right,
+                    &format!(" {what}   "),
+                    Style::new().fg(p.faint),
+                );
+            }
+            right = right.saturating_sub(width + 3);
+        }
         // Whole hints only: one that doesn't fit ends the row.
-        for (key, what) in back.iter().chain(hints) {
+        for (key, what) in hints {
             if x + (key.width() + 1 + what.width()) as u16 > right {
                 break;
             }
@@ -4292,7 +4282,7 @@ mod tests {
         app.on_key(ch('z'));
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.notes[0].comment, "z");
-        app.on_key(ch('d'));
+        app.on_key(key(KeyCode::Delete));
         assert!(app.notes.is_empty());
         assert!(!app.notes_open);
         assert_eq!(app.focus, Focus::Tree);
@@ -4785,17 +4775,18 @@ mod tests {
         }
         app.on_key(ch('L'));
         assert_eq!((app.notes_open, app.focus), (false, Focus::Reader));
-        // 1/2 switch screens outside the reader and count inside it.
-        app.set_focus(Focus::Tree);
-        app.on_key(ch('2'));
-        assert!(app.view == View::Branches);
-        app.on_key(ch('1'));
-        assert!(app.view == View::Changes);
+        // 1/2 switch screens from every pane.
+        for pane in [Focus::Tree, Focus::Reader] {
+            app.set_focus(pane);
+            app.on_key(ch('2'));
+            assert!(app.view == View::Branches);
+            app.on_key(ch('1'));
+            assert!(app.view == View::Changes);
+        }
         app.set_focus(Focus::Reader);
-        for k in [ch('g'), ch('2'), ch('j')] {
+        for k in [ch('g'), ch('j'), ch('j')] {
             app.on_key(k);
         }
-        assert!(app.view == View::Changes);
         assert_eq!(app.reader.cursor().row, 3);
         // a line, A file and c commit are distinct.
         app.on_key(ch('a'));
@@ -4888,33 +4879,31 @@ mod tests {
             assert!(entries.len() > 5, "{scope:?} help lists its keys");
             for (keys, _, action) in entries {
                 for k in keys {
-                    app.prefix = None;
-                    app.count = None;
+                    app.leader = false;
                     let events = match k {
                         Key::Press(code, modifiers) => vec![KeyEvent::new(code, modifiers)],
                         Key::Leader(c) => vec![ch(' '), ch(c)],
-                        Key::Z(c) => vec![ch('z'), ch(c)],
                     };
                     let mut resolved = None;
                     for e in events {
                         resolved = app.resolve(e);
                     }
                     match action {
-                        Action::Leader | Action::MotionPrefix => {
-                            assert_eq!(app.prefix, Some(action))
-                        }
-                        Action::Count(digit) => assert_eq!(app.count, Some(usize::from(digit))),
-                        _ => assert_eq!(
-                            resolved.map(|(a, _)| a),
-                            Some(action),
-                            "{} in {scope:?}",
-                            k.label()
-                        ),
+                        Action::Leader => assert!(app.leader),
+                        _ => assert_eq!(resolved, Some(action), "{} in {scope:?}", k.label()),
                     }
                 }
             }
         }
-        app.prefix = None;
+        // One set for the whole Changes screen: tree and reader keys share the list.
+        let changes: Vec<Key> = keymap::help(Scope::Changes)
+            .into_iter()
+            .flat_map(|(keys, _, _)| keys)
+            .collect();
+        for c in ['z', 'w', 'H', 'd', '1', 'L'] {
+            assert!(changes.contains(&Key::from_event(&ch(c))), "{c} is listed");
+        }
+        app.leader = false;
         app.view = View::Changes;
         app.focus = Focus::Tree;
         // Tab completes and cycles command names; Shift-Tab goes back.

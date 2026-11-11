@@ -135,8 +135,10 @@ does nothing.
 
 The Changes screen has three panes: the file tree, the file reader, and the
 notes list (`L`). `Tab` / `Shift-Tab` cycles the visible panes, and a thick
-blue border marks the focused one. `?` shows the keys for the current screen
-and pane; the help comes from the same table that handles the keys.
+blue border marks the focused one. Every key works the same in all three
+panes; movement keys move whichever pane has focus. `?` lists every key, from
+the same table that handles them, and the footer hints stay the same as you
+switch panes.
 
 Moving through the tree previews the selected file and keeps focus in the tree.
 `Enter` or `Tab` on a file, clicking its name, the picker, `:e`, and `{` / `}`
@@ -145,17 +147,18 @@ the reader where it was. `Enter` on a folder folds it.
 
 The reader is native. Source line numbers and diff signs live in the gutter,
 outside selected text. `[` / `]` move between hunks (clamped at the first and
-last), `{` / `}` between files in tree order. `:42`, `42G`, and `:Source 42`
-jump to source line 42 on the focused side, opening whole-file mode when
-needed. Search is a Rust regex (smart case) over the displayed source on the
-focused side: `/` searches forward, `n` / `N` repeat, and an invalid pattern
-keeps the previous search. Vim text objects, operators, registers, and block
-selections are not available.
+last), `{` / `}` between files in tree order. `z` in the reader folds the hunk
+under the cursor to its header; `z` on the header, or a search or jump into
+it, unfolds it. `:42` and `:Source 42` jump to source line 42 on the focused
+side, opening whole-file mode when needed. Search is a Rust regex (smart case)
+over the displayed source on the focused side: `/` searches forward, `n` / `N`
+repeat, and an invalid pattern keeps the previous search. Vim counts, text
+objects, operators, registers, and block selections are not available.
 
 `S` toggles stacked and side-by-side split views. Split view shows old code on
 the left and new code on the right: changed lines pair up in order, with blank
 filler on the shorter side. The panes scroll together; long lines scroll
-sideways with `zh` / `zl` instead of wrapping. `Space h` / `Space l` (or a
+sideways as the cursor moves instead of wrapping. `Space h` / `Space l` (or a
 click) pick the old / new side. Narrow panes fall back to the stacked view
 until there's room again. The layout choice lasts for the current session.
 
@@ -164,38 +167,37 @@ does nothing.
 
 | Key | Action |
 | --- | --- |
-| `↑` `↓` / `j` `k` | Tree: previous / next row, previewing the file. Reader: move. Notes: preview |
-| `←` `→` / `h` `l` | Tree: collapse/go to parent or expand/enter a folder. Reader: move |
-| `z` in the tree | Stage/unstage a changed file; fold a folder. Unchanged/ignored files are read-only |
-| `Enter` / `Tab` in the tree | Open the file at its first hunk (`Enter` on a folder folds it) |
+| `↑` `↓` / `j` `k` | Down / up in the focused pane; the tree previews the file |
+| `←` `→` / `h` `l` | Left / right; in the tree, collapse/go to parent or expand/enter a folder |
+| `z` | Tree: stage/unstage a changed file, fold a folder (unchanged/ignored files are read-only). Reader: fold the hunk |
+| `Enter` / `Tab` | Open the tree's file at its first hunk (`Enter` folds a folder, edits a note) |
 | `Tab` / `Shift-Tab` | Cycle the tree, reader, and notes |
-| `g` / `G`, `Home` / `End` | Top / bottom of the focused list or file |
-| `Ctrl+f/b`, `Ctrl+d/u`, `PgDn` / `PgUp` | Full/half-page movement in the focused list or file |
+| `g` / `G`, `Home` / `End` | Top / bottom of the focused pane |
+| `Ctrl+f/b`, `Ctrl+d/u`, `PgDn` / `PgUp` | Full/half-page movement in the focused pane |
 | `[` / `]`, `{` / `}` | Previous / next hunk, previous / next file |
 | `Space e` / `Space h` / `Space l` | Hide/show the tree; old / new side of a split diff |
 | `t` | Toggle Changed files / All files, including hidden and ignored project files |
 | `Ctrl+p` | Fuzzy project-file picker (excludes Git-ignored files); type a path abbreviation, arrows or Ctrl+n/p to choose, Enter to open, Esc to cancel |
 | `:` | Command line (below) |
-| `H` (Shift+h) in the tree | Browse commits in the checked-out branch; `Enter` opens the selected commit's diff |
-| `D` (Shift+d), in the tree or History | View all committed branch changes from the merge base with the default branch |
-| `B` (Shift+b), in the tree or History | Enter a different comparison base, such as `origin/main` or `develop` |
+| `H` (Shift+h) | Browse commits in the checked-out branch; `Enter` opens the selected commit's diff |
+| `D` (Shift+d) | View all committed branch changes from the merge base with the default branch |
+| `B` (Shift+b) | Enter a different comparison base, such as `origin/main` or `develop` |
 | `W` (Shift+w) | Return to staged, unstaged, and untracked working-tree changes |
-| `v` / `V` in the reader | Select characters / whole lines; `Esc` clears the selection, then search highlights |
-| `a` | Annotate the reader's line or selection (a header or notice, or the tree, annotates the whole file). Arrow keys move the text cursor; `Shift+Enter` inserts a newline, `Enter` saves, `Esc` cancels |
+| `v` / `V` | Select characters / whole lines in the file; `Esc` clears the selection, then search highlights |
+| `a` | Annotate the file's line or selection (a header or notice annotates the whole file). Arrow keys move the text cursor; `Shift+Enter` inserts a newline, `Enter` saves, `Esc` cancels |
 | `A` | Annotate the whole file |
 | `s` | Paste queued annotations into an agent's input in this tab; `↑↓` and `Enter` pick when multiple agents are available |
-| `L` | Show and focus the notes; again (while focused) hides them. `Enter` edits, `d` deletes, `Esc`/`q` closes |
-| `Ctrl+e` / `Ctrl+y`, `zt` / `zz` / `zb` in the reader | Scroll one line; put the cursor line at the top / middle / bottom |
-| `J` / `K` in the tree | Scroll the reader without focusing it |
-| `0` / `^` / `$`, `w` / `b` / `e` in the reader | Line and word motions; counts such as `10j` repeat motions |
-| `/`, `n` / `N` in the reader | Regex smart-case search; next / previous match with wraparound |
+| `L` | Show and focus the notes; again (while focused) hides them. `Enter` edits, `Delete`/`Backspace` removes, `Esc` closes |
+| `J` / `K`, `Ctrl+e` / `Ctrl+y` | Scroll the file one line, keeping focus |
+| `0` / `^` / `$`, `w` / `b` / `e` | Line and word motions in the file |
+| `/`, `n` / `N` | Regex smart-case search in the file; next / previous match with wraparound |
 | `c` | Commit what's staged (see below) |
-| `d` in the tree | Discard the changes of the file or folder under the cursor (see below) |
+| `d` | Discard the changes of the tree's file or folder, or of the open file from other panes (see below) |
 | `x` | Toggle between changed hunks only and the whole file |
 | `S` | Toggle stacked / split diff layout |
-| `+` / `-` in the tree | Make the tree bigger / smaller |
-| `1` / `2` | Changes / Branches screen (or click the tabs in the header). In the reader, digits form motion counts |
-| `r` in the tree | Reload the repository |
+| `+` / `-` | Make the tree bigger / smaller |
+| `1` / `2` | Changes / Branches screen (or click the tabs in the header) |
+| `r` | Reload the repository |
 | `q` | Quit (the pane closes) |
 
 The command line (`:`) works on every screen. Each command runs the same

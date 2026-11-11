@@ -24,35 +24,35 @@ Usage:
       --focus                              focus the panel when it opens
   rexdiff view                             run the panel in the current terminal
 
-In the panel (? shows the keys for the current screen and focus):
-  ↑↓ / j k        tree: previous / next row, previewing the file; reader: move
-  ← → / h l       tree: collapse/parent or expand/enter a folder; reader: move
-  Enter / Tab     open the selected file at its first hunk (Enter on a folder folds it)
-  Tab / Shift-Tab cycle the tree, reader, and notes
-  z               in the tree: stage/unstage a file; on a folder: open/close
+In the panel (? lists every key; each key works the same in the tree, file, and notes):
+  ↑↓ / j k        down / up in the focused pane (the tree previews the file)
+  ← → / h l       left / right; in the tree, collapse/parent or expand/enter a folder
+  Enter / Tab     open the selected file at its first hunk (Enter folds a folder, edits a note)
+  Tab / Shift-Tab cycle the tree, file, and notes
+  z               tree: stage/unstage a file, fold a folder; file: fold the hunk
   Space e / h / l hide/show the tree / old side / new side of a split diff
   [ ] / { }       previous / next hunk / file
-  g / G / NG      top / bottom / source line N (also :N and :Source N)
-  0 ^ $ w b e     line and word motions; counts repeat motions (12j)
-  Ctrl+f/b/d/u    full/half-page movement; Ctrl+e/y scroll; zt zz zb place; zh zl pan split
+  g / G           top / bottom of the focused pane (:N jumps to source line N)
+  0 ^ $ w b e     line and word motions in the file
+  Ctrl+f/b/d/u    full/half-page movement; J K / Ctrl+e/y scroll the file
   v / V           select characters / lines; Esc clears selection, then search
   / n N           regex smart-case search; next / previous match
-  a / A           annotate the line or selection (the file, in the tree) / the whole file
+  a / A           annotate the file's line or selection / the whole file
                   in notes: arrows move the cursor; Shift+Enter inserts a newline
   s               paste queued annotations to an agent in this tab
-  L               show/focus the notes; again hides: Enter edits, d deletes
+  L               show/focus the notes; again hides: Enter edits, Delete removes
   x / S           whole file / split or stacked layout
   Ctrl+p          fuzzy file picker; :e PATH opens a project file
   :               command line: :N :e :base :diff :context :notes :commit :reload
                   :changes :branches :help :q (Tab completes)
   H (Shift+h)     browse checked-out branch commits; Enter opens a commit diff
-  D (Shift+d)     in Changes/History: combined branch diff from the merge base
-  B (Shift+b)     in Changes/History: choose the branch comparison base
+  D (Shift+d)     combined branch diff from the merge base
+  B (Shift+b)     choose the branch comparison base
   W (Shift+w)     return to working-tree changes
   t               toggle changed files / all project files (including ignored files)
   c               commit what's staged: type the message, Enter commits, Esc cancels
-  d               discard the changes of the file or folder under the cursor (y confirms)
-  1 / 2           Changes / Branches screen (in the reader, digits are counts)
+  d               discard the changes of the tree's file or folder, or the open file (y confirms)
+  1 / 2           Changes / Branches screen
 
 On the Branches screen:
   ↑↓ / j k        move between local branches
