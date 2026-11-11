@@ -2526,17 +2526,21 @@ impl App {
             put(buf, &mut x, y, right, busy, Style::new().fg(p.muted));
             return None;
         }
+        // Messages sit at the right end so the key hints stay readable.
+        let mut right = right;
         if let Some(f) = &self.flash
             && Instant::now() < f.until
         {
-            put(buf, &mut x, y, right, &f.text, Style::new().fg(if f.ok { p.green } else { p.red }));
-            return None;
+            let w = (f.text.width() as u16).min(area.width.saturating_sub(2));
+            let mut fx = right.saturating_sub(w + 1);
+            put(buf, &mut fx, y, right, &f.text, Style::new().fg(if f.ok { p.green } else { p.red }));
+            right = right.saturating_sub(w + 3);
         }
         if !self.notes.is_empty() {
             put(buf, &mut x, y, right, &format!("{} notes · ", self.notes.len()), Style::new().fg(p.blue));
         }
         let back = match &self.comparison {
-            Some(c) if c.is_commit => [("Esc", "commits"), ("W", "working tree")].as_slice(),
+            Some(c) if c.is_commit => [("Esc", "commits")].as_slice(),
             Some(_) => [("Esc", "working tree"), ("B", "base")].as_slice(),
             None => &[],
         };
@@ -2547,7 +2551,7 @@ impl App {
             ],
             (View::Changes, Focus::Notes) => &[("j/k", "preview"), ("Enter", "edit"), ("d", "delete"), ("Esc", "close"), ("?", "help")],
             (View::Changes, Focus::Tree) => &[
-                ("Enter", "open"), ("z", "stage/fold"), ("a", "annotate"), ("c", "commit"), ("d", "discard"),
+                ("Enter", "open"), ("W", "working tree"), ("D", "branch diff"), ("z", "stage/fold"), ("a", "annotate"), ("c", "commit"), ("d", "discard"),
                 ("L", "notes"), ("{ }", "files"), ("2", "branches"), ("?", "help"), (":", "command"),
             ],
             (View::History, _) => &[("↑↓", "move"), ("Enter", "diff"), ("D", "branch diff"), ("B", "base"), ("W", "working tree"), ("Esc", "back"), ("?", "help")],
